@@ -1,0 +1,5 @@
+stt/models/
+*.tar.bz2
+__pycache__/
+*.pyc
+.codex
