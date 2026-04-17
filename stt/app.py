@@ -50,9 +50,35 @@ def _require_file(path: Path) -> str:
     return str(path)
 
 
+def _require_one(paths: list[Path]) -> str:
+    for path in paths:
+        if path.is_file():
+            return str(path)
+    options = ", ".join(str(p) for p in paths)
+    raise FileNotFoundError(f"Nenhum arquivo encontrado entre: {options}")
+
+
 def build_offline_recognizer() -> sherpa_onnx.OfflineRecognizer:
+    if MODEL_TYPE.startswith("cohere_transcribe"):
+        tokens_path = MODEL_DIR / "tokens.txt"
+        return sherpa_onnx.OfflineRecognizer.from_cohere_transcribe(
+            encoder=_require_one([MODEL_DIR / "encoder.int8.onnx", MODEL_DIR / "encoder.onnx"]),
+            decoder=_require_one([MODEL_DIR / "decoder.int8.onnx", MODEL_DIR / "decoder.onnx"]),
+            tokens=str(tokens_path) if tokens_path.is_file() else "",
+            num_threads=NUM_THREADS,
+            language=MODEL_LANGUAGE,
+            use_punct=True,
+            use_itn=True,
+            provider="cpu",
+            decoding_method="greedy_search",
+            debug=False,
+        )
+
+    if not MODEL_TYPE.startswith("nemo_ctc"):
+        raise ValueError(f"MODEL_TYPE nao suportado: {MODEL_TYPE}")
+
     return sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
-        model=_require_file(MODEL_DIR / "model.int8.onnx"),
+        model=_require_one([MODEL_DIR / "model.int8.onnx", MODEL_DIR / "model.onnx"]),
         tokens=_require_file(MODEL_DIR / "tokens.txt"),
         num_threads=NUM_THREADS,
         provider="cpu",
