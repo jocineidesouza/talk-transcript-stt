@@ -12,7 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FEATURE_DIM=80 \
     MODEL_LANGUAGE=pt-BR \
     MODEL_TYPE=nemo_ctc_offline_vad_streaming \
-    USE_INTERNAL_VAD=false \
+    USE_INTERNAL_VAD=true \
     AUTO_DOWNLOAD_MODEL=1
 
 RUN apt-get update \
