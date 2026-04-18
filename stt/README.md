@@ -1,90 +1,68 @@
-# STT sherpa-onnx (PT-BR + WebSocket)
+# Talk Transcript STT Service (Async HTTP)
 
-Servico STT em CPU com:
-- `POST /transcribe` (arquivo, compativel com endpoint atual)
+Servico de transcricao assíncrona para ingestão de chunks de audio vindos do agente LiveKit.
+
+## Endpoints
+
 - `GET /health`
-- `WS /ws/transcribe` (tempo real com VAD e hipoteses parciais/finais)
+- `POST /v1/sessions/start`
+- `POST /v1/sessions/chunk` (`multipart/form-data` com `meta` + `audio`)
+- `POST /v1/sessions/end`
 
-## Modelo e estrategia
+## Fluxo
 
-Modelo principal: `sherpa-onnx-nemo-stt_pt_fastconformer_hybrid_large_pc-int8`
-(portugues, int8).
+1. agente envia `start` por participante/sessao
+2. agente envia chunks PCM16 mono 16k em `chunk` com `seq` crescente
+3. servico grava spool em disco, enfileira no SQLite e responde `202`
+4. worker unico consome fila, transcreve e grava incremental em Firestore
+5. em `end` de participante/sala, o servico finaliza agregados e salva artefatos textuais no Storage
 
-Observacao tecnica: atualmente nao ha modelo PT-BR de streaming nativo no release com latencia baixa como zipformer streaming. Para manter PT-BR com boa qualidade, o WebSocket usa VAD + decodificacao incremental por segmento (realtime pratico, CPU-only).
+## Seguranca
 
-## Bootstrap automatico
+Todas as rotas de ingestao exigem HMAC via headers:
 
-Ao subir o container, `bootstrap_models.sh` baixa automaticamente (se faltarem):
-- modelo PT-BR
-- `silero_vad.onnx`
-- `pt_br.wav` para teste
+- `X-TS-Timestamp`
+- `X-TS-Nonce`
+- `X-TS-Signature`
+- `X-TS-Key-Id`
 
-Tudo fica em `/opt/stack/stt/models` via volume `./stt/models:/models`.
+Canonical string assinada:
 
-## Subir o servico
-
-```bash
-cd /opt/stack
-docker compose up --build -d stt
-docker compose logs -f stt
+```text
+METHOD
+PATH
+TIMESTAMP
+NONCE
+SHA256_HEX(body)
 ```
 
-## Testes locais
+## Banco e fila
 
-Health:
-```bash
-curl -s http://localhost:3001/health
-```
+- SQLite em WAL mode
+- fila unica global em `chunks` (`queued` -> `processing` -> `done/error`)
+- idempotencia: chave `(room_name, session_id, participant_identity, seq)`
+- anti-replay HMAC: tabela `hmac_nonces`
 
-HTTP com audio PT-BR:
-```bash
-/opt/stack/stt/test_http_pt.sh
-```
+## Firebase
 
-WebSocket realtime:
-```bash
-docker exec stt python /app/ws_client_test.py \
-  --url ws://localhost:3001/ws/transcribe \
-  --wav /models/pt_br.wav
-```
+Quando `FIREBASE_ENABLED=true`:
 
-## Protocolo WebSocket (`/ws/transcribe`)
+- Firestore:
+  - `calls/{call_key}`
+  - `calls/{call_key}/participants/{participant_identity}`
+  - `calls/{call_key}/participants/{participant_identity}/segments/{seq}`
+- Storage:
+  - `calls/{call_key}/participants/{participant}/transcript.txt|json`
+  - `calls/{call_key}/transcript.txt|json`
 
-Entrada:
-- mensagens binarias com chunks PCM16 mono (`s16le`, ideal 16 kHz)
-- para finalizar envio: `{"event":"end"}` (texto JSON)
+## Principais variaveis de ambiente
 
-Saida:
-- `{"type":"partial","segment_id":N,"text":"..."}`
-- `{"type":"final","segment_id":N,"text":"...","start_seconds":X}`
-- `{"type":"done"}`
-
-## VAD interno opcional (`USE_INTERNAL_VAD`)
-
-Configuracao:
-- `USE_INTERNAL_VAD=false` (padrao): desliga segmentacao por VAD interno.
-- `USE_INTERNAL_VAD=true`: usa `silero_vad.onnx` no servidor.
-
-Quando usar `true`:
-- cliente envia audio bruto continuo e espera finalizacao automatica por fala/silencio.
-- melhor para clientes simples sem controle de segmentacao.
-
-Quando usar `false` (ex.: LiveKit controlando segmentos):
-- a aplicacao externa decide quando comecar/encerrar segmento.
-- no websocket, o servidor passa a tratar toda a sessao como um unico segmento (`segment_id=0`) e emite `final` no evento `{"event":"end"}`.
-
-Impacto no endpoint `/ws/transcribe`:
-- com VAD interno: podem existir varios `final` por conexao (segmentos detectados).
-- sem VAD interno: normalmente 1 `final` por conexao, ao final do stream.
-
-## Validacao externa da VPS
-
-HTTP:
-```bash
-curl -X POST "http://SEU_DNS_PUBLICO:3001/transcribe" \
-  -F "file=@C:\\caminho\\pt_br.wav"
-```
-
-WebSocket:
-- URL: `ws://SEU_DNS_PUBLICO:3001/ws/transcribe`
-- confirme firewall/security group liberando TCP `3001`.
+- `STT_HMAC_KEY_ID`, `STT_HMAC_SECRET` (ou `STT_HMAC_KEYS`)
+- `HMAC_WINDOW_SECONDS` (padrao `300`)
+- `SQLITE_PATH` (padrao `/data/queue.db`)
+- `SPOOL_DIR` (padrao `/data/spool`)
+- `QUEUE_MAX_PENDING` (padrao `2000`)
+- `FIREBASE_ENABLED`
+- `FIREBASE_SERVICE_ACCOUNT_FILE`
+- `FIREBASE_STORAGE_BUCKET`
+- `FIREBASE_PROJECT_ID`

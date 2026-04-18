@@ -4,7 +4,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     MODEL_DIR=/models/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01 \
-    VAD_MODEL=/models/silero_vad.onnx \
     SHERPA_NUM_THREADS=3 \
     DECODE_MAX_CONCURRENCY=1 \
     UVICORN_WORKERS=1 \
@@ -12,7 +11,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FEATURE_DIM=80 \
     MODEL_LANGUAGE=pt \
     MODEL_TYPE=cohere_transcribe_offline_vad_streaming \
-    USE_INTERNAL_VAD=true \
+    SQLITE_PATH=/data/queue.db \
+    SPOOL_DIR=/data/spool \
+    QUEUE_MAX_PENDING=2000 \
+    HMAC_WINDOW_SECONDS=300 \
+    STT_HMAC_KEY_ID=default \
+    STT_HMAC_SECRET=replace_with_long_random_secret \
+    FIREBASE_ENABLED=false \
     AUTO_DOWNLOAD_MODEL=1
 
 RUN apt-get update \
@@ -26,7 +31,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY bootstrap_models.sh .
-COPY ws_client_test.py .
 RUN chmod +x /app/bootstrap_models.sh
 
 EXPOSE 3001

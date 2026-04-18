@@ -6,8 +6,6 @@ MODEL_NAME="${MODEL_NAME:-sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01}
 MODEL_DIR="${MODEL_DIR:-${MODELS_ROOT}/${MODEL_NAME}}"
 MODEL_TAR="${MODELS_ROOT}/${MODEL_NAME}.tar.bz2"
 MODEL_URL="${MODEL_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${MODEL_NAME}.tar.bz2}"
-VAD_MODEL="${VAD_MODEL:-${MODELS_ROOT}/silero_vad.onnx}"
-VAD_URL="${VAD_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx}"
 PT_TEST_WAV="${PT_TEST_WAV:-${MODELS_ROOT}/pt_br.wav}"
 PT_TEST_WAV_URL="${PT_TEST_WAV_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/pt_br.wav}"
 AUTO_DOWNLOAD_MODEL="${AUTO_DOWNLOAD_MODEL:-1}"
@@ -38,11 +36,6 @@ if [ "$model_ready" -ne 1 ]; then
   fi
 
   python3 -c "import tarfile; tarfile.open('${MODEL_TAR}').extractall('${MODELS_ROOT}')"
-fi
-
-if [ ! -f "$VAD_MODEL" ]; then
-  echo "VAD nao encontrado em ${VAD_MODEL}; iniciando download."
-  curl -fL -o "$VAD_MODEL" "$VAD_URL"
 fi
 
 if [ ! -f "$PT_TEST_WAV" ]; then
