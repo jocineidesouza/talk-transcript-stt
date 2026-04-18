@@ -3,3 +3,6 @@ stt/models/
 __pycache__/
 *.pyc
 .codex
+transcripts_export.json
+stt/data/queue.db
+stt/data/queue.db-shm
