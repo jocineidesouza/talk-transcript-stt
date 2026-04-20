@@ -60,21 +60,22 @@ SHA256_HEX(body)
 Quando `FIREBASE_ENABLED=true`:
 
 - destino Firebase e resolvido por namespace da sala
+- `POST /v1/sessions/start` exige `LIVEKIT_ROOM_INDEX/{room_name}` com `vertical` e `slug`
 - configuracao por `FIREBASE_NAMESPACE_CONFIG_JSON` (`namespace -> config`)
 - cada namespace usa app/credencial propria (sem fallback silencioso)
 - nao grava transcricao completa no Firestore por chunk
 
 Firestore:
 
-- `calls/{call_key}`: metadados, status, heartbeat, ponteiros de resumo
-- `calls/{call_key}/minute_shards/{minute_index}`: ponteiros dos JSONs por minuto
+- `VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/TRANSCRIPT/{session_id}`: metadados, status, heartbeat, ponteiros de resumo
+- `.../minute_shards/{minute_index}`: ponteiros dos JSONs por minuto
 
 Storage:
 
-- `calls/{call_key}/minutes/{minute_index}/transcript.json`
-- `calls/{call_key}/minutes/{minute_index}/summary.json`
-- `calls/{call_key}/summary/accumulated.json`
-- `calls/{call_key}/final/final_summary.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}/minutes/{minute_index}/transcript.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}/minutes/{minute_index}/summary.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}/summary/accumulated.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}/final/final_summary.json`
 
 ## OpenAI Summary (opcional)
 

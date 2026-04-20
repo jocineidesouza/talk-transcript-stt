@@ -44,4 +44,4 @@ RUN chmod +x /app/bootstrap_models.sh
 
 EXPOSE 3001
 
-CMD ["sh", "-c", "/app/bootstrap_models.sh && uvicorn app:app --host 0.0.0.0 --port 3001 --workers ${UVICORN_WORKERS:-1}"]
+CMD ["sh", "-c", "/app/bootstrap_models.sh && echo 'iniciando servico' && uvicorn app:app --host 0.0.0.0 --port 3001 --workers ${UVICORN_WORKERS:-1}"]

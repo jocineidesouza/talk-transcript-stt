@@ -38,7 +38,7 @@ services:
       OPENAI_MAX_RETRIES: "3"
       LOG_LEVEL: INFO
     volumes:
-      - /opt/stack/stt/models:/models
+      - ./stt/models:/models
       - ./stt/data:/data
       - ./stt/secrets:/secrets:ro
     tmpfs:

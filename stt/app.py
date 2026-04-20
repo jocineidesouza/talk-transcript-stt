@@ -96,6 +96,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("stt")
 
+CALL_INDEX_UNSET = object()
+
 
 class StartRequest(BaseModel):
     room_name: str = Field(min_length=1)
@@ -183,7 +185,6 @@ class FirebaseNamespaceConfig:
 class MinuteShardPayload:
     room_name: str
     session_id: str
-    call_key: str
     minute_index: int
     minute_started_at: str
     minute_ended_at: str
@@ -195,6 +196,24 @@ class MinuteShardPayload:
     finalized: bool
 
 
+@dataclass(frozen=True)
+class RoomRoutingContext:
+    namespace: str
+    room_name: str
+    room_id: str
+    session_id: str
+    vertical: str
+    slug: str
+    firestore_doc_path: str
+    storage_base_path: str
+
+
+class RoomRoutingError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def extract_room_namespace(room_name: str) -> RoomNamespaceInfo | None:
     for namespace in sorted(ALLOWED_LIVEKIT_NAMESPACES, key=len, reverse=True):
         prefix = f"{namespace}__"
@@ -204,6 +223,18 @@ def extract_room_namespace(room_name: str) -> RoomNamespaceInfo | None:
                 return RoomNamespaceInfo(namespace=namespace, room_id=room_id)
             return None
     return None
+
+
+def build_firestore_doc_path(vertical: str, slug: str, room_id: str, session_id: str) -> str:
+    return f"VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/TRANSCRIPT/{session_id}"
+
+
+def build_storage_base_path(vertical: str, slug: str, room_id: str, session_id: str) -> str:
+    return f"VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}"
+
+
+def join_storage_path(storage_base_path: str, suffix: str) -> str:
+    return f"{storage_base_path.rstrip('/')}/{suffix.lstrip('/')}"
 
 
 def parse_firebase_namespace_configs() -> dict[str, FirebaseNamespaceConfig]:
@@ -281,6 +312,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 room_name TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                room_id TEXT,
+                vertical TEXT,
+                slug TEXT,
+                firestore_doc_path TEXT,
+                storage_base_path TEXT,
                 started_at TEXT NOT NULL,
                 metadata_json TEXT,
                 state TEXT NOT NULL DEFAULT 'active',
@@ -378,6 +414,16 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN last_chunk_at TEXT")
         if "last_firebase_flush_at" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN last_firebase_flush_at TEXT")
+        if "room_id" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN room_id TEXT")
+        if "vertical" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN vertical TEXT")
+        if "slug" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN slug TEXT")
+        if "firestore_doc_path" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN firestore_doc_path TEXT")
+        if "storage_base_path" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN storage_base_path TEXT")
         conn.execute(
             "UPDATE sessions SET last_chunk_at = started_at WHERE last_chunk_at IS NULL"
         )
@@ -583,53 +629,63 @@ class FirebaseSink:
     firestore_client: firestore.Client | None
     storage_bucket: storage.bucket.Bucket | None
 
+    def _doc_ref(self, firestore_doc_path: str):
+        if self.firestore_client is None:
+            raise RuntimeError("firestore_client indisponivel")
+        return self.firestore_client.document(firestore_doc_path)
+
     def publish_call_index(
         self,
-        room_name: str,
-        session_id: str,
-        room_id: str,
+        routing: RoomRoutingContext,
         status: str,
         last_minute_index: int,
         finalized: bool,
         minute_window_seconds: int,
         flush_interval_seconds: int,
-        final_summary_path: str | None = None,
-        summary_accumulated_path: str | None = None,
+        final_summary_path: str | None | object = CALL_INDEX_UNSET,
+        summary_accumulated_path: str | None | object = CALL_INDEX_UNSET,
+        final_summary_ready: bool | object = CALL_INDEX_UNSET,
+        final_transcript_path: str | None | object = CALL_INDEX_UNSET,
+        final_transcript_ready: bool | object = CALL_INDEX_UNSET,
     ) -> None:
         if not self.enabled or self.firestore_client is None:
             return
 
-        call_key = f"{room_name}__{session_id}"
-        call_ref = self.firestore_client.collection("calls").document(call_key)
-        call_ref.set(
-            {
-                "room_name": room_name,
-                "room_id": room_id,
-                "session_id": session_id,
-                "call_key": call_key,
-                "namespace": self.namespace,
-                "status": status,
-                "finalized": finalized,
-                "last_minute_index": last_minute_index,
-                "minute_window_seconds": minute_window_seconds,
-                "flush_interval_seconds": flush_interval_seconds,
-                "storage_base": f"calls/{safe_key(call_key)}/",
-                "summary_accumulated_path": summary_accumulated_path,
-                "final_summary_path": final_summary_path,
-                "updated_at": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
+        call_ref = self._doc_ref(routing.firestore_doc_path)
+        payload = {
+            "room_name": routing.room_name,
+            "room_id": routing.room_id,
+            "session_id": routing.session_id,
+            "namespace": self.namespace,
+            "vertical": routing.vertical,
+            "slug": routing.slug,
+            "status": status,
+            "finalized": finalized,
+            "last_minute_index": last_minute_index,
+            "minute_window_seconds": minute_window_seconds,
+            "flush_interval_seconds": flush_interval_seconds,
+            "storage_base": routing.storage_base_path,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        if summary_accumulated_path is not CALL_INDEX_UNSET:
+            payload["summary_accumulated_path"] = summary_accumulated_path
+        if final_summary_path is not CALL_INDEX_UNSET:
+            payload["final_summary_path"] = final_summary_path
+        if final_summary_ready is not CALL_INDEX_UNSET:
+            payload["final_summary_ready"] = final_summary_ready
+        if final_transcript_path is not CALL_INDEX_UNSET:
+            payload["final_transcript_path"] = final_transcript_path
+        if final_transcript_ready is not CALL_INDEX_UNSET:
+            payload["final_transcript_ready"] = final_transcript_ready
 
-    def upsert_minute_shard(self, payload: MinuteShardPayload) -> None:
+        call_ref.set(payload, merge=True)
+
+    def upsert_minute_shard(self, routing: RoomRoutingContext, payload: MinuteShardPayload) -> None:
         if not self.enabled or self.firestore_client is None:
             return
 
-        shard_ref = (
-            self.firestore_client.collection("calls")
-            .document(payload.call_key)
-            .collection("minute_shards")
-            .document(str(payload.minute_index))
+        shard_ref = self._doc_ref(routing.firestore_doc_path).collection("minute_shards").document(
+            str(payload.minute_index)
         )
         shard_ref.set(
             {
@@ -647,15 +703,12 @@ class FirebaseSink:
         )
 
     def update_minute_summary_link(
-        self, call_key: str, minute_index: int, summary_json_path: str
+        self, routing: RoomRoutingContext, minute_index: int, summary_json_path: str
     ) -> None:
         if not self.enabled or self.firestore_client is None:
             return
-        shard_ref = (
-            self.firestore_client.collection("calls")
-            .document(call_key)
-            .collection("minute_shards")
-            .document(str(minute_index))
+        shard_ref = self._doc_ref(routing.firestore_doc_path).collection("minute_shards").document(
+            str(minute_index)
         )
         shard_ref.set(
             {
@@ -687,14 +740,17 @@ class FirebaseSink:
         except json.JSONDecodeError:
             return None
 
-    def upload_minute_transcript(self, payload: MinuteShardPayload) -> None:
+    def upload_minute_transcript(
+        self, routing: RoomRoutingContext, payload: MinuteShardPayload
+    ) -> None:
         self.upload_json(
             payload.transcript_json_path,
             {
                 "room_name": payload.room_name,
                 "session_id": payload.session_id,
-                "call_key": payload.call_key,
                 "namespace": self.namespace,
+                "vertical": routing.vertical,
+                "slug": routing.slug,
                 "minute_index": payload.minute_index,
                 "minute_started_at": payload.minute_started_at,
                 "minute_ended_at": payload.minute_ended_at,
@@ -791,22 +847,77 @@ class FirebaseRouter:
             return self._disabled_sink
         return self._get_or_create_sink(info.namespace)
 
+    def sink_for_namespace(self, namespace: str) -> FirebaseSink:
+        return self._get_or_create_sink(namespace)
+
+    def resolve_room_routing_context(self, room_name: str, session_id: str) -> RoomRoutingContext:
+        info = extract_room_namespace(room_name)
+        if info is None:
+            raise RoomRoutingError("invalid_namespace", f"namespace invalido para room {room_name}")
+
+        if not self.enabled:
+            vertical = "disabled"
+            slug = "disabled"
+            return RoomRoutingContext(
+                namespace=info.namespace,
+                room_name=room_name,
+                room_id=info.room_id,
+                session_id=session_id,
+                vertical=vertical,
+                slug=slug,
+                firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, session_id),
+                storage_base_path=build_storage_base_path(vertical, slug, info.room_id, session_id),
+            )
+
+        sink = self._get_or_create_sink(info.namespace)
+        if not sink.enabled or sink.firestore_client is None:
+            raise RoomRoutingError(
+                "room_index_invalid",
+                f"namespace sem firestore habilitado para room {room_name}",
+            )
+
+        index_ref = sink.firestore_client.collection("LIVEKIT_ROOM_INDEX").document(room_name)
+        snapshot = index_ref.get()
+        if not snapshot.exists:
+            raise RoomRoutingError(
+                "room_index_not_found",
+                f"indice LIVEKIT_ROOM_INDEX nao encontrado para room {room_name}",
+            )
+        raw_payload = snapshot.to_dict()
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
+        vertical = str(payload.get("vertical", "")).strip()
+        slug = str(payload.get("slug", "")).strip()
+        if not vertical or not slug:
+            raise RoomRoutingError(
+                "room_index_invalid",
+                f"indices vertical/slug invalidos para room {room_name}",
+            )
+
+        return RoomRoutingContext(
+            namespace=info.namespace,
+            room_name=room_name,
+            room_id=info.room_id,
+            session_id=session_id,
+            vertical=vertical,
+            slug=slug,
+            firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, session_id),
+            storage_base_path=build_storage_base_path(vertical, slug, info.room_id, session_id),
+        )
+
     def publish_call_index(
         self,
-        room_name: str,
-        session_id: str,
+        routing: RoomRoutingContext,
         status: str,
         last_minute_index: int,
         finalized: bool,
-        final_summary_path: str | None = None,
-        summary_accumulated_path: str | None = None,
+        final_summary_path: str | None | object = CALL_INDEX_UNSET,
+        summary_accumulated_path: str | None | object = CALL_INDEX_UNSET,
+        final_summary_ready: bool | object = CALL_INDEX_UNSET,
+        final_transcript_path: str | None | object = CALL_INDEX_UNSET,
+        final_transcript_ready: bool | object = CALL_INDEX_UNSET,
     ) -> None:
-        info = extract_room_namespace(room_name)
-        room_id = info.room_id if info is not None else room_name
-        self.sink_for_room(room_name).publish_call_index(
-            room_name,
-            session_id,
-            room_id,
+        self.sink_for_namespace(routing.namespace).publish_call_index(
+            routing,
             status,
             last_minute_index,
             finalized,
@@ -814,27 +925,31 @@ class FirebaseRouter:
             FIREBASE_FLUSH_INTERVAL_SECONDS,
             final_summary_path=final_summary_path,
             summary_accumulated_path=summary_accumulated_path,
+            final_summary_ready=final_summary_ready,
+            final_transcript_path=final_transcript_path,
+            final_transcript_ready=final_transcript_ready,
         )
 
-    def upsert_minute_shard(self, room_name: str, payload: MinuteShardPayload) -> None:
-        self.sink_for_room(room_name).upsert_minute_shard(payload)
+    def upsert_minute_shard(self, routing: RoomRoutingContext, payload: MinuteShardPayload) -> None:
+        self.sink_for_namespace(routing.namespace).upsert_minute_shard(routing, payload)
 
     def update_minute_summary_link(
-        self, room_name: str, session_id: str, minute_index: int, summary_json_path: str
+        self, routing: RoomRoutingContext, minute_index: int, summary_json_path: str
     ) -> None:
-        call_key = f"{room_name}__{session_id}"
-        self.sink_for_room(room_name).update_minute_summary_link(
-            call_key, minute_index, summary_json_path
+        self.sink_for_namespace(routing.namespace).update_minute_summary_link(
+            routing, minute_index, summary_json_path
         )
 
-    def upload_minute_transcript(self, room_name: str, payload: MinuteShardPayload) -> None:
-        self.sink_for_room(room_name).upload_minute_transcript(payload)
+    def upload_minute_transcript(
+        self, routing: RoomRoutingContext, payload: MinuteShardPayload
+    ) -> None:
+        self.sink_for_namespace(routing.namespace).upload_minute_transcript(routing, payload)
 
-    def upload_json(self, room_name: str, object_path: str, body: dict) -> None:
-        self.sink_for_room(room_name).upload_json(object_path, body)
+    def upload_json(self, routing: RoomRoutingContext, object_path: str, body: dict) -> None:
+        self.sink_for_namespace(routing.namespace).upload_json(object_path, body)
 
-    def fetch_json(self, room_name: str, object_path: str) -> dict | None:
-        return self.sink_for_room(room_name).fetch_json(object_path)
+    def fetch_json(self, routing: RoomRoutingContext, object_path: str) -> dict | None:
+        return self.sink_for_namespace(routing.namespace).fetch_json(object_path)
 
 
 def db_pending_count() -> int:
@@ -848,7 +963,7 @@ def db_pending_count() -> int:
         conn.close()
 
 
-def db_upsert_start(req: StartRequest) -> None:
+def db_upsert_start(req: StartRequest, routing: RoomRoutingContext) -> None:
     now = utc_now_iso()
     conn = read_db_connection()
     try:
@@ -856,17 +971,29 @@ def db_upsert_start(req: StartRequest) -> None:
         conn.execute(
             """
             INSERT INTO sessions(
-                room_name, session_id, started_at, metadata_json,
+                room_name, session_id, room_id, vertical, slug,
+                firestore_doc_path, storage_base_path,
+                started_at, metadata_json,
                 state, room_end_received, last_chunk_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)
             ON CONFLICT(room_name, session_id) DO UPDATE SET
                 updated_at=excluded.updated_at,
+                room_id=excluded.room_id,
+                vertical=excluded.vertical,
+                slug=excluded.slug,
+                firestore_doc_path=excluded.firestore_doc_path,
+                storage_base_path=excluded.storage_base_path,
                 metadata_json=COALESCE(excluded.metadata_json, sessions.metadata_json),
                 last_chunk_at=COALESCE(sessions.last_chunk_at, excluded.last_chunk_at)
             """,
             (
                 req.room_name,
                 req.session_id,
+                routing.room_id,
+                routing.vertical,
+                routing.slug,
+                routing.firestore_doc_path,
+                routing.storage_base_path,
                 req.started_at,
                 json.dumps(req.metadata, ensure_ascii=False) if req.metadata is not None else None,
                 req.started_at,
@@ -1313,7 +1440,9 @@ def db_get_session_row(room_name: str, session_id: str) -> sqlite3.Row | None:
     try:
         return conn.execute(
             """
-            SELECT room_name, session_id, started_at, room_end_received, finalized_at
+            SELECT room_name, session_id, room_id, vertical, slug,
+                   firestore_doc_path, storage_base_path,
+                   started_at, room_end_received, finalized_at
             FROM sessions
             WHERE room_name=? AND session_id=?
             """,
@@ -1321,6 +1450,38 @@ def db_get_session_row(room_name: str, session_id: str) -> sqlite3.Row | None:
         ).fetchone()
     finally:
         conn.close()
+
+
+def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
+    room_name = str(row["room_name"] or "")
+    namespace_info = extract_room_namespace(room_name)
+    namespace_value = namespace_info.namespace if namespace_info is not None else ""
+    room_id = str(row["room_id"] or "").strip()
+    session_id = str(row["session_id"] or "").strip()
+    vertical = str(row["vertical"] or "").strip()
+    slug = str(row["slug"] or "").strip()
+    firestore_doc_path = str(row["firestore_doc_path"] or "").strip()
+    storage_base_path = str(row["storage_base_path"] or "").strip()
+
+    if not room_name or not room_id or not session_id:
+        raise RuntimeError("session routing context incompleto: room_name/room_id/session_id")
+    if not vertical or not slug:
+        raise RuntimeError("session routing context incompleto: vertical/slug")
+    if not firestore_doc_path or not storage_base_path:
+        raise RuntimeError("session routing context incompleto: firestore_doc_path/storage_base_path")
+    if not namespace_value:
+        raise RuntimeError("session routing context invalido: namespace ausente")
+
+    return RoomRoutingContext(
+        namespace=namespace_value,
+        room_name=room_name,
+        room_id=room_id,
+        session_id=session_id,
+        vertical=vertical,
+        slug=slug,
+        firestore_doc_path=firestore_doc_path,
+        storage_base_path=storage_base_path,
+    )
 
 
 def db_get_done_chunks_for_session(room_name: str, session_id: str) -> list[sqlite3.Row]:
@@ -1352,12 +1513,12 @@ def db_get_done_chunks_for_session(room_name: str, session_id: str) -> list[sqli
 def build_minute_shards(
     room_name: str,
     session_id: str,
+    storage_base_path: str,
     started_at: str,
     done_chunks: list[sqlite3.Row],
     minute_window_seconds: int,
     finalized: bool,
 ) -> list[MinuteShardPayload]:
-    call_key = f"{room_name}__{session_id}"
     grouped: dict[int, list[dict]] = {}
     for row in done_chunks:
         text = (row["transcript"] or "").strip()
@@ -1386,7 +1547,7 @@ def build_minute_shards(
             seconds=minute_index * minute_window_seconds
         )
         minute_end_dt = minute_start_dt + timedelta(seconds=minute_window_seconds)
-        call_base = f"calls/{safe_key(call_key)}/minutes/{minute_index:04d}"
+        call_base = join_storage_path(storage_base_path, f"minutes/{minute_index:04d}")
         transcript_path = f"{call_base}/transcript.json"
         summary_path = f"{call_base}/summary.json"
         minute_lines = grouped[minute_index]
@@ -1397,7 +1558,6 @@ def build_minute_shards(
             MinuteShardPayload(
                 room_name=room_name,
                 session_id=session_id,
-                call_key=call_key,
                 minute_index=minute_index,
                 minute_started_at=minute_start_dt.isoformat(),
                 minute_ended_at=minute_end_dt.isoformat(),
@@ -1976,14 +2136,28 @@ class SummaryEngine:
             f"Resumo acumulado da chamada:\n{merged_summary}",
         )
 
-def session_summary_accumulated_path(room_name: str, session_id: str) -> str:
-    call_key = f"{room_name}__{session_id}"
-    return f"calls/{safe_key(call_key)}/summary/accumulated.json"
+def session_summary_accumulated_path(storage_base_path: str) -> str:
+    return join_storage_path(storage_base_path, "summary/accumulated.json")
 
 
-def session_final_summary_path(room_name: str, session_id: str) -> str:
-    call_key = f"{room_name}__{session_id}"
-    return f"calls/{safe_key(call_key)}/final/final_summary.json"
+def session_final_summary_path(storage_base_path: str) -> str:
+    return join_storage_path(storage_base_path, "final/final_summary.json")
+
+
+def session_final_transcript_path(storage_base_path: str) -> str:
+    return join_storage_path(storage_base_path, "final/final_transcript.json")
+
+
+def build_final_transcript_payload(room_name: str, session_id: str, now_iso: str) -> dict:
+    transcript, lines = db_get_room_aggregate(room_name, session_id)
+    return {
+        "room_name": room_name,
+        "session_id": session_id,
+        "transcript": transcript,
+        "lines": lines,
+        "line_count": len(lines),
+        "updated_at": now_iso,
+    }
 
 
 def publish_session_minute_exports(
@@ -1997,10 +2171,12 @@ def publish_session_minute_exports(
     session_row = db_get_session_row(room_name, session_id)
     if session_row is None:
         return -1
+    routing = routing_context_from_session_row(session_row)
     done_chunks = db_get_done_chunks_for_session(room_name, session_id)
     shards = build_minute_shards(
         room_name=room_name,
         session_id=session_id,
+        storage_base_path=routing.storage_base_path,
         started_at=session_row["started_at"],
         done_chunks=done_chunks,
         minute_window_seconds=STORAGE_MINUTE_WINDOW_SECONDS,
@@ -2015,26 +2191,28 @@ def publish_session_minute_exports(
             or (finalized and int(previous["finalized"] or 0) == 0)
         )
         if should_upload:
-            firebase_router.upload_minute_transcript(room_name, shard)
+            firebase_router.upload_minute_transcript(routing, shard)
         if summary_enabled and (
             should_upload or previous is None or not previous["summary_json_path"]
         ):
             db_upsert_summary_task(room_name, session_id, shard.minute_index, now_iso)
         db_upsert_minute_export(shard, now_iso)
-        firebase_router.upsert_minute_shard(room_name, shard)
+        firebase_router.upsert_minute_shard(routing, shard)
 
     firebase_router.publish_call_index(
-        room_name=room_name,
-        session_id=session_id,
+        routing=routing,
         status="finalized" if finalized else "processing",
         last_minute_index=last_minute_index,
         finalized=finalized,
         final_summary_path=(
-            session_final_summary_path(room_name, session_id)
+            session_final_summary_path(routing.storage_base_path)
             if finalized and summary_enabled
             else None
         ),
-        summary_accumulated_path=session_summary_accumulated_path(room_name, session_id),
+        summary_accumulated_path=session_summary_accumulated_path(routing.storage_base_path),
+        final_summary_ready=False,
+        final_transcript_path=None,
+        final_transcript_ready=False,
     )
     return last_minute_index
 
@@ -2086,19 +2264,67 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
         room_name = room["room_name"]
         session_id = room["session_id"]
         now_iso = utc_now_iso()
-        await asyncio.to_thread(
-            publish_session_minute_exports,
-            firebase_router,
-            room_name,
-            session_id,
-            now_iso,
-            True,
-            summary_engine.enabled,
-        )
-        if summary_engine.enabled:
-            await asyncio.to_thread(db_upsert_summary_task, room_name, session_id, -1, now_iso)
-        db_mark_room_finalized(room_name, session_id)
-        logger.info("room finalized room=%s session=%s", room_name, session_id)
+        try:
+            last_minute_index = await asyncio.to_thread(
+                publish_session_minute_exports,
+                firebase_router,
+                room_name,
+                session_id,
+                now_iso,
+                True,
+                summary_engine.enabled,
+            )
+            routing = routing_context_from_session_row(room)
+            final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+            final_transcript_payload = await asyncio.to_thread(
+                build_final_transcript_payload, room_name, session_id, now_iso
+            )
+            await asyncio.to_thread(
+                firebase_router.upload_json,
+                routing,
+                final_transcript_path,
+                final_transcript_payload,
+            )
+            logger.info(
+                "final transcript uploaded room=%s session=%s path=%s line_count=%s",
+                room_name,
+                session_id,
+                final_transcript_path,
+                final_transcript_payload["line_count"],
+            )
+            await asyncio.to_thread(
+                firebase_router.publish_call_index,
+                routing=routing,
+                status="finalized",
+                last_minute_index=last_minute_index,
+                finalized=True,
+                final_summary_path=(
+                    session_final_summary_path(routing.storage_base_path)
+                    if summary_engine.enabled
+                    else None
+                ),
+                summary_accumulated_path=session_summary_accumulated_path(routing.storage_base_path),
+                final_summary_ready=False,
+                final_transcript_path=final_transcript_path,
+                final_transcript_ready=True,
+            )
+
+            if summary_engine.enabled:
+                await asyncio.to_thread(db_upsert_summary_task, room_name, session_id, -1, now_iso)
+                logger.info(
+                    "final summary task queued room=%s session=%s minute=-1",
+                    room_name,
+                    session_id,
+                )
+            db_mark_room_finalized(room_name, session_id)
+            logger.info("room finalized room=%s session=%s", room_name, session_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception(
+                "room finalization failed room=%s session=%s error=%s",
+                room_name,
+                session_id,
+                exc,
+            )
 
 
 async def summary_worker_loop(
@@ -2123,7 +2349,14 @@ async def summary_worker_loop(
         minute_index = int(task["minute_index"])
         retries = int(task["retries"])
         try:
-            call_key = f"{room_name}__{session_id}"
+            session_row = await asyncio.to_thread(db_get_session_row, room_name, session_id)
+            if session_row is None:
+                await asyncio.to_thread(
+                    db_mark_summary_task_done, room_name, session_id, minute_index, now_iso
+                )
+                continue
+            routing = routing_context_from_session_row(session_row)
+            session_is_finalized = bool(session_row["finalized_at"])
             if minute_index >= 0:
                 export_row = await asyncio.to_thread(
                     db_get_minute_export, room_name, session_id, minute_index
@@ -2134,16 +2367,16 @@ async def summary_worker_loop(
                     )
                     continue
                 minute_payload = await asyncio.to_thread(
-                    firebase_router.fetch_json, room_name, export_row["transcript_json_path"]
+                    firebase_router.fetch_json, routing, export_row["transcript_json_path"]
                 )
                 lines = minute_payload.get("lines", []) if isinstance(minute_payload, dict) else []
                 minute_summary = await asyncio.to_thread(summary_engine.summarize_minute, lines)
                 summary_path = export_row["summary_json_path"] or (
-                    f"calls/{safe_key(call_key)}/minutes/{minute_index:04d}/summary.json"
+                    join_storage_path(routing.storage_base_path, f"minutes/{minute_index:04d}/summary.json")
                 )
                 await asyncio.to_thread(
                     firebase_router.upload_json,
-                    room_name,
+                    routing,
                     summary_path,
                     {
                         "room_name": room_name,
@@ -2163,15 +2396,14 @@ async def summary_worker_loop(
                 )
                 await asyncio.to_thread(
                     firebase_router.update_minute_summary_link,
-                    room_name,
-                    session_id,
+                    routing,
                     minute_index,
                     summary_path,
                 )
 
-                accumulated_path = session_summary_accumulated_path(room_name, session_id)
+                accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
                 previous_payload = await asyncio.to_thread(
-                    firebase_router.fetch_json, room_name, accumulated_path
+                    firebase_router.fetch_json, routing, accumulated_path
                 )
                 previous_summary = ""
                 if isinstance(previous_payload, dict):
@@ -2181,7 +2413,7 @@ async def summary_worker_loop(
                 )
                 await asyncio.to_thread(
                     firebase_router.upload_json,
-                    room_name,
+                    routing,
                     accumulated_path,
                     {
                         "room_name": room_name,
@@ -2193,13 +2425,14 @@ async def summary_worker_loop(
                 )
                 await asyncio.to_thread(
                     firebase_router.publish_call_index,
-                    room_name,
-                    session_id,
-                    "processing",
-                    minute_index,
-                    False,
-                    None,
-                    accumulated_path,
+                    routing=routing,
+                    status="finalized" if session_is_finalized else "processing",
+                    last_minute_index=minute_index,
+                    finalized=session_is_finalized,
+                    summary_accumulated_path=accumulated_path,
+                    final_summary_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
+                    final_transcript_path=None if not session_is_finalized else CALL_INDEX_UNSET,
+                    final_transcript_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
                 )
             else:
                 exports = await asyncio.to_thread(db_get_session_minute_exports, room_name, session_id)
@@ -2209,7 +2442,7 @@ async def summary_worker_loop(
                     if not summary_path:
                         continue
                     payload = await asyncio.to_thread(
-                        firebase_router.fetch_json, room_name, summary_path
+                        firebase_router.fetch_json, routing, summary_path
                     )
                     if isinstance(payload, dict):
                         text = str(payload.get("summary", "")).strip()
@@ -2218,10 +2451,10 @@ async def summary_worker_loop(
                 merged = "\n".join(summary_parts).strip()
                 if merged:
                     final_summary = await asyncio.to_thread(summary_engine.finalize_summary, merged)
-                    final_path = session_final_summary_path(room_name, session_id)
+                    final_path = session_final_summary_path(routing.storage_base_path)
                     await asyncio.to_thread(
                         firebase_router.upload_json,
-                        room_name,
+                        routing,
                         final_path,
                         {
                             "room_name": room_name,
@@ -2230,16 +2463,25 @@ async def summary_worker_loop(
                             "updated_at": now_iso,
                         },
                     )
-                    accumulated_path = session_summary_accumulated_path(room_name, session_id)
+                    accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
+                    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
                     await asyncio.to_thread(
                         firebase_router.publish_call_index,
+                        routing=routing,
+                        status="finalized",
+                        last_minute_index=exports[-1]["minute_index"] if exports else -1,
+                        finalized=True,
+                        final_summary_path=final_path,
+                        summary_accumulated_path=accumulated_path,
+                        final_summary_ready=True,
+                        final_transcript_path=final_transcript_path,
+                        final_transcript_ready=True,
+                    )
+                    logger.info(
+                        "final summary uploaded room=%s session=%s path=%s",
                         room_name,
                         session_id,
-                        "finalized",
-                        exports[-1]["minute_index"] if exports else -1,
-                        True,
                         final_path,
-                        accumulated_path,
                     )
 
             await asyncio.to_thread(
@@ -2329,7 +2571,9 @@ class AppState:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    logger.info("iniciando servico")
     init_db()
+    logger.info("inicializando reconhecedor modelo=%s tipo=%s", MODEL_DIR, MODEL_TYPE)
     recognizer = build_offline_recognizer()
     hmac_keys = parse_hmac_keys()
     firebase_router = FirebaseRouter.create()
@@ -2350,7 +2594,9 @@ async def lifespan(_: FastAPI):
         summary_worker_task=summary_worker_task,
         worker_stop_event=worker_stop_event,
     )
+    logger.info("servico pronto")
     yield
+    logger.info("encerrando servico")
     runtime: AppState = app.state.runtime
     runtime.worker_stop_event.set()
     if runtime.worker_task:
@@ -2408,7 +2654,16 @@ async def session_start(request: Request) -> JSONResponse:
             reason="invalid_namespace",
         )
 
-    await asyncio.to_thread(db_upsert_start, payload)
+    try:
+        routing = await asyncio.to_thread(
+            runtime.firebase_router.resolve_room_routing_context,
+            payload.room_name,
+            payload.session_id,
+        )
+    except RoomRoutingError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+
+    await asyncio.to_thread(db_upsert_start, payload, routing)
     return JSONResponse({"status": "accepted"}, status_code=202)
 
 
