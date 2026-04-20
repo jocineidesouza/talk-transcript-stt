@@ -20,13 +20,22 @@ services:
       SQLITE_PATH: /data/queue.db
       SPOOL_DIR: /data/spool
       QUEUE_MAX_PENDING: "2000"
+      ROOM_INACTIVITY_TIMEOUT_SECONDS: "1800"
       HMAC_WINDOW_SECONDS: "300"
       STT_HMAC_KEY_ID: default
       STT_HMAC_SECRET: flamengo
-      FIREBASE_ENABLED: "false"
-      FIREBASE_SERVICE_ACCOUNT_FILE: /secrets/firebase-service-account.json
-      FIREBASE_STORAGE_BUCKET: ""
-      FIREBASE_PROJECT_ID: ""
+      FIREBASE_ENABLED: "true"
+      FIREBASE_FLUSH_INTERVAL_SECONDS: "30"
+      STORAGE_MINUTE_WINDOW_SECONDS: "60"
+      FIREBASE_NAMESPACE_CONFIG_JSON: >-
+        {"talk__dev":{"project_id":"dev-atendo","storage_bucket":"dev-atendo.appspot.com","credentials_file":"/secrets/talk-dev-firebaseadmin.json"},"talk__stg":{"project_id":"stage-atendo","storage_bucket":"stage-atendo.appspot.com","credentials_file":"/secrets/talk-stg-firebaseadmin.json"},"talk__prd":{"project_id":"dev-atendo","storage_bucket":"dev-atendo.appspot.com","credentials_file":"/secrets/talk-prd-firebaseadmin.json"},"ellevo-connect__dev":{"project_id":"ellevo-connect-dev","storage_bucket":"ellevo-connect-dev.firebasestorage.app","credentials_file":"/secrets/ellevo-connect-dev-firebaseadmin.json"},"ellevo-connect__stg":{"project_id":"ellevo-connect-stg","storage_bucket":"ellevo-connect-stg.firebasestorage.app","credentials_file":"/secrets/ellevo-connect-stg-firebaseadmin.json"},"ellevo-connect__prd":{"project_id":"ellevo-connect","storage_bucket":"ellevo-connect.firebasestorage.app","credentials_file":"/secrets/ellevo-connect-prd-firebaseadmin.json"}}
+      OPENAI_SUMMARY_ENABLED: "true"
+      OPENAI_APIKEY_FILE: /secrets/openai_apikey.json
+      OPENAI_MODEL_MINUTE_SUMMARY: "gpt-4.1-mini"
+      OPENAI_MODEL_ACCUMULATED_SUMMARY: "gpt-4.1"
+      OPENAI_MODEL_FINAL_SUMMARY: "gpt-4.1"
+      OPENAI_REQUEST_TIMEOUT_SECONDS: "20"
+      OPENAI_MAX_RETRIES: "3"
       LOG_LEVEL: INFO
     volumes:
       - ./stt/models:/models

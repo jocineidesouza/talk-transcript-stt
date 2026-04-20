@@ -6,3 +6,7 @@ __pycache__/
 transcripts_export.json
 stt/data/queue.db
 stt/data/queue.db-shm
+stt/secrets/openai_apikey.json
+stt/secrets/*.json
+!stt/secrets/*.example.json
+stt/data/queue.db-wal
