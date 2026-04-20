@@ -98,6 +98,54 @@ logger = logging.getLogger("stt")
 
 CALL_INDEX_UNSET = object()
 
+DEFAULT_SUMMARIZE_MINUTE_PROMPT = (
+    "Voce e um assistente especializado em resumir trechos de chamadas corporativas em portugues do Brasil. "
+    "Analise APENAS as falas deste minuto e gere um resumo factual, claro e objetivo. "
+    "Regras: use somente o conteudo fornecido; nao invente contexto; nao transforme sugestoes em decisoes; "
+    "nao trate duvidas como conclusoes; preserve nomes de pessoas, sistemas, produtos e funcionalidades; "
+    "se houver ambiguidade, registre com cautela. "
+    "Formato da resposta:\n"
+    "Resumo do minuto:\n"
+    "- 1 a 5 frases objetivas\n\n"
+    "Decisoes identificadas:\n"
+    "- liste apenas decisoes explicitas; se nao houver, escreva 'Nenhuma decisao explicita.'\n\n"
+    "Pendencias ou duvidas:\n"
+    "- liste apenas o que realmente estiver em aberto; se nao houver, escreva 'Nenhuma pendencia explicita.'"
+)
+
+DEFAULT_MERGE_SUMMARIES_PROMPT = (
+    "Voce e um assistente especializado em consolidar resumos acumulados de chamadas corporativas. "
+    "Recebera um resumo acumulado anterior e um novo resumo de minuto. "
+    "Sua tarefa e produzir um novo resumo acumulado, preservando fatos importantes e incorporando apenas novidades reais. "
+    "Regras: mantenha decisoes ja registradas, exceto se o novo conteudo as contradizer explicitamente; "
+    "nao invente contexto; nao transforme sugestoes em decisoes; elimine repeticoes; "
+    "mantenha pendencias ainda abertas; preserve nomes e termos tecnicos exatamente como informados. "
+    "Formato da resposta:\n"
+    "Resumo acumulado:\n"
+    "- 1 a 3 paragrafos coesos\n\n"
+    "Decisoes confirmadas:\n"
+    "- liste apenas decisoes confirmadas; se nao houver, escreva 'Nenhuma decisao confirmada ate o momento.'\n\n"
+    "Pendencias em aberto:\n"
+    "- liste pendencias ainda abertas; se nao houver, escreva 'Nenhuma pendencia em aberto identificada.'"
+)
+
+DEFAULT_FINALIZE_SUMMARY_PROMPT = (
+    "Voce e um assistente especializado em produzir resumos executivos de chamadas corporativas em portugues do Brasil. "
+    "Com base apenas no resumo acumulado fornecido, gere um resumo final claro, objetivo e util para acompanhamento posterior. "
+    "Regras: nao invente decisoes, responsaveis ou prazos; diferencie fatos discutidos, decisoes tomadas e pendencias; "
+    "nao use linguagem vaga; preserve nomes e termos tecnicos. "
+    "Use exatamente esta estrutura:\n\n"
+    "Resumo Final Executivo da Chamada\n\n"
+    "Principais Pontos:\n"
+    "- ...\n\n"
+    "Decisoes:\n"
+    "- ...\n\n"
+    "Pendencias:\n"
+    "- ...\n\n"
+    "Proximos Passos:\n"
+    "- ..."
+)
+
 
 class StartRequest(BaseModel):
     room_name: str = Field(min_length=1)
@@ -231,6 +279,10 @@ def build_firestore_doc_path(vertical: str, slug: str, room_id: str, session_id:
 
 def build_storage_base_path(vertical: str, slug: str, room_id: str, session_id: str) -> str:
     return f"VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}"
+
+
+def build_agent_prompt_doc_path(vertical: str, slug: str, agent_id: str) -> str:
+    return f"VERTICALS/{vertical}/COMPANIES/{slug}/SETTINGS/ai_agents/AGENTS/{agent_id}"
 
 
 def join_storage_path(storage_base_path: str, suffix: str) -> str:
@@ -950,6 +1002,70 @@ class FirebaseRouter:
 
     def fetch_json(self, routing: RoomRoutingContext, object_path: str) -> dict | None:
         return self.sink_for_namespace(routing.namespace).fetch_json(object_path)
+
+    def fetch_agent_prompt(self, routing: RoomRoutingContext, agent_id: str) -> str | None:
+        agent_key = str(agent_id or "").strip()
+        if not agent_key:
+            logger.warning(
+                "agent prompt fallback: agent_id invalido room=%s session=%s",
+                routing.room_name,
+                routing.session_id,
+            )
+            return None
+        sink = self.sink_for_namespace(routing.namespace)
+        if not sink.enabled or sink.firestore_client is None:
+            logger.warning(
+                "agent prompt fallback: firestore indisponivel room=%s session=%s agent_id=%s",
+                routing.room_name,
+                routing.session_id,
+                agent_key,
+            )
+            return None
+        prompt_doc_path = build_agent_prompt_doc_path(routing.vertical, routing.slug, agent_key)
+        try:
+            snapshot = sink.firestore_client.document(prompt_doc_path).get()
+            if not snapshot.exists:
+                return None
+            raw_payload = snapshot.to_dict()
+            payload = raw_payload if isinstance(raw_payload, dict) else {}
+            prompt_raw = payload.get("prompt")
+            if not isinstance(prompt_raw, str):
+                logger.warning(
+                    "agent prompt fallback: campo prompt invalido room=%s session=%s agent_id=%s path=%s",
+                    routing.room_name,
+                    routing.session_id,
+                    agent_key,
+                    prompt_doc_path,
+                )
+                return None
+            prompt = prompt_raw.strip()
+            if not prompt:
+                logger.warning(
+                    "agent prompt fallback: campo prompt vazio room=%s session=%s agent_id=%s path=%s",
+                    routing.room_name,
+                    routing.session_id,
+                    agent_key,
+                    prompt_doc_path,
+                )
+                return None
+            logger.info(
+                "agent prompt override: usando prompt do firebase room=%s session=%s agent_id=%s path=%s",
+                routing.room_name,
+                routing.session_id,
+                agent_key,
+                prompt_doc_path,
+            )
+            return prompt
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "agent prompt fallback: erro ao ler firestore room=%s session=%s agent_id=%s path=%s error=%s",
+                routing.room_name,
+                routing.session_id,
+                agent_key,
+                prompt_doc_path,
+                exc,
+            )
+            return None
 
 
 def db_pending_count() -> int:
@@ -2070,69 +2186,35 @@ class SummaryEngine:
             raise RuntimeError("OpenAI retornou resposta sem texto")
         return text
 
-    def summarize_minute(self, minute_lines: list[dict]) -> str:
+    def summarize_minute(self, minute_lines: list[dict], system_prompt: str | None = None) -> str:
         minute_text = "\n".join(f"[{line['speaker']}] {line['text']}" for line in minute_lines)
+        resolved_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
         return self._request_text(
             self.minute_model,
-            (
-                "Voce e um assistente especializado em resumir trechos de chamadas corporativas em portugues do Brasil. "
-                "Analise APENAS as falas deste minuto e gere um resumo factual, claro e objetivo. "
-                "Regras: use somente o conteudo fornecido; nao invente contexto; nao transforme sugestoes em decisoes; "
-                "nao trate duvidas como conclusoes; preserve nomes de pessoas, sistemas, produtos e funcionalidades; "
-                "se houver ambiguidade, registre com cautela. "
-                "Formato da resposta:\n"
-                "Resumo do minuto:\n"
-                "- 1 a 5 frases objetivas\n\n"
-                "Decisoes identificadas:\n"
-                "- liste apenas decisoes explicitas; se nao houver, escreva 'Nenhuma decisao explicita.'\n\n"
-                "Pendencias ou duvidas:\n"
-                "- liste apenas o que realmente estiver em aberto; se nao houver, escreva 'Nenhuma pendencia explicita.'"
-            ),
+            resolved_prompt or DEFAULT_SUMMARIZE_MINUTE_PROMPT,
             f"Minuto da chamada:\n{minute_text}",
         )
 
-    def merge_summaries(self, previous_summary: str, minute_summary: str) -> str:
+    def merge_summaries(
+        self,
+        previous_summary: str,
+        minute_summary: str,
+        system_prompt: str | None = None,
+    ) -> str:
+        resolved_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
         return self._request_text(
             self.accumulated_model,
-            (
-                "Voce e um assistente especializado em consolidar resumos acumulados de chamadas corporativas. "
-                "Recebera um resumo acumulado anterior e um novo resumo de minuto. "
-                "Sua tarefa e produzir um novo resumo acumulado, preservando fatos importantes e incorporando apenas novidades reais. "
-                "Regras: mantenha decisoes ja registradas, exceto se o novo conteudo as contradizer explicitamente; "
-                "nao invente contexto; nao transforme sugestoes em decisoes; elimine repeticoes; "
-                "mantenha pendencias ainda abertas; preserve nomes e termos tecnicos exatamente como informados. "
-                "Formato da resposta:\n"
-                "Resumo acumulado:\n"
-                "- 1 a 3 paragrafos coesos\n\n"
-                "Decisoes confirmadas:\n"
-                "- liste apenas decisoes confirmadas; se nao houver, escreva 'Nenhuma decisao confirmada ate o momento.'\n\n"
-                "Pendencias em aberto:\n"
-                "- liste pendencias ainda abertas; se nao houver, escreva 'Nenhuma pendencia em aberto identificada.'"
-            ),
+            resolved_prompt or DEFAULT_MERGE_SUMMARIES_PROMPT,
             "Resumo acumulado atual:\n"
             f"{previous_summary or '(vazio)'}\n\n"
             f"Resumo novo do minuto:\n{minute_summary}",
         )
 
-    def finalize_summary(self, merged_summary: str) -> str:
+    def finalize_summary(self, merged_summary: str, system_prompt: str | None = None) -> str:
+        resolved_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
         return self._request_text(
             self.final_model,
-            (
-                "Voce e um assistente especializado em produzir resumos executivos de chamadas corporativas em portugues do Brasil. "
-                "Com base apenas no resumo acumulado fornecido, gere um resumo final claro, objetivo e util para acompanhamento posterior. "
-                "Regras: nao invente decisoes, responsaveis ou prazos; diferencie fatos discutidos, decisoes tomadas e pendencias; "
-                "nao use linguagem vaga; preserve nomes e termos tecnicos. "
-                "Use exatamente esta estrutura:\n\n"
-                "Resumo Final Executivo da Chamada\n\n"
-                "Principais Pontos:\n"
-                "- ...\n\n"
-                "Decisoes:\n"
-                "- ...\n\n"
-                "Pendencias:\n"
-                "- ...\n\n"
-                "Proximos Passos:\n"
-                "- ..."
-            ),
+            resolved_prompt or DEFAULT_FINALIZE_SUMMARY_PROMPT,
             f"Resumo acumulado da chamada:\n{merged_summary}",
         )
 
@@ -2370,7 +2452,12 @@ async def summary_worker_loop(
                     firebase_router.fetch_json, routing, export_row["transcript_json_path"]
                 )
                 lines = minute_payload.get("lines", []) if isinstance(minute_payload, dict) else []
-                minute_summary = await asyncio.to_thread(summary_engine.summarize_minute, lines)
+                minute_system_prompt = await asyncio.to_thread(
+                    firebase_router.fetch_agent_prompt, routing, "stt_summarize_minute"
+                )
+                minute_summary = await asyncio.to_thread(
+                    summary_engine.summarize_minute, lines, minute_system_prompt
+                )
                 summary_path = export_row["summary_json_path"] or (
                     join_storage_path(routing.storage_base_path, f"minutes/{minute_index:04d}/summary.json")
                 )
@@ -2408,8 +2495,14 @@ async def summary_worker_loop(
                 previous_summary = ""
                 if isinstance(previous_payload, dict):
                     previous_summary = str(previous_payload.get("summary", "")).strip()
+                merge_system_prompt = await asyncio.to_thread(
+                    firebase_router.fetch_agent_prompt, routing, "stt_merge_summaries"
+                )
                 merged_summary = await asyncio.to_thread(
-                    summary_engine.merge_summaries, previous_summary, minute_summary
+                    summary_engine.merge_summaries,
+                    previous_summary,
+                    minute_summary,
+                    merge_system_prompt,
                 )
                 await asyncio.to_thread(
                     firebase_router.upload_json,
@@ -2450,7 +2543,14 @@ async def summary_worker_loop(
                             summary_parts.append(text)
                 merged = "\n".join(summary_parts).strip()
                 if merged:
-                    final_summary = await asyncio.to_thread(summary_engine.finalize_summary, merged)
+                    final_system_prompt = await asyncio.to_thread(
+                        firebase_router.fetch_agent_prompt, routing, "stt_finalize_summary"
+                    )
+                    final_summary = await asyncio.to_thread(
+                        summary_engine.finalize_summary,
+                        merged,
+                        final_system_prompt,
+                    )
                     final_path = session_final_summary_path(routing.storage_base_path)
                     await asyncio.to_thread(
                         firebase_router.upload_json,

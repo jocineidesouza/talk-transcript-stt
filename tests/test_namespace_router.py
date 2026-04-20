@@ -235,6 +235,140 @@ class FirebaseRouterTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, "room_index_invalid")
 
+    def test_fetch_agent_prompt_returns_prompt_when_document_exists(self):
+        router = STT_APP.FirebaseRouter(enabled=True, configs_by_namespace={})
+        routing = self.build_routing()
+        fake_snapshot = MagicMock()
+        fake_snapshot.exists = True
+        fake_snapshot.to_dict.return_value = {"prompt": "  Prompt do agente  "}
+        fake_doc = MagicMock()
+        fake_doc.get.return_value = fake_snapshot
+        fake_fs_client = MagicMock()
+        fake_fs_client.document.return_value = fake_doc
+        fake_sink = STT_APP.FirebaseSink(
+            namespace="talk__dev",
+            enabled=True,
+            firestore_client=fake_fs_client,
+            storage_bucket=None,
+        )
+
+        with patch.object(router, "sink_for_namespace", return_value=fake_sink):
+            prompt = router.fetch_agent_prompt(routing, "stt_summarize_minute")
+
+        self.assertEqual(prompt, "Prompt do agente")
+        fake_fs_client.document.assert_called_once_with(
+            "VERTICALS/HEALTH/COMPANIES/acme/SETTINGS/ai_agents/AGENTS/stt_summarize_minute"
+        )
+
+    def test_fetch_agent_prompt_returns_none_when_document_does_not_exist(self):
+        router = STT_APP.FirebaseRouter(enabled=True, configs_by_namespace={})
+        routing = self.build_routing()
+        fake_snapshot = MagicMock()
+        fake_snapshot.exists = False
+        fake_doc = MagicMock()
+        fake_doc.get.return_value = fake_snapshot
+        fake_fs_client = MagicMock()
+        fake_fs_client.document.return_value = fake_doc
+        fake_sink = STT_APP.FirebaseSink(
+            namespace="talk__dev",
+            enabled=True,
+            firestore_client=fake_fs_client,
+            storage_bucket=None,
+        )
+
+        with patch.object(router, "sink_for_namespace", return_value=fake_sink):
+            prompt = router.fetch_agent_prompt(routing, "stt_merge_summaries")
+
+        self.assertIsNone(prompt)
+
+    def test_fetch_agent_prompt_returns_none_when_prompt_is_invalid(self):
+        router = STT_APP.FirebaseRouter(enabled=True, configs_by_namespace={})
+        routing = self.build_routing()
+
+        invalid_payloads = [
+            {"prompt": 123},
+            {"prompt": ""},
+            {"prompt": "   "},
+            {},
+            None,
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                fake_snapshot = MagicMock()
+                fake_snapshot.exists = True
+                fake_snapshot.to_dict.return_value = payload
+                fake_doc = MagicMock()
+                fake_doc.get.return_value = fake_snapshot
+                fake_fs_client = MagicMock()
+                fake_fs_client.document.return_value = fake_doc
+                fake_sink = STT_APP.FirebaseSink(
+                    namespace="talk__dev",
+                    enabled=True,
+                    firestore_client=fake_fs_client,
+                    storage_bucket=None,
+                )
+
+                with patch.object(router, "sink_for_namespace", return_value=fake_sink):
+                    prompt = router.fetch_agent_prompt(routing, "stt_finalize_summary")
+
+                self.assertIsNone(prompt)
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class SummaryEnginePromptTests(unittest.TestCase):
+    def build_engine(self) -> object:
+        return STT_APP.SummaryEngine(
+            enabled=True,
+            api_key="test-key",
+            minute_model="minute-model",
+            accumulated_model="accumulated-model",
+            final_model="final-model",
+            timeout_seconds=20,
+        )
+
+    def test_summarize_minute_uses_external_and_fallback_prompts(self):
+        engine = self.build_engine()
+        minute_lines = [{"speaker": "Alice", "text": "Vamos iniciar"}]
+
+        with patch.object(engine, "_request_text", return_value="ok") as request_mock:
+            engine.summarize_minute(minute_lines, "PROMPT_EXTERNO")
+            engine.summarize_minute(minute_lines)
+
+        self.assertEqual(request_mock.call_args_list[0].args[0], "minute-model")
+        self.assertEqual(request_mock.call_args_list[0].args[1], "PROMPT_EXTERNO")
+        self.assertEqual(
+            request_mock.call_args_list[1].args[1],
+            STT_APP.DEFAULT_SUMMARIZE_MINUTE_PROMPT,
+        )
+
+    def test_merge_summaries_uses_external_and_fallback_prompts(self):
+        engine = self.build_engine()
+
+        with patch.object(engine, "_request_text", return_value="ok") as request_mock:
+            engine.merge_summaries("resumo anterior", "resumo minuto", "PROMPT_MERGE")
+            engine.merge_summaries("resumo anterior", "resumo minuto")
+
+        self.assertEqual(request_mock.call_args_list[0].args[0], "accumulated-model")
+        self.assertEqual(request_mock.call_args_list[0].args[1], "PROMPT_MERGE")
+        self.assertEqual(
+            request_mock.call_args_list[1].args[1],
+            STT_APP.DEFAULT_MERGE_SUMMARIES_PROMPT,
+        )
+
+    def test_finalize_summary_uses_external_and_fallback_prompts(self):
+        engine = self.build_engine()
+
+        with patch.object(engine, "_request_text", return_value="ok") as request_mock:
+            engine.finalize_summary("resumo acumulado", "PROMPT_FINAL")
+            engine.finalize_summary("resumo acumulado")
+
+        self.assertEqual(request_mock.call_args_list[0].args[0], "final-model")
+        self.assertEqual(request_mock.call_args_list[0].args[1], "PROMPT_FINAL")
+        self.assertEqual(
+            request_mock.call_args_list[1].args[1],
+            STT_APP.DEFAULT_FINALIZE_SUMMARY_PROMPT,
+        )
+
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
 class RoutingPathTests(unittest.TestCase):
