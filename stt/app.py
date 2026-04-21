@@ -32,7 +32,7 @@ from starlette.datastructures import UploadFile
 MODEL_DIR = Path(
     os.environ.get(
         "MODEL_DIR",
-        "/models/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
+        "/models/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12",
     )
 )
 SAMPLE_RATE = int(os.environ.get("SAMPLE_RATE", "16000"))
@@ -40,7 +40,7 @@ NUM_THREADS = int(os.environ.get("SHERPA_NUM_THREADS", "3"))
 DECODE_MAX_CONCURRENCY = int(os.environ.get("DECODE_MAX_CONCURRENCY", "1"))
 TAIL_PADDING_SECONDS = float(os.environ.get("TAIL_PADDING_SECONDS", "0.35"))
 MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
-MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
+MODEL_TYPE = os.environ.get("MODEL_TYPE", "nemo_ctc_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
 APP_VERSION = os.environ.get("APP_VERSION", "1.00.01").strip() or "1.00.01"
 

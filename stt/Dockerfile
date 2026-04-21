@@ -3,14 +3,14 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    MODEL_DIR=/models/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01 \
+    MODEL_DIR=/models/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12 \
     SHERPA_NUM_THREADS=3 \
     DECODE_MAX_CONCURRENCY=1 \
     UVICORN_WORKERS=1 \
     SAMPLE_RATE=16000 \
     FEATURE_DIM=80 \
     MODEL_LANGUAGE=pt \
-    MODEL_TYPE=cohere_transcribe_offline_vad_streaming \
+    MODEL_TYPE=nemo_ctc_offline_vad_streaming \
     SQLITE_PATH=/data/queue.db \
     SPOOL_DIR=/data/spool \
     QUEUE_MAX_PENDING=2000 \
