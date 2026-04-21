@@ -591,6 +591,16 @@ def build_offline_recognizer() -> sherpa_onnx.OfflineRecognizer:
             debug=False,
         )
 
+    if MODEL_TYPE.startswith("omnilingual_asr_ctc"):
+        return sherpa_onnx.OfflineRecognizer.from_omnilingual_asr_ctc(
+            model=require_one([MODEL_DIR / "model.int8.onnx", MODEL_DIR / "model.onnx"]),
+            tokens=require_file(MODEL_DIR / "tokens.txt"),
+            num_threads=NUM_THREADS,
+            provider="cpu",
+            decoding_method="greedy_search",
+            debug=False,
+        )
+
     return sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
         model=require_one([MODEL_DIR / "model.int8.onnx", MODEL_DIR / "model.onnx"]),
         tokens=require_file(MODEL_DIR / "tokens.txt"),
