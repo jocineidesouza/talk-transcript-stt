@@ -393,6 +393,10 @@ class RoutingPathTests(unittest.TestCase):
             storage_base,
             "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/session-1",
         )
+        self.assertEqual(
+            STT_APP.build_active_room_doc_path("HEALTH", "acme", "roomA"),
+            "ACTIVE_ROOMS/HEALTH/COMPANIES/acme/ROOMS/roomA",
+        )
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -503,6 +507,39 @@ class CallIndexContractTests(unittest.TestCase):
         self.assertNotIn("final_summary_ready", payload)
         self.assertNotIn("final_transcript_path", payload)
         self.assertNotIn("final_transcript_ready", payload)
+
+    def test_upsert_agent_stt_id_on_start_writes_transcript_and_active_room(self):
+        transcript_ref = MagicMock()
+        active_room_ref = MagicMock()
+        fake_batch = MagicMock()
+        fake_fs_client = MagicMock()
+        fake_fs_client.document.side_effect = [transcript_ref, active_room_ref]
+        fake_fs_client.batch.return_value = fake_batch
+        sink = STT_APP.FirebaseSink(
+            namespace="talk__dev",
+            enabled=True,
+            firestore_client=fake_fs_client,
+            storage_bucket=None,
+        )
+
+        sink.upsert_agent_stt_id_on_start(self.build_routing())
+
+        fake_fs_client.document.assert_any_call(
+            "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/TRANSCRIPT/session-1"
+        )
+        fake_fs_client.document.assert_any_call("ACTIVE_ROOMS/HEALTH/COMPANIES/acme/ROOMS/roomA")
+        fake_batch.set.assert_any_call(
+            transcript_ref,
+            {"agent_stt_id": "session-1"},
+            merge=True,
+        )
+        fake_batch.set.assert_any_call(
+            active_room_ref,
+            {"agent_stt_id": "session-1"},
+            merge=True,
+        )
+        self.assertEqual(fake_batch.set.call_count, 2)
+        fake_batch.commit.assert_called_once()
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")

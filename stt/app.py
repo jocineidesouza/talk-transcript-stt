@@ -288,6 +288,10 @@ def build_storage_base_path(vertical: str, slug: str, room_id: str, session_id: 
     return f"VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}"
 
 
+def build_active_room_doc_path(vertical: str, slug: str, room_id: str) -> str:
+    return f"ACTIVE_ROOMS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}"
+
+
 def build_agent_prompt_doc_path(vertical: str, slug: str, agent_id: str) -> str:
     return f"VERTICALS/{vertical}/COMPANIES/{slug}/SETTINGS/ai_agents/AGENTS/{agent_id}"
 
@@ -749,6 +753,20 @@ class FirebaseSink:
 
         call_ref.set(payload, merge=True)
 
+    def upsert_agent_stt_id_on_start(self, routing: RoomRoutingContext) -> None:
+        if not self.enabled or self.firestore_client is None:
+            return
+
+        batch = self.firestore_client.batch()
+        transcript_ref = self._doc_ref(routing.firestore_doc_path)
+        active_room_ref = self._doc_ref(
+            build_active_room_doc_path(routing.vertical, routing.slug, routing.room_id)
+        )
+        payload = {"agent_stt_id": routing.session_id}
+        batch.set(transcript_ref, payload, merge=True)
+        batch.set(active_room_ref, payload, merge=True)
+        batch.commit()
+
     def upsert_minute_shard(self, routing: RoomRoutingContext, payload: MinuteShardPayload) -> None:
         if not self.enabled or self.firestore_client is None:
             return
@@ -998,6 +1016,9 @@ class FirebaseRouter:
             final_transcript_path=final_transcript_path,
             final_transcript_ready=final_transcript_ready,
         )
+
+    def upsert_agent_stt_id_on_start(self, routing: RoomRoutingContext) -> None:
+        self.sink_for_namespace(routing.namespace).upsert_agent_stt_id_on_start(routing)
 
     def upsert_minute_shard(self, routing: RoomRoutingContext, payload: MinuteShardPayload) -> None:
         self.sink_for_namespace(routing.namespace).upsert_minute_shard(routing, payload)
@@ -2821,6 +2842,17 @@ async def session_start(request: Request) -> JSONResponse:
         )
     except RoomRoutingError as exc:
         raise HTTPException(status_code=409, detail=exc.code) from exc
+
+    try:
+        await asyncio.to_thread(runtime.firebase_router.upsert_agent_stt_id_on_start, routing)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception(
+            "session start failed while writing agent_stt_id room=%s session=%s error=%s",
+            payload.room_name,
+            payload.session_id,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail="firebase_start_write_failed") from exc
 
     await asyncio.to_thread(db_upsert_start, payload, routing)
     return JSONResponse({"status": "accepted"}, status_code=202)
