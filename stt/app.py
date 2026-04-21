@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -40,6 +42,7 @@ TAIL_PADDING_SECONDS = float(os.environ.get("TAIL_PADDING_SECONDS", "0.35"))
 MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
+APP_VERSION = os.environ.get("APP_VERSION", "1.00.01").strip() or "1.00.01"
 
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "/data/queue.db"))
 SPOOL_DIR = Path(os.environ.get("SPOOL_DIR", "/data/spool"))
@@ -76,6 +79,10 @@ OPENAI_MODEL_FINAL_SUMMARY = os.environ.get(
 ).strip()
 OPENAI_REQUEST_TIMEOUT_SECONDS = max(
     5, int(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "20"))
+)
+OPENAI_REQUEST_RETRIES = max(0, int(os.environ.get("OPENAI_REQUEST_RETRIES", "2")))
+OPENAI_REQUEST_RETRY_BASE_SECONDS = max(
+    0.1, float(os.environ.get("OPENAI_REQUEST_RETRY_BASE_SECONDS", "1.5"))
 )
 OPENAI_MAX_RETRIES = max(1, int(os.environ.get("OPENAI_MAX_RETRIES", "3")))
 
@@ -2121,6 +2128,8 @@ class SummaryEngine:
     accumulated_model: str
     final_model: str
     timeout_seconds: int
+    request_retries: int
+    retry_base_seconds: float
 
     @staticmethod
     def create() -> "SummaryEngine":
@@ -2133,6 +2142,8 @@ class SummaryEngine:
                 OPENAI_MODEL_ACCUMULATED_SUMMARY,
                 OPENAI_MODEL_FINAL_SUMMARY,
                 OPENAI_REQUEST_TIMEOUT_SECONDS,
+                OPENAI_REQUEST_RETRIES,
+                OPENAI_REQUEST_RETRY_BASE_SECONDS,
             )
         return SummaryEngine(
             True,
@@ -2141,7 +2152,12 @@ class SummaryEngine:
             OPENAI_MODEL_ACCUMULATED_SUMMARY,
             OPENAI_MODEL_FINAL_SUMMARY,
             OPENAI_REQUEST_TIMEOUT_SECONDS,
+            OPENAI_REQUEST_RETRIES,
+            OPENAI_REQUEST_RETRY_BASE_SECONDS,
         )
+
+    def _retry_delay_seconds(self, attempt: int) -> float:
+        return min(8.0, self.retry_base_seconds * (2**attempt))
 
     def _request_text(self, model: str, system_prompt: str, user_prompt: str) -> str:
         if not self.enabled:
@@ -2168,19 +2184,51 @@ class SummaryEngine:
                 "Authorization": f"Bearer {self.api_key}",
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = ""
+        max_attempts = self.request_retries + 1
+        for attempt in range(max_attempts):
             try:
-                body = exc.read().decode("utf-8", errors="ignore")
-                detail = body[:1200]
-            except Exception:  # pylint: disable=broad-except
+                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
                 detail = ""
-            raise RuntimeError(
-                f"OpenAI request failed status={exc.code} model={model} detail={detail}"
-            ) from exc
+                try:
+                    body = exc.read().decode("utf-8", errors="ignore")
+                    detail = body[:1200]
+                except Exception:  # pylint: disable=broad-except
+                    detail = ""
+                should_retry = exc.code in (408, 409, 429, 500, 502, 503, 504)
+                if should_retry and attempt < (max_attempts - 1):
+                    delay = self._retry_delay_seconds(attempt)
+                    logger.warning(
+                        "OpenAI transient HTTP error model=%s status=%s attempt=%s/%s retry_in=%.1fs",
+                        model,
+                        exc.code,
+                        attempt + 1,
+                        max_attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"OpenAI request failed status={exc.code} model={model} detail={detail}"
+                ) from exc
+            except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+                if attempt < (max_attempts - 1):
+                    delay = self._retry_delay_seconds(attempt)
+                    logger.warning(
+                        "OpenAI request retry model=%s attempt=%s/%s error=%s retry_in=%.1fs",
+                        model,
+                        attempt + 1,
+                        max_attempts,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(f"OpenAI request failed model={model} error={exc}") from exc
+        else:
+            raise RuntimeError(f"OpenAI request failed model={model} error=retry loop exhausted")
         text = extract_openai_output_text(payload)
         if not text:
             raise RuntimeError("OpenAI retornou resposta sem texto")
@@ -2671,7 +2719,7 @@ class AppState:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    logger.info("iniciando servico")
+    logger.info("iniciando servico version=%s", APP_VERSION)
     init_db()
     logger.info("inicializando reconhecedor modelo=%s tipo=%s", MODEL_DIR, MODEL_TYPE)
     recognizer = build_offline_recognizer()
@@ -2694,7 +2742,7 @@ async def lifespan(_: FastAPI):
         summary_worker_task=summary_worker_task,
         worker_stop_event=worker_stop_event,
     )
-    logger.info("servico pronto")
+    logger.info("servico pronto version=%s", APP_VERSION)
     yield
     logger.info("encerrando servico")
     runtime: AppState = app.state.runtime
@@ -2714,6 +2762,7 @@ async def health() -> dict:
     runtime: AppState = app.state.runtime
     return {
         "status": "ok",
+        "version": APP_VERSION,
         "model_dir": str(MODEL_DIR),
         "model_type": MODEL_TYPE,
         "language": MODEL_LANGUAGE,
