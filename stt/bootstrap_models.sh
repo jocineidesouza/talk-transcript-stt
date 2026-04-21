@@ -2,7 +2,7 @@
 set -eu
 
 MODELS_ROOT="${MODELS_ROOT:-/models}"
-MODEL_NAME="${MODEL_NAME:-sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12}"
+MODEL_NAME="${MODEL_NAME:-sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01}"
 MODEL_DIR="${MODEL_DIR:-${MODELS_ROOT}/${MODEL_NAME}}"
 MODEL_TAR="${MODELS_ROOT}/${MODEL_NAME}.tar.bz2"
 MODEL_TAR_TMP="${MODEL_TAR}.part"
@@ -10,7 +10,7 @@ MODEL_URL="${MODEL_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/
 PT_TEST_WAV="${PT_TEST_WAV:-${MODELS_ROOT}/pt_br.wav}"
 PT_TEST_WAV_URL="${PT_TEST_WAV_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/pt_br.wav}"
 AUTO_DOWNLOAD_MODEL="${AUTO_DOWNLOAD_MODEL:-1}"
-MODEL_TYPE="${MODEL_TYPE:-nemo_ctc_offline_vad_streaming}"
+MODEL_TYPE="${MODEL_TYPE:-cohere_transcribe_offline_vad_streaming}"
 DOWNLOAD_RETRIES="${DOWNLOAD_RETRIES:-3}"
 COHERE_ENCODER_DATA_MIN_BYTES="${COHERE_ENCODER_DATA_MIN_BYTES:-2500000000}"
 
