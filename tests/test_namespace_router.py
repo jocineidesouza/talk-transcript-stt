@@ -50,13 +50,14 @@ class FirebaseRouterTests(unittest.TestCase):
             namespace="talk__dev",
             room_name="talk__dev__roomA",
             room_id="roomA",
-            session_id="session-1",
+            call_session_id="RM_session-1",
+            transcript_session_id="session-1",
             vertical="HEALTH",
             slug="acme",
             firestore_doc_path=(
-                "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/TRANSCRIPT/session-1"
+                "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1"
             ),
-            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/session-1",
+            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
         )
 
     def test_router_reuses_cached_sink_for_same_namespace(self):
@@ -159,7 +160,9 @@ class FirebaseRouterTests(unittest.TestCase):
         )
 
         with patch.object(router, "_get_or_create_sink", return_value=fake_sink):
-            routing = router.resolve_room_routing_context("talk__dev__roomA", "session-1")
+            routing = router.resolve_room_routing_context(
+                "talk__dev__roomA", "RM_session-1", "session-1"
+            )
 
         self.assertEqual(routing.namespace, "talk__dev")
         self.assertEqual(routing.room_id, "roomA")
@@ -167,11 +170,11 @@ class FirebaseRouterTests(unittest.TestCase):
         self.assertEqual(routing.slug, "acme")
         self.assertEqual(
             routing.firestore_doc_path,
-            "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/TRANSCRIPT/session-1",
+            "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
         )
         self.assertEqual(
             routing.storage_base_path,
-            "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/session-1",
+            "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
         )
         fake_fs_client.collection.assert_called_once_with("LIVEKIT_ROOM_INDEX")
         fake_collection.document.assert_called_once_with("talk__dev__roomA")
@@ -201,7 +204,7 @@ class FirebaseRouterTests(unittest.TestCase):
 
         with patch.object(router, "_get_or_create_sink", return_value=fake_sink):
             with self.assertRaises(STT_APP.RoomRoutingError) as ctx:
-                router.resolve_room_routing_context("talk__dev__roomA", "session-1")
+                router.resolve_room_routing_context("talk__dev__roomA", "RM_session-1", None)
 
         self.assertEqual(ctx.exception.code, "room_index_not_found")
 
@@ -231,7 +234,7 @@ class FirebaseRouterTests(unittest.TestCase):
 
         with patch.object(router, "_get_or_create_sink", return_value=fake_sink):
             with self.assertRaises(STT_APP.RoomRoutingError) as ctx:
-                router.resolve_room_routing_context("talk__dev__roomA", "session-1")
+                router.resolve_room_routing_context("talk__dev__roomA", "RM_session-1", None)
 
         self.assertEqual(ctx.exception.code, "room_index_invalid")
 
@@ -330,44 +333,94 @@ class SummaryEnginePromptTests(unittest.TestCase):
         engine = self.build_engine()
         minute_lines = [{"speaker": "Alice", "text": "Vamos iniciar"}]
 
-        with patch.object(engine, "_request_text", return_value="ok") as request_mock:
+        with patch.object(engine, "_request_json", return_value={}) as request_mock:
             engine.summarize_minute(minute_lines, "PROMPT_EXTERNO")
             engine.summarize_minute(minute_lines)
 
-        self.assertEqual(request_mock.call_args_list[0].args[0], "minute-model")
-        self.assertEqual(request_mock.call_args_list[0].args[1], "PROMPT_EXTERNO")
+        self.assertEqual(request_mock.call_args_list[0].args[0], STT_APP.SUMMARY_KIND_MINUTE)
+        self.assertEqual(request_mock.call_args_list[0].args[1], "minute-model")
         self.assertEqual(
-            request_mock.call_args_list[1].args[1],
-            STT_APP.DEFAULT_SUMMARIZE_MINUTE_PROMPT,
+            request_mock.call_args_list[0].args[2],
+            "PROMPT_EXTERNO\n\n" + STT_APP.CONTRACT_SUFFIX_MINUTE,
+        )
+        self.assertEqual(
+            request_mock.call_args_list[1].args[2],
+            STT_APP.DEFAULT_SUMMARIZE_MINUTE_PROMPT.strip() + "\n\n" + STT_APP.CONTRACT_SUFFIX_MINUTE,
         )
 
     def test_merge_summaries_uses_external_and_fallback_prompts(self):
         engine = self.build_engine()
+        previous_summary = STT_APP.default_accumulated_summary_payload()
+        minute_summary = {
+            "chunk_type": "mista",
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
 
-        with patch.object(engine, "_request_text", return_value="ok") as request_mock:
-            engine.merge_summaries("resumo anterior", "resumo minuto", "PROMPT_MERGE")
-            engine.merge_summaries("resumo anterior", "resumo minuto")
+        with patch.object(engine, "_request_json", return_value={}) as request_mock:
+            engine.merge_summaries(previous_summary, minute_summary, "PROMPT_MERGE")
+            engine.merge_summaries(previous_summary, minute_summary)
 
-        self.assertEqual(request_mock.call_args_list[0].args[0], "accumulated-model")
-        self.assertEqual(request_mock.call_args_list[0].args[1], "PROMPT_MERGE")
+        self.assertEqual(request_mock.call_args_list[0].args[0], STT_APP.SUMMARY_KIND_ACCUMULATED)
+        self.assertEqual(request_mock.call_args_list[0].args[1], "accumulated-model")
         self.assertEqual(
-            request_mock.call_args_list[1].args[1],
-            STT_APP.DEFAULT_MERGE_SUMMARIES_PROMPT,
+            request_mock.call_args_list[0].args[2],
+            "PROMPT_MERGE\n\n" + STT_APP.CONTRACT_SUFFIX_ACCUMULATED,
+        )
+        self.assertEqual(
+            request_mock.call_args_list[1].args[2],
+            STT_APP.DEFAULT_MERGE_SUMMARIES_PROMPT.strip()
+            + "\n\n"
+            + STT_APP.CONTRACT_SUFFIX_ACCUMULATED,
         )
 
     def test_finalize_summary_uses_external_and_fallback_prompts(self):
         engine = self.build_engine()
+        merged_summary = STT_APP.default_accumulated_summary_payload()
 
-        with patch.object(engine, "_request_text", return_value="ok") as request_mock:
-            engine.finalize_summary("resumo acumulado", "PROMPT_FINAL")
-            engine.finalize_summary("resumo acumulado")
+        with patch.object(engine, "_request_json", return_value={}) as request_mock:
+            engine.finalize_summary(merged_summary, "PROMPT_FINAL")
+            engine.finalize_summary(merged_summary)
 
-        self.assertEqual(request_mock.call_args_list[0].args[0], "final-model")
-        self.assertEqual(request_mock.call_args_list[0].args[1], "PROMPT_FINAL")
+        self.assertEqual(request_mock.call_args_list[0].args[0], STT_APP.SUMMARY_KIND_FINAL)
+        self.assertEqual(request_mock.call_args_list[0].args[1], "final-model")
         self.assertEqual(
-            request_mock.call_args_list[1].args[1],
-            STT_APP.DEFAULT_FINALIZE_SUMMARY_PROMPT,
+            request_mock.call_args_list[0].args[2],
+            "PROMPT_FINAL\n\n" + STT_APP.CONTRACT_SUFFIX_FINAL,
         )
+        self.assertEqual(
+            request_mock.call_args_list[1].args[2],
+            STT_APP.DEFAULT_FINALIZE_SUMMARY_PROMPT.strip() + "\n\n" + STT_APP.CONTRACT_SUFFIX_FINAL,
+        )
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class SummarySchemaValidationTests(unittest.TestCase):
+    def test_parse_and_validate_summary_output_accepts_minute_payload(self):
+        raw = json.dumps(
+            {
+                "chunk_type": "tecnica",
+                "facts": [],
+                "hypotheses": [],
+                "decisions": [],
+                "open_items": [],
+                "next_steps": [],
+                "notes": [],
+            }
+        )
+        parsed = STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_MINUTE, raw)
+        self.assertEqual(parsed["chunk_type"], "tecnica")
+
+    def test_parse_and_validate_summary_output_rejects_invalid_payload(self):
+        with self.assertRaises(RuntimeError):
+            STT_APP.parse_and_validate_summary_output(
+                STT_APP.SUMMARY_KIND_MINUTE,
+                json.dumps({"chunk_type": "tecnica"}),
+            )
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -377,25 +430,21 @@ class RoutingPathTests(unittest.TestCase):
             vertical="HEALTH",
             slug="acme",
             room_id="roomA",
-            session_id="session-1",
+            call_session_id="RM_session-1",
         )
         storage_base = STT_APP.build_storage_base_path(
             vertical="HEALTH",
             slug="acme",
             room_id="roomA",
-            session_id="session-1",
+            call_session_id="RM_session-1",
         )
         self.assertEqual(
             doc_path,
-            "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/TRANSCRIPT/session-1",
+            "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
         )
         self.assertEqual(
             storage_base,
-            "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/session-1",
-        )
-        self.assertEqual(
-            STT_APP.build_active_room_doc_path("HEALTH", "acme", "roomA"),
-            "ACTIVE_ROOMS/HEALTH/COMPANIES/acme/ROOMS/roomA",
+            "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
         )
 
 
@@ -440,13 +489,14 @@ class CallIndexContractTests(unittest.TestCase):
             namespace="talk__dev",
             room_name="talk__dev__roomA",
             room_id="roomA",
-            session_id="session-1",
+            call_session_id="RM_session-1",
+            transcript_session_id="session-1",
             vertical="HEALTH",
             slug="acme",
             firestore_doc_path=(
-                "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/TRANSCRIPT/session-1"
+                "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1"
             ),
-            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/session-1",
+            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
         )
 
     def test_publish_call_index_writes_new_ready_fields_when_explicit(self):
@@ -508,13 +558,10 @@ class CallIndexContractTests(unittest.TestCase):
         self.assertNotIn("final_transcript_path", payload)
         self.assertNotIn("final_transcript_ready", payload)
 
-    def test_upsert_agent_stt_id_on_start_writes_transcript_and_active_room(self):
-        transcript_ref = MagicMock()
-        active_room_ref = MagicMock()
-        fake_batch = MagicMock()
+    def test_upsert_room_session_links_on_start_writes_only_session_doc(self):
+        session_ref = MagicMock()
         fake_fs_client = MagicMock()
-        fake_fs_client.document.side_effect = [transcript_ref, active_room_ref]
-        fake_fs_client.batch.return_value = fake_batch
+        fake_fs_client.document.return_value = session_ref
         sink = STT_APP.FirebaseSink(
             namespace="talk__dev",
             enabled=True,
@@ -522,33 +569,116 @@ class CallIndexContractTests(unittest.TestCase):
             storage_bucket=None,
         )
 
-        sink.upsert_agent_stt_id_on_start(self.build_routing())
+        sink.upsert_room_session_links_on_start(self.build_routing())
 
-        fake_fs_client.document.assert_any_call(
-            "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/TRANSCRIPT/session-1"
+        fake_fs_client.document.assert_called_once_with(
+            "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1"
         )
-        fake_fs_client.document.assert_any_call("ACTIVE_ROOMS/HEALTH/COMPANIES/acme/ROOMS/roomA")
-        fake_batch.set.assert_any_call(
-            transcript_ref,
-            {"agent_stt_id": "session-1"},
-            merge=True,
-        )
-        fake_batch.set.assert_any_call(
-            active_room_ref,
-            {"agent_stt_id": "session-1"},
-            merge=True,
-        )
-        self.assertEqual(fake_batch.set.call_count, 2)
-        fake_batch.commit.assert_called_once()
+        payload = session_ref.set.call_args.args[0]
+        self.assertEqual(payload["call_session_id"], "RM_session-1")
+        self.assertEqual(payload["transcript_session_id"], "session-1")
 
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class SummaryToleranceAndFinalizationClaimTests(unittest.TestCase):
+    def test_validate_minute_summary_payload_normalizes_invalid_notes_confidence(self):
+        payload = {
+            "chunk_type": "mista",
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [
+                {
+                    "text": "ponto com baixa confianca",
+                    "confidence": "HIGH",
+                    "status": "info",
+                    "tags": ["ruido"],
+                }
+            ],
+        }
+        normalized = STT_APP.validate_minute_summary_payload(payload)
+        self.assertEqual(normalized["notes"][0]["confidence"], "medium")
+
+    def test_validate_minute_summary_payload_normalizes_invalid_hypotheses_confidence(self):
+        payload = {
+            "chunk_type": "mista",
+            "facts": [],
+            "hypotheses": [
+                {
+                    "text": "hipotese inicial",
+                    "confidence": "unknown",
+                    "status": "uncertain",
+                    "tags": ["hipotese"],
+                }
+            ],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        normalized = STT_APP.validate_minute_summary_payload(payload)
+        self.assertEqual(normalized["hypotheses"][0]["confidence"], "medium")
+
+    def test_db_claim_room_finalization_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.db"
+            spool_dir = Path(tmpdir) / "spool"
+            with patch.object(STT_APP, "SQLITE_PATH", db_path):
+                with patch.object(STT_APP, "SPOOL_DIR", spool_dir):
+                    STT_APP.init_db()
+                    now = "2026-04-22T16:30:00+00:00"
+                    conn = STT_APP.read_db_connection()
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO sessions(
+                                room_name, session_id, call_session_id, transcript_session_id, room_id, vertical, slug,
+                                firestore_doc_path, storage_base_path,
+                                started_at, state, room_end_received, last_chunk_at, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'room_ended', 1, ?, ?, ?)
+                            """,
+                            (
+                                "talk__dev__roomA",
+                                "RM_session-1",
+                                "RM_session-1",
+                                None,
+                                "roomA",
+                                "HEALTH",
+                                "acme",
+                                "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
+                                "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
+                                now,
+                                now,
+                                now,
+                                now,
+                            ),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    first = STT_APP.db_claim_room_finalization(
+                        "talk__dev__roomA", "RM_session-1", now
+                    )
+                    second = STT_APP.db_claim_room_finalization(
+                        "talk__dev__roomA", "RM_session-1", now
+                    )
+
+                    self.assertTrue(first)
+                    self.assertFalse(second)
+
+                    row = STT_APP.db_get_session_row("talk__dev__roomA", "RM_session-1")
+                    self.assertEqual(row["state"], "finalizing")
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
 class FinalTranscriptTests(unittest.TestCase):
     def test_session_final_transcript_path_matches_expected_structure(self):
-        base = "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/session-1"
+        base = "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1"
         self.assertEqual(
             STT_APP.session_final_transcript_path(base),
-            "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/session-1/final/final_transcript.json",
+            "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1/final/final_transcript.json",
         )
 
     def test_build_final_transcript_payload_uses_room_aggregate(self):
@@ -563,7 +693,8 @@ class FinalTranscriptTests(unittest.TestCase):
         with patch.object(STT_APP, "db_get_room_aggregate", return_value=("[Alice] Oi", lines)):
             payload = STT_APP.build_final_transcript_payload(
                 room_name="talk__dev__roomA",
-                session_id="session-1",
+                call_session_id="RM_session-1",
+                transcript_session_id="session-1",
                 now_iso="2026-04-18T10:10:00+00:00",
             )
 
@@ -589,7 +720,7 @@ class FinalTranscriptTests(unittest.TestCase):
                                 state, room_end_received, last_chunk_at, created_at, updated_at
                             ) VALUES (?, ?, ?, 'active', 0, ?, ?, ?)
                             """,
-                            ("talk__dev__roomA", "session-1", now, now, now, now),
+                            ("talk__dev__roomA", "RM_session-1", now, now, now, now),
                         )
                         conn.execute(
                             """
@@ -598,7 +729,7 @@ class FinalTranscriptTests(unittest.TestCase):
                                 started_at, state, last_seq, created_at, updated_at
                             ) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)
                             """,
-                            ("talk__dev__roomA", "session-1", "user_a", "Alice", now, now, now),
+                            ("talk__dev__roomA", "RM_session-1", "user_a", "Alice", now, now, now),
                         )
                         conn.execute(
                             """
@@ -607,7 +738,7 @@ class FinalTranscriptTests(unittest.TestCase):
                                 started_at, state, last_seq, created_at, updated_at
                             ) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)
                             """,
-                            ("talk__dev__roomA", "session-1", "user_b", "Bruno", now, now, now),
+                            ("talk__dev__roomA", "RM_session-1", "user_b", "Bruno", now, now, now),
                         )
                         conn.execute(
                             """
@@ -619,7 +750,7 @@ class FinalTranscriptTests(unittest.TestCase):
                             """,
                             (
                                 "talk__dev__roomA",
-                                "session-1",
+                                "RM_session-1",
                                 "user_b",
                                 1,
                                 "track-b",
@@ -645,7 +776,7 @@ class FinalTranscriptTests(unittest.TestCase):
                             """,
                             (
                                 "talk__dev__roomA",
-                                "session-1",
+                                "RM_session-1",
                                 "user_a",
                                 1,
                                 "track-a",
@@ -671,7 +802,7 @@ class FinalTranscriptTests(unittest.TestCase):
                             """,
                             (
                                 "talk__dev__roomA",
-                                "session-1",
+                                "RM_session-1",
                                 "user_b",
                                 2,
                                 "track-b",
@@ -691,7 +822,7 @@ class FinalTranscriptTests(unittest.TestCase):
                     finally:
                         conn.close()
 
-                    transcript, lines = STT_APP.db_get_room_aggregate("talk__dev__roomA", "session-1")
+                    transcript, lines = STT_APP.db_get_room_aggregate("talk__dev__roomA", "RM_session-1")
 
         self.assertEqual([line["speaker"] for line in lines], ["Alice", "Bruno", "Bruno"])
         self.assertEqual([line["seq"] for line in lines], [1, 1, 2])

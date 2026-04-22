@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Callable
 
 import firebase_admin
 import numpy as np
@@ -105,68 +106,533 @@ logger = logging.getLogger("stt")
 
 CALL_INDEX_UNSET = object()
 
-DEFAULT_SUMMARIZE_MINUTE_PROMPT = (
-    "Voce e um assistente especializado em resumir trechos de chamadas corporativas em portugues do Brasil. "
-    "Analise APENAS as falas deste minuto e gere um resumo factual, claro e objetivo. "
-    "Regras: use somente o conteudo fornecido; nao invente contexto; nao transforme sugestoes em decisoes; "
-    "nao trate duvidas como conclusoes; preserve nomes de pessoas, sistemas, produtos e funcionalidades; "
-    "se houver ambiguidade, registre com cautela. "
-    "Formato da resposta:\n"
-    "Resumo do minuto:\n"
-    "- 1 a 5 frases objetivas\n\n"
-    "Decisoes identificadas:\n"
-    "- liste apenas decisoes explicitas; se nao houver, escreva 'Nenhuma decisao explicita.'\n\n"
-    "Pendencias ou duvidas:\n"
-    "- liste apenas o que realmente estiver em aberto; se nao houver, escreva 'Nenhuma pendencia explicita.'"
+DEFAULT_SUMMARIZE_MINUTE_PROMPT = """Voce e um assistente especializado em analisar trechos de chamadas corporativas em portugues do Brasil.
+
+Entrada:
+- Um TRECHO de conversa referente a um intervalo arbitrario (ex.: 30s, 1min, 3min, 5min).
+- O trecho pode estar incompleto, com interrupcoes, mudancas de contexto, erros de transcricao e falas fragmentadas.
+
+Tarefa:
+- Extrair informacoes estruturadas APENAS do trecho recebido, de forma conservadora e confiavel.
+- Seguir estritamente o contrato JSON de saida fornecido separadamente.
+
+Regras obrigatorias:
+- Use somente o conteudo do trecho.
+- Nao invente contexto anterior/posterior.
+- Nao complete raciocinios interrompidos.
+- Nao inferir datas, prazos, responsaveis ou sequencias temporais a partir de fala ambigua.
+- Nao transformar sugestoes, hipoteses, perguntas, desejos, intencoes ou condicionais em decisoes/fatos.
+- Acoes futuras nunca entram em facts.
+- Perguntas sem resposta entram em open_items ou notes, nunca em facts.
+- Se houver contradicao interna, nao resolver: registrar em notes.
+- Se termo/nome estiver pouco confiavel, nao tratar como entidade confiavel.
+- Priorize confiabilidade sobre completude.
+- Elimine duplicacao semantica entre categorias.
+- Se houver duvida entre facts e hypotheses, priorize hypotheses.
+- hypotheses e notes nao podem ter confidence=high.
+- Tags curtas e especificas.
+- Limites: text max 240 caracteres; tags entre 1 e 4 itens; maximo 8 itens por categoria.
+- Se o trecho for inutil/ruidoso, retornar arrays vazios e registrar 1 note curta.
+"""
+
+DEFAULT_MERGE_SUMMARIES_PROMPT = """Voce e um assistente responsavel por atualizar o estado acumulado de uma chamada corporativa em portugues do Brasil.
+
+Entrada:
+1) estado acumulado anterior em JSON
+2) novo resumo de trecho (chunk) em JSON
+
+Tarefa:
+- Atualizar o estado acumulado usando apenas as informacoes recebidas.
+- Nao reescrever do zero.
+- Seguir estritamente o contrato JSON de saida fornecido separadamente.
+
+Regras obrigatorias:
+- Nao inventar informacoes.
+- Nao promover hypotheses para facts/decisions sem evidencia explicita.
+- Nao transformar planos/condicionais em fatos confirmados.
+- Eliminar duplicacoes literais e semanticas.
+- Manter a versao mais clara/completa/confiavel quando houver equivalencia.
+- Nao sobrescrever fatos anteriores sem evidencia explicita.
+- Em contradicoes relevantes, manter as visoes e registrar inconsistencia em notes.
+- conversation_types: manter existentes e adicionar novos sem duplicar.
+- next_steps so vira fact com evidencia explicita posterior.
+- open_items so remove com evidencia explicita de resolucao.
+- hypotheses so remove com confirmacao/invalidacao explicita.
+- Consolidar agressivamente para evitar listas infladas.
+- hypotheses e notes nao podem ter confidence=high.
+- Limites: text max 240 caracteres; tags entre 1 e 4 itens; maximo 20 itens por categoria.
+- Retornar arrays vazios quando categoria nao tiver itens.
+"""
+
+DEFAULT_FINALIZE_SUMMARY_PROMPT = """Voce e um assistente especializado em produzir resumo final estruturado de chamadas corporativas em portugues do Brasil.
+
+Entrada:
+- Estado acumulado em JSON.
+
+Tarefa:
+- Gerar resumo final fiel, claro, conservador e util para exibicao em frontend.
+- Seguir estritamente o contrato JSON de saida fornecido separadamente.
+
+Objetivo:
+- Explicar o que aconteceu, o que foi decidido, o que esta em aberto, proximos passos e pontos de baixa confianca/ambiguidade.
+
+Regras obrigatorias:
+- Use apenas informacoes do estado acumulado.
+- Nao invente fatos, decisoes, prazos, responsaveis ou contexto extra.
+- Nao transformar hypotheses em conclusoes.
+- Nao transformar next_steps em fatos realizados.
+- Nao transformar pending_items em decisoes.
+- Consolidar redundancias e manter apenas o que for mais claro/relevante/confiavel.
+- Nao repetir o mesmo conteudo em secoes diferentes sem necessidade.
+- Se nao houver decisao explicita, inserir exatamente:
+  "Nenhuma decisao explicita foi registrada."
+- title deve ser exatamente: "Resumo Final Executivo da Chamada".
+- conversation_types deve refletir o estado acumulado.
+- Limites: text max 280 caracteres; tags entre 1 e 4 itens; maximo 12 itens por categoria.
+- Retornar arrays vazios quando categoria nao tiver itens (exceto regra de decisions acima).
+"""
+
+SUMMARY_KIND_MINUTE = "minute"
+SUMMARY_KIND_ACCUMULATED = "accumulated"
+SUMMARY_KIND_FINAL = "final"
+
+SUMMARY_ALLOWED_TYPES = {"tecnica", "executiva", "operacional", "comercial", "mista"}
+SUMMARY_ALLOWED_CONFIDENCE = {"high", "medium", "low"}
+
+SUMMARY_SCHEMA_MINUTE = {
+    "chunk_type": "tecnica|executiva|operacional|comercial|mista",
+    "facts": [{"text": "string", "confidence": "high|medium|low", "status": "confirmed|uncertain", "tags": ["string"]}],
+    "hypotheses": [{"text": "string", "confidence": "medium|low", "status": "uncertain", "tags": ["string"]}],
+    "decisions": [{"text": "string", "confidence": "high|medium|low", "status": "confirmed", "tags": ["string"]}],
+    "open_items": [{"text": "string", "confidence": "high|medium|low", "status": "open", "tags": ["string"]}],
+    "next_steps": [{"text": "string", "confidence": "high|medium|low", "status": "planned", "tags": ["string"]}],
+    "notes": [{"text": "string", "confidence": "medium|low", "status": "uncertain|info", "tags": ["string"]}],
+}
+
+SUMMARY_SCHEMA_ACCUMULATED = {
+    "conversation_types": ["tecnica|executiva|operacional|comercial|mista"],
+    "facts": [{"text": "string", "confidence": "high|medium|low", "status": "confirmed|uncertain", "tags": ["string"]}],
+    "hypotheses": [{"text": "string", "confidence": "medium|low", "status": "uncertain", "tags": ["string"]}],
+    "decisions": [{"text": "string", "confidence": "high|medium|low", "status": "confirmed", "tags": ["string"]}],
+    "open_items": [{"text": "string", "confidence": "high|medium|low", "status": "open", "tags": ["string"]}],
+    "next_steps": [{"text": "string", "confidence": "high|medium|low", "status": "planned", "tags": ["string"]}],
+    "notes": [{"text": "string", "confidence": "medium|low", "status": "uncertain|info", "tags": ["string"]}],
+}
+
+SUMMARY_SCHEMA_FINAL = {
+    "title": "Resumo Final Executivo da Chamada",
+    "conversation_types": ["tecnica|executiva|operacional|comercial|mista"],
+    "main_points": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
+    "decisions": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
+    "pending_items": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
+    "next_steps": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
+    "additional_notes": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
+}
+
+CONTRACT_SUFFIX_MINUTE = (
+    "Saida:\n"
+    "- Retorne APENAS JSON valido, sem markdown, sem explicacoes e sem texto adicional.\n"
+    "- Nao adicionar campos fora do contrato.\n"
+    "- Regra obrigatoria de confidence por secao:\n"
+    "  * hypotheses[].confidence: apenas low ou medium (nunca high)\n"
+    "  * notes[].confidence: apenas low ou medium (nunca high)\n"
+    "Use exatamente este schema:\n"
+    f"{json.dumps(SUMMARY_SCHEMA_MINUTE, ensure_ascii=True, indent=2)}"
 )
 
-DEFAULT_MERGE_SUMMARIES_PROMPT = (
-    "Voce e um assistente especializado em consolidar resumos acumulados de chamadas corporativas. "
-    "Recebera um resumo acumulado anterior e um novo resumo de minuto. "
-    "Sua tarefa e produzir um novo resumo acumulado, preservando fatos importantes e incorporando apenas novidades reais. "
-    "Regras: mantenha decisoes ja registradas, exceto se o novo conteudo as contradizer explicitamente; "
-    "nao invente contexto; nao transforme sugestoes em decisoes; elimine repeticoes; "
-    "mantenha pendencias ainda abertas; preserve nomes e termos tecnicos exatamente como informados. "
-    "Formato da resposta:\n"
-    "Resumo acumulado:\n"
-    "- 1 a 3 paragrafos coesos\n\n"
-    "Decisoes confirmadas:\n"
-    "- liste apenas decisoes confirmadas; se nao houver, escreva 'Nenhuma decisao confirmada ate o momento.'\n\n"
-    "Pendencias em aberto:\n"
-    "- liste pendencias ainda abertas; se nao houver, escreva 'Nenhuma pendencia em aberto identificada.'"
+CONTRACT_SUFFIX_ACCUMULATED = (
+    "Saida:\n"
+    "- Retorne APENAS JSON valido, sem markdown, sem explicacoes e sem texto adicional.\n"
+    "- Nao adicionar campos fora do contrato.\n"
+    "Use exatamente este schema:\n"
+    f"{json.dumps(SUMMARY_SCHEMA_ACCUMULATED, ensure_ascii=True, indent=2)}"
 )
 
-DEFAULT_FINALIZE_SUMMARY_PROMPT = (
-    "Voce e um assistente especializado em produzir resumos executivos de chamadas corporativas em portugues do Brasil. "
-    "Com base apenas no resumo acumulado fornecido, gere um resumo final claro, objetivo e util para acompanhamento posterior. "
-    "Regras: nao invente decisoes, responsaveis ou prazos; diferencie fatos discutidos, decisoes tomadas e pendencias; "
-    "nao use linguagem vaga; preserve nomes e termos tecnicos. "
-    "Use exatamente esta estrutura:\n\n"
-    "Resumo Final Executivo da Chamada\n\n"
-    "Principais Pontos:\n"
-    "- ...\n\n"
-    "Decisoes:\n"
-    "- ...\n\n"
-    "Pendencias:\n"
-    "- ...\n\n"
-    "Proximos Passos:\n"
-    "- ..."
+CONTRACT_SUFFIX_FINAL = (
+    "Saida:\n"
+    "- Retorne APENAS JSON valido, sem markdown, sem explicacoes e sem texto adicional.\n"
+    "- Nao adicionar campos fora do contrato.\n"
+    "Use exatamente este schema:\n"
+    f"{json.dumps(SUMMARY_SCHEMA_FINAL, ensure_ascii=True, indent=2)}"
 )
+
+
+def build_effective_system_prompt(
+    system_prompt_override: str | None,
+    default_prompt: str,
+    contract_suffix: str,
+) -> str:
+    base_prompt = (
+        system_prompt_override.strip()
+        if isinstance(system_prompt_override, str) and system_prompt_override.strip()
+        else default_prompt.strip()
+    )
+    return f"{base_prompt}\n\n{contract_suffix}"
+
+
+def strip_code_fences(value: str) -> str:
+    text = value.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if len(lines) >= 2 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return text
+
+
+def parse_json_model_output(raw_output: str) -> dict:
+    cleaned = strip_code_fences(raw_output)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"resposta de resumo nao e JSON valido: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("resposta de resumo deve ser JSON objeto")
+    return parsed
+
+
+def assert_no_extra_keys(payload: dict, allowed_keys: set[str], label: str) -> None:
+    extra = set(payload.keys()) - allowed_keys
+    if extra:
+        raise RuntimeError(f"{label}: campos extras nao permitidos: {sorted(extra)}")
+
+
+def validate_summary_tags(tags: Any, label: str) -> list[str]:
+    if not isinstance(tags, list):
+        raise RuntimeError(f"{label}.tags deve ser array")
+    if len(tags) < 1 or len(tags) > 4:
+        raise RuntimeError(f"{label}.tags deve conter entre 1 e 4 itens")
+    normalized: list[str] = []
+    for index, tag in enumerate(tags):
+        if not isinstance(tag, str):
+            raise RuntimeError(f"{label}.tags[{index}] deve ser string")
+        clean = tag.strip()
+        if not clean:
+            raise RuntimeError(f"{label}.tags[{index}] nao pode ser vazio")
+        if len(clean) > 32:
+            raise RuntimeError(f"{label}.tags[{index}] excede 32 caracteres")
+        normalized.append(clean)
+    return normalized
+
+
+def validate_summary_item(
+    item: Any,
+    label: str,
+    allowed_confidence: set[str],
+    allowed_status: set[str] | None,
+    max_text: int,
+    include_status: bool,
+) -> dict:
+    if not isinstance(item, dict):
+        raise RuntimeError(f"{label} deve ser objeto")
+    expected_keys = {"text", "confidence", "tags"}
+    if include_status:
+        expected_keys.add("status")
+    assert_no_extra_keys(item, expected_keys, label)
+    text = item.get("text")
+    if not isinstance(text, str):
+        raise RuntimeError(f"{label}.text deve ser string")
+    text = text.strip()
+    if not text:
+        raise RuntimeError(f"{label}.text nao pode ser vazio")
+    if len(text) > max_text:
+        raise RuntimeError(f"{label}.text excede {max_text} caracteres")
+    raw_confidence = item.get("confidence")
+    normalized_confidence = (
+        raw_confidence.strip().lower() if isinstance(raw_confidence, str) else None
+    )
+    confidence: str
+    if isinstance(normalized_confidence, str) and normalized_confidence in allowed_confidence:
+        confidence = normalized_confidence
+    else:
+        confidence = "medium" if "medium" in allowed_confidence else "low"
+        logger.warning(
+            "summary confidence normalized field=%s raw=%s normalized=%s allowed=%s",
+            label,
+            raw_confidence,
+            confidence,
+            sorted(allowed_confidence),
+        )
+    normalized: dict[str, Any] = {
+        "text": text,
+        "confidence": confidence,
+        "tags": validate_summary_tags(item.get("tags"), label),
+    }
+    if include_status:
+        status = item.get("status")
+        if not isinstance(status, str) or (allowed_status is not None and status not in allowed_status):
+            raise RuntimeError(f"{label}.status invalido")
+        normalized["status"] = status
+    return normalized
+
+
+def validate_summary_list(
+    value: Any,
+    key: str,
+    max_items: int,
+    item_validator: Callable[[Any, str], dict],
+) -> list[dict]:
+    if not isinstance(value, list):
+        raise RuntimeError(f"{key} deve ser array")
+    if len(value) > max_items:
+        raise RuntimeError(f"{key} excede maximo de {max_items} itens")
+    return [item_validator(item, f"{key}[{index}]") for index, item in enumerate(value)]
+
+
+def default_accumulated_summary_payload() -> dict:
+    return {
+        "conversation_types": [],
+        "facts": [],
+        "hypotheses": [],
+        "decisions": [],
+        "open_items": [],
+        "next_steps": [],
+        "notes": [],
+    }
+
+
+def validate_minute_summary_payload(payload: dict) -> dict:
+    required_keys = {"chunk_type", "facts", "hypotheses", "decisions", "open_items", "next_steps", "notes"}
+    assert_no_extra_keys(payload, required_keys, SUMMARY_KIND_MINUTE)
+    for key in required_keys:
+        if key not in payload:
+            raise RuntimeError(f"{SUMMARY_KIND_MINUTE}: campo obrigatorio ausente: {key}")
+    chunk_type = payload.get("chunk_type")
+    if not isinstance(chunk_type, str) or chunk_type not in SUMMARY_ALLOWED_TYPES:
+        raise RuntimeError("minute.chunk_type invalido")
+    return {
+        "chunk_type": chunk_type,
+        "facts": validate_summary_list(
+            payload.get("facts"),
+            "facts",
+            8,
+            lambda item, label: validate_summary_item(
+                item,
+                label,
+                SUMMARY_ALLOWED_CONFIDENCE,
+                {"confirmed", "uncertain"},
+                240,
+                True,
+            ),
+        ),
+        "hypotheses": validate_summary_list(
+            payload.get("hypotheses"),
+            "hypotheses",
+            8,
+            lambda item, label: validate_summary_item(
+                item, label, {"medium", "low"}, {"uncertain"}, 240, True
+            ),
+        ),
+        "decisions": validate_summary_list(
+            payload.get("decisions"),
+            "decisions",
+            8,
+            lambda item, label: validate_summary_item(
+                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True
+            ),
+        ),
+        "open_items": validate_summary_list(
+            payload.get("open_items"),
+            "open_items",
+            8,
+            lambda item, label: validate_summary_item(
+                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True
+            ),
+        ),
+        "next_steps": validate_summary_list(
+            payload.get("next_steps"),
+            "next_steps",
+            8,
+            lambda item, label: validate_summary_item(
+                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True
+            ),
+        ),
+        "notes": validate_summary_list(
+            payload.get("notes"),
+            "notes",
+            8,
+            lambda item, label: validate_summary_item(
+                item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True
+            ),
+        ),
+    }
+
+
+def validate_accumulated_summary_payload(payload: dict) -> dict:
+    required_keys = {
+        "conversation_types",
+        "facts",
+        "hypotheses",
+        "decisions",
+        "open_items",
+        "next_steps",
+        "notes",
+    }
+    assert_no_extra_keys(payload, required_keys, SUMMARY_KIND_ACCUMULATED)
+    for key in required_keys:
+        if key not in payload:
+            raise RuntimeError(f"{SUMMARY_KIND_ACCUMULATED}: campo obrigatorio ausente: {key}")
+    conversation_types_raw = payload.get("conversation_types")
+    if not isinstance(conversation_types_raw, list):
+        raise RuntimeError("accumulated.conversation_types deve ser array")
+    conversation_types: list[str] = []
+    seen_types: set[str] = set()
+    for index, item in enumerate(conversation_types_raw):
+        if not isinstance(item, str) or item not in SUMMARY_ALLOWED_TYPES:
+            raise RuntimeError(f"accumulated.conversation_types[{index}] invalido")
+        if item in seen_types:
+            continue
+        seen_types.add(item)
+        conversation_types.append(item)
+    return {
+        "conversation_types": conversation_types,
+        "facts": validate_summary_list(
+            payload.get("facts"),
+            "facts",
+            20,
+            lambda item, label: validate_summary_item(
+                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed", "uncertain"}, 240, True
+            ),
+        ),
+        "hypotheses": validate_summary_list(
+            payload.get("hypotheses"),
+            "hypotheses",
+            20,
+            lambda item, label: validate_summary_item(
+                item, label, {"medium", "low"}, {"uncertain"}, 240, True
+            ),
+        ),
+        "decisions": validate_summary_list(
+            payload.get("decisions"),
+            "decisions",
+            20,
+            lambda item, label: validate_summary_item(
+                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True
+            ),
+        ),
+        "open_items": validate_summary_list(
+            payload.get("open_items"),
+            "open_items",
+            20,
+            lambda item, label: validate_summary_item(
+                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True
+            ),
+        ),
+        "next_steps": validate_summary_list(
+            payload.get("next_steps"),
+            "next_steps",
+            20,
+            lambda item, label: validate_summary_item(
+                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True
+            ),
+        ),
+        "notes": validate_summary_list(
+            payload.get("notes"),
+            "notes",
+            20,
+            lambda item, label: validate_summary_item(
+                item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True
+            ),
+        ),
+    }
+
+
+def validate_final_summary_payload(payload: dict) -> dict:
+    required_keys = {
+        "title",
+        "conversation_types",
+        "main_points",
+        "decisions",
+        "pending_items",
+        "next_steps",
+        "additional_notes",
+    }
+    assert_no_extra_keys(payload, required_keys, SUMMARY_KIND_FINAL)
+    for key in required_keys:
+        if key not in payload:
+            raise RuntimeError(f"{SUMMARY_KIND_FINAL}: campo obrigatorio ausente: {key}")
+    title = payload.get("title")
+    if title != "Resumo Final Executivo da Chamada":
+        raise RuntimeError("final.title invalido")
+    conversation_types_raw = payload.get("conversation_types")
+    if not isinstance(conversation_types_raw, list):
+        raise RuntimeError("final.conversation_types deve ser array")
+    conversation_types: list[str] = []
+    seen_types: set[str] = set()
+    for index, item in enumerate(conversation_types_raw):
+        if not isinstance(item, str) or item not in SUMMARY_ALLOWED_TYPES:
+            raise RuntimeError(f"final.conversation_types[{index}] invalido")
+        if item in seen_types:
+            continue
+        seen_types.add(item)
+        conversation_types.append(item)
+
+    def _final_item(item: Any, label: str) -> dict:
+        return validate_summary_item(
+            item,
+            label,
+            SUMMARY_ALLOWED_CONFIDENCE,
+            None,
+            280,
+            False,
+        )
+
+    return {
+        "title": title,
+        "conversation_types": conversation_types,
+        "main_points": validate_summary_list(payload.get("main_points"), "main_points", 12, _final_item),
+        "decisions": validate_summary_list(payload.get("decisions"), "decisions", 12, _final_item),
+        "pending_items": validate_summary_list(payload.get("pending_items"), "pending_items", 12, _final_item),
+        "next_steps": validate_summary_list(payload.get("next_steps"), "next_steps", 12, _final_item),
+        "additional_notes": validate_summary_list(payload.get("additional_notes"), "additional_notes", 12, _final_item),
+    }
+
+
+def validate_summary_payload(kind: str, payload: dict) -> dict:
+    if kind == SUMMARY_KIND_MINUTE:
+        return validate_minute_summary_payload(payload)
+    if kind == SUMMARY_KIND_ACCUMULATED:
+        return validate_accumulated_summary_payload(payload)
+    if kind == SUMMARY_KIND_FINAL:
+        return validate_final_summary_payload(payload)
+    raise RuntimeError(f"tipo de resumo nao suportado: {kind}")
+
+
+def parse_and_validate_summary_output(kind: str, raw_output: str) -> dict:
+    payload = parse_json_model_output(raw_output)
+    return validate_summary_payload(kind, payload)
 
 
 class StartRequest(BaseModel):
     room_name: str = Field(min_length=1)
-    session_id: str = Field(min_length=1)
+    call_session_id: str = Field(min_length=1)
+    transcript_session_id: str | None = None
     participant_identity: str = Field(min_length=1)
     started_at: str = Field(min_length=1)
     participant_name: str | None = None
     track_sid: str | None = None
     metadata: dict | None = None
 
+    @field_validator("call_session_id")
+    @classmethod
+    def validate_call_session_id(cls, value: str) -> str:
+        if not value.startswith("RM_"):
+            raise ValueError("call_session_id deve iniciar com RM_")
+        return value
+
+    @field_validator("transcript_session_id", mode="before")
+    @classmethod
+    def normalize_transcript_session_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
 
 class ChunkMeta(BaseModel):
     room_name: str = Field(min_length=1)
-    session_id: str = Field(min_length=1)
+    call_session_id: str = Field(min_length=1)
+    transcript_session_id: str | None = None
     participant_identity: str = Field(min_length=1)
     seq: int = Field(ge=1)
     chunk_started_at: str = Field(min_length=1)
@@ -176,6 +642,21 @@ class ChunkMeta(BaseModel):
     encoding: str
     participant_name: str | None = None
     track_sid: str | None = None
+
+    @field_validator("call_session_id")
+    @classmethod
+    def validate_call_session_id(cls, value: str) -> str:
+        if not value.startswith("RM_"):
+            raise ValueError("call_session_id deve iniciar com RM_")
+        return value
+
+    @field_validator("transcript_session_id", mode="before")
+    @classmethod
+    def normalize_transcript_session_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     @field_validator("sample_rate")
     @classmethod
@@ -201,11 +682,27 @@ class ChunkMeta(BaseModel):
 
 class EndRequest(BaseModel):
     room_name: str = Field(min_length=1)
-    session_id: str = Field(min_length=1)
+    call_session_id: str = Field(min_length=1)
+    transcript_session_id: str | None = None
     scope: str = Field(min_length=1)
     participant_identity: str | None = None
     ended_at: str | None = None
     metadata: dict | None = None
+
+    @field_validator("call_session_id")
+    @classmethod
+    def validate_call_session_id(cls, value: str) -> str:
+        if not value.startswith("RM_"):
+            raise ValueError("call_session_id deve iniciar com RM_")
+        return value
+
+    @field_validator("transcript_session_id", mode="before")
+    @classmethod
+    def normalize_transcript_session_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     @field_validator("scope")
     @classmethod
@@ -239,7 +736,8 @@ class FirebaseNamespaceConfig:
 @dataclass(frozen=True)
 class MinuteShardPayload:
     room_name: str
-    session_id: str
+    call_session_id: str
+    transcript_session_id: str | None
     minute_index: int
     minute_started_at: str
     minute_ended_at: str
@@ -256,7 +754,8 @@ class RoomRoutingContext:
     namespace: str
     room_name: str
     room_id: str
-    session_id: str
+    call_session_id: str
+    transcript_session_id: str | None
     vertical: str
     slug: str
     firestore_doc_path: str
@@ -280,16 +779,16 @@ def extract_room_namespace(room_name: str) -> RoomNamespaceInfo | None:
     return None
 
 
-def build_firestore_doc_path(vertical: str, slug: str, room_id: str, session_id: str) -> str:
-    return f"VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/TRANSCRIPT/{session_id}"
+def build_firestore_doc_path(vertical: str, slug: str, room_id: str, call_session_id: str) -> str:
+    return f"VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/SESSIONS/{call_session_id}"
 
 
-def build_storage_base_path(vertical: str, slug: str, room_id: str, session_id: str) -> str:
-    return f"VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}"
+def build_storage_base_path(vertical: str, slug: str, room_id: str, call_session_id: str) -> str:
+    return f"VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}"
 
 
-def build_active_room_doc_path(vertical: str, slug: str, room_id: str) -> str:
-    return f"ACTIVE_ROOMS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}"
+def build_room_session_doc_path(vertical: str, slug: str, room_id: str, call_session_id: str) -> str:
+    return f"VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/SESSIONS/{call_session_id}"
 
 
 def build_agent_prompt_doc_path(vertical: str, slug: str, agent_id: str) -> str:
@@ -375,6 +874,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 room_name TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                call_session_id TEXT NOT NULL,
+                transcript_session_id TEXT,
                 room_id TEXT,
                 vertical TEXT,
                 slug TEXT,
@@ -477,6 +978,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN last_chunk_at TEXT")
         if "last_firebase_flush_at" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN last_firebase_flush_at TEXT")
+        if "call_session_id" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN call_session_id TEXT")
+        if "transcript_session_id" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN transcript_session_id TEXT")
         if "room_id" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN room_id TEXT")
         if "vertical" not in columns:
@@ -487,9 +992,15 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN firestore_doc_path TEXT")
         if "storage_base_path" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN storage_base_path TEXT")
+        conn.execute("UPDATE sessions SET call_session_id = room_id WHERE call_session_id IS NULL OR call_session_id = ''")
         conn.execute(
-            "UPDATE sessions SET last_chunk_at = started_at WHERE last_chunk_at IS NULL"
+            """
+            UPDATE sessions
+            SET transcript_session_id = session_id
+            WHERE transcript_session_id IS NULL OR transcript_session_id = ''
+            """
         )
+        conn.execute("UPDATE sessions SET last_chunk_at = started_at WHERE last_chunk_at IS NULL")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_sessions_inactivity
@@ -728,7 +1239,8 @@ class FirebaseSink:
         payload = {
             "room_name": routing.room_name,
             "room_id": routing.room_id,
-            "session_id": routing.session_id,
+            "transcript_session_id": routing.transcript_session_id,
+            "call_session_id": routing.call_session_id,
             "namespace": self.namespace,
             "vertical": routing.vertical,
             "slug": routing.slug,
@@ -753,57 +1265,25 @@ class FirebaseSink:
 
         call_ref.set(payload, merge=True)
 
-    def upsert_agent_stt_id_on_start(self, routing: RoomRoutingContext) -> None:
+    def upsert_room_session_links_on_start(self, routing: RoomRoutingContext) -> None:
         if not self.enabled or self.firestore_client is None:
             return
 
-        batch = self.firestore_client.batch()
-        transcript_ref = self._doc_ref(routing.firestore_doc_path)
-        active_room_ref = self._doc_ref(
-            build_active_room_doc_path(routing.vertical, routing.slug, routing.room_id)
+        session_ref = self._doc_ref(routing.firestore_doc_path)
+        transcript_session_ids = (
+            firestore.ArrayUnion([routing.transcript_session_id]) if routing.transcript_session_id else None
         )
-        payload = {"agent_stt_id": routing.session_id}
-        batch.set(transcript_ref, payload, merge=True)
-        batch.set(active_room_ref, payload, merge=True)
-        batch.commit()
-
-    def upsert_minute_shard(self, routing: RoomRoutingContext, payload: MinuteShardPayload) -> None:
-        if not self.enabled or self.firestore_client is None:
-            return
-
-        shard_ref = self._doc_ref(routing.firestore_doc_path).collection("minute_shards").document(
-            str(payload.minute_index)
-        )
-        shard_ref.set(
-            {
-                "minute_index": payload.minute_index,
-                "minute_started_at": payload.minute_started_at,
-                "minute_ended_at": payload.minute_ended_at,
-                "transcript_json_path": payload.transcript_json_path,
-                "summary_json_path": payload.summary_json_path,
-                "line_count": payload.line_count,
-                "transcript_hash": payload.transcript_hash,
-                "finalized": payload.finalized,
-                "updated_at": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
-
-    def update_minute_summary_link(
-        self, routing: RoomRoutingContext, minute_index: int, summary_json_path: str
-    ) -> None:
-        if not self.enabled or self.firestore_client is None:
-            return
-        shard_ref = self._doc_ref(routing.firestore_doc_path).collection("minute_shards").document(
-            str(minute_index)
-        )
-        shard_ref.set(
-            {
-                "summary_json_path": summary_json_path,
-                "updated_at": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
+        payload = {
+            "call_session_id": routing.call_session_id,
+            "transcript_session_id": routing.transcript_session_id,
+            "agent_stt_id": routing.transcript_session_id,
+            "status": "active",
+            "started_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        if transcript_session_ids is not None:
+            payload["transcript_session_ids"] = transcript_session_ids
+        session_ref.set(payload, merge=True)
 
     def upload_json(self, object_path: str, body: dict) -> None:
         if not self.enabled or self.storage_bucket is None:
@@ -834,7 +1314,8 @@ class FirebaseSink:
             payload.transcript_json_path,
             {
                 "room_name": payload.room_name,
-                "session_id": payload.session_id,
+                "transcript_session_id": payload.transcript_session_id,
+                "call_session_id": payload.call_session_id,
                 "namespace": self.namespace,
                 "vertical": routing.vertical,
                 "slug": routing.slug,
@@ -936,8 +1417,12 @@ class FirebaseRouter:
 
     def sink_for_namespace(self, namespace: str) -> FirebaseSink:
         return self._get_or_create_sink(namespace)
-
-    def resolve_room_routing_context(self, room_name: str, session_id: str) -> RoomRoutingContext:
+    def resolve_room_routing_context(
+        self,
+        room_name: str,
+        call_session_id: str,
+        transcript_session_id: str | None,
+    ) -> RoomRoutingContext:
         info = extract_room_namespace(room_name)
         if info is None:
             raise RoomRoutingError("invalid_namespace", f"namespace invalido para room {room_name}")
@@ -949,11 +1434,12 @@ class FirebaseRouter:
                 namespace=info.namespace,
                 room_name=room_name,
                 room_id=info.room_id,
-                session_id=session_id,
+                call_session_id=call_session_id,
+                transcript_session_id=transcript_session_id,
                 vertical=vertical,
                 slug=slug,
-                firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, session_id),
-                storage_base_path=build_storage_base_path(vertical, slug, info.room_id, session_id),
+                firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, call_session_id),
+                storage_base_path=build_storage_base_path(vertical, slug, info.room_id, call_session_id),
             )
 
         sink = self._get_or_create_sink(info.namespace)
@@ -984,13 +1470,13 @@ class FirebaseRouter:
             namespace=info.namespace,
             room_name=room_name,
             room_id=info.room_id,
-            session_id=session_id,
+            call_session_id=call_session_id,
+            transcript_session_id=transcript_session_id,
             vertical=vertical,
             slug=slug,
-            firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, session_id),
-            storage_base_path=build_storage_base_path(vertical, slug, info.room_id, session_id),
+            firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, call_session_id),
+            storage_base_path=build_storage_base_path(vertical, slug, info.room_id, call_session_id),
         )
-
     def publish_call_index(
         self,
         routing: RoomRoutingContext,
@@ -1017,18 +1503,8 @@ class FirebaseRouter:
             final_transcript_ready=final_transcript_ready,
         )
 
-    def upsert_agent_stt_id_on_start(self, routing: RoomRoutingContext) -> None:
-        self.sink_for_namespace(routing.namespace).upsert_agent_stt_id_on_start(routing)
-
-    def upsert_minute_shard(self, routing: RoomRoutingContext, payload: MinuteShardPayload) -> None:
-        self.sink_for_namespace(routing.namespace).upsert_minute_shard(routing, payload)
-
-    def update_minute_summary_link(
-        self, routing: RoomRoutingContext, minute_index: int, summary_json_path: str
-    ) -> None:
-        self.sink_for_namespace(routing.namespace).update_minute_summary_link(
-            routing, minute_index, summary_json_path
-        )
+    def upsert_room_session_links_on_start(self, routing: RoomRoutingContext) -> None:
+        self.sink_for_namespace(routing.namespace).upsert_room_session_links_on_start(routing)
 
     def upload_minute_transcript(
         self, routing: RoomRoutingContext, payload: MinuteShardPayload
@@ -1047,7 +1523,7 @@ class FirebaseRouter:
             logger.warning(
                 "agent prompt fallback: agent_id invalido room=%s session=%s",
                 routing.room_name,
-                routing.session_id,
+                routing.call_session_id,
             )
             return None
         sink = self.sink_for_namespace(routing.namespace)
@@ -1055,7 +1531,7 @@ class FirebaseRouter:
             logger.warning(
                 "agent prompt fallback: firestore indisponivel room=%s session=%s agent_id=%s",
                 routing.room_name,
-                routing.session_id,
+                routing.call_session_id,
                 agent_key,
             )
             return None
@@ -1071,7 +1547,7 @@ class FirebaseRouter:
                 logger.warning(
                     "agent prompt fallback: campo prompt invalido room=%s session=%s agent_id=%s path=%s",
                     routing.room_name,
-                    routing.session_id,
+                    routing.call_session_id,
                     agent_key,
                     prompt_doc_path,
                 )
@@ -1081,7 +1557,7 @@ class FirebaseRouter:
                 logger.warning(
                     "agent prompt fallback: campo prompt vazio room=%s session=%s agent_id=%s path=%s",
                     routing.room_name,
-                    routing.session_id,
+                    routing.call_session_id,
                     agent_key,
                     prompt_doc_path,
                 )
@@ -1089,7 +1565,7 @@ class FirebaseRouter:
             logger.info(
                 "agent prompt override: usando prompt do firebase room=%s session=%s agent_id=%s path=%s",
                 routing.room_name,
-                routing.session_id,
+                routing.call_session_id,
                 agent_key,
                 prompt_doc_path,
             )
@@ -1098,7 +1574,7 @@ class FirebaseRouter:
             logger.warning(
                 "agent prompt fallback: erro ao ler firestore room=%s session=%s agent_id=%s path=%s error=%s",
                 routing.room_name,
-                routing.session_id,
+                routing.call_session_id,
                 agent_key,
                 prompt_doc_path,
                 exc,
@@ -1125,13 +1601,15 @@ def db_upsert_start(req: StartRequest, routing: RoomRoutingContext) -> None:
         conn.execute(
             """
             INSERT INTO sessions(
-                room_name, session_id, room_id, vertical, slug,
+                room_name, session_id, call_session_id, transcript_session_id, room_id, vertical, slug,
                 firestore_doc_path, storage_base_path,
                 started_at, metadata_json,
                 state, room_end_received, last_chunk_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)
             ON CONFLICT(room_name, session_id) DO UPDATE SET
                 updated_at=excluded.updated_at,
+                call_session_id=excluded.call_session_id,
+                transcript_session_id=excluded.transcript_session_id,
                 room_id=excluded.room_id,
                 vertical=excluded.vertical,
                 slug=excluded.slug,
@@ -1142,7 +1620,9 @@ def db_upsert_start(req: StartRequest, routing: RoomRoutingContext) -> None:
             """,
             (
                 req.room_name,
-                req.session_id,
+                req.call_session_id,
+                req.call_session_id,
+                req.transcript_session_id,
                 routing.room_id,
                 routing.vertical,
                 routing.slug,
@@ -1168,7 +1648,7 @@ def db_upsert_start(req: StartRequest, routing: RoomRoutingContext) -> None:
             """,
             (
                 req.room_name,
-                req.session_id,
+                req.call_session_id,
                 req.participant_identity,
                 req.participant_name,
                 req.track_sid,
@@ -1186,7 +1666,7 @@ def db_upsert_start(req: StartRequest, routing: RoomRoutingContext) -> None:
 
 
 def write_spool_file(meta: ChunkMeta, audio_bytes: bytes) -> Path:
-    call_dir = SPOOL_DIR / safe_key(f"{meta.room_name}__{meta.session_id}") / safe_key(
+    call_dir = SPOOL_DIR / safe_key(f"{meta.room_name}__{meta.call_session_id}") / safe_key(
         meta.participant_identity
     )
     call_dir.mkdir(parents=True, exist_ok=True)
@@ -1209,8 +1689,8 @@ def db_enqueue_chunk(meta: ChunkMeta, spool_path: Path) -> str:
             return "queue_full"
 
         session = conn.execute(
-            "SELECT 1 FROM sessions WHERE room_name = ? AND session_id = ?",
-            (meta.room_name, meta.session_id),
+            "SELECT 1 FROM sessions WHERE room_name = ? AND session_id = ? AND call_session_id = ?",
+            (meta.room_name, meta.call_session_id, meta.call_session_id),
         ).fetchone()
         if not session:
             conn.execute("ROLLBACK")
@@ -1221,7 +1701,7 @@ def db_enqueue_chunk(meta: ChunkMeta, spool_path: Path) -> str:
             SELECT last_seq FROM participants
             WHERE room_name = ? AND session_id = ? AND participant_identity = ?
             """,
-            (meta.room_name, meta.session_id, meta.participant_identity),
+            (meta.room_name, meta.call_session_id, meta.participant_identity),
         ).fetchone()
         if not participant:
             conn.execute(
@@ -1233,7 +1713,7 @@ def db_enqueue_chunk(meta: ChunkMeta, spool_path: Path) -> str:
                 """,
                 (
                     meta.room_name,
-                    meta.session_id,
+                    meta.call_session_id,
                     meta.participant_identity,
                     meta.participant_name,
                     meta.track_sid,
@@ -1261,7 +1741,7 @@ def db_enqueue_chunk(meta: ChunkMeta, spool_path: Path) -> str:
                 """,
                 (
                     meta.room_name,
-                    meta.session_id,
+                    meta.call_session_id,
                     meta.participant_identity,
                     meta.seq,
                     meta.track_sid,
@@ -1292,17 +1772,19 @@ def db_enqueue_chunk(meta: ChunkMeta, spool_path: Path) -> str:
                 meta.track_sid,
                 now,
                 meta.room_name,
-                meta.session_id,
+                meta.call_session_id,
                 meta.participant_identity,
             ),
         )
         conn.execute(
             """
             UPDATE sessions
-            SET last_chunk_at = ?, updated_at = ?
+            SET last_chunk_at = ?,
+                transcript_session_id = COALESCE(transcript_session_id, ?),
+                updated_at = ?
             WHERE room_name = ? AND session_id = ?
             """,
-            (now, now, meta.room_name, meta.session_id),
+            (now, meta.transcript_session_id, now, meta.room_name, meta.call_session_id),
         )
         conn.execute("COMMIT")
         return "accepted"
@@ -1324,7 +1806,15 @@ def db_mark_participant_end(req: EndRequest) -> None:
             SET state='ended', ended_at=COALESCE(ended_at, ?), updated_at=?
             WHERE room_name = ? AND session_id = ? AND participant_identity = ?
             """,
-            (now, utc_now_iso(), req.room_name, req.session_id, req.participant_identity),
+            (now, utc_now_iso(), req.room_name, req.call_session_id, req.participant_identity),
+        )
+        conn.execute(
+            """
+            UPDATE sessions
+            SET transcript_session_id = COALESCE(transcript_session_id, ?), updated_at=?
+            WHERE room_name = ? AND session_id = ?
+            """,
+            (req.transcript_session_id, utc_now_iso(), req.room_name, req.call_session_id),
         )
         conn.execute("COMMIT")
     except Exception:
@@ -1343,10 +1833,12 @@ def db_mark_room_end(req: EndRequest) -> None:
             """
             UPDATE sessions
             SET room_end_received=1, state='room_ended',
-                ended_at=COALESCE(ended_at, ?), updated_at=?
+                ended_at=COALESCE(ended_at, ?),
+                transcript_session_id=COALESCE(transcript_session_id, ?),
+                updated_at=?
             WHERE room_name = ? AND session_id = ?
             """,
-            (now, utc_now_iso(), req.room_name, req.session_id),
+            (now, req.transcript_session_id, utc_now_iso(), req.room_name, req.call_session_id),
         )
         conn.execute(
             """
@@ -1354,7 +1846,7 @@ def db_mark_room_end(req: EndRequest) -> None:
             SET state='ended', ended_at=COALESCE(ended_at, ?), updated_at=?
             WHERE room_name = ? AND session_id = ? AND state='active'
             """,
-            (now, utc_now_iso(), req.room_name, req.session_id),
+            (now, utc_now_iso(), req.room_name, req.call_session_id),
         )
         conn.execute("COMMIT")
     except Exception:
@@ -1560,7 +2052,7 @@ def db_get_sessions_due_for_flush(now_iso: str, interval_seconds: int) -> list[s
     try:
         return conn.execute(
             """
-            SELECT room_name, session_id, started_at, room_end_received
+            SELECT room_name, COALESCE(call_session_id, session_id) AS call_session_id, started_at, room_end_received
             FROM sessions
             WHERE finalized_at IS NULL
               AND (
@@ -1574,33 +2066,33 @@ def db_get_sessions_due_for_flush(now_iso: str, interval_seconds: int) -> list[s
         conn.close()
 
 
-def db_mark_session_flushed(room_name: str, session_id: str, now_iso: str) -> None:
+def db_mark_session_flushed(room_name: str, call_session_id: str, now_iso: str) -> None:
     conn = read_db_connection()
     try:
         conn.execute(
             """
             UPDATE sessions
             SET last_firebase_flush_at=?, updated_at=?
-            WHERE room_name=? AND session_id=?
+            WHERE room_name=? AND (session_id=? OR call_session_id=?)
             """,
-            (now_iso, now_iso, room_name, session_id),
+            (now_iso, now_iso, room_name, call_session_id, call_session_id),
         )
     finally:
         conn.close()
 
 
-def db_get_session_row(room_name: str, session_id: str) -> sqlite3.Row | None:
+def db_get_session_row(room_name: str, call_session_id: str) -> sqlite3.Row | None:
     conn = read_db_connection()
     try:
         return conn.execute(
             """
-            SELECT room_name, session_id, room_id, vertical, slug,
+            SELECT room_name, session_id, call_session_id, transcript_session_id, room_id, vertical, slug,
                    firestore_doc_path, storage_base_path,
                    started_at, room_end_received, finalized_at
             FROM sessions
-            WHERE room_name=? AND session_id=?
+            WHERE room_name=? AND (session_id=? OR call_session_id=?)
             """,
-            (room_name, session_id),
+            (room_name, call_session_id, call_session_id),
         ).fetchone()
     finally:
         conn.close()
@@ -1611,14 +2103,15 @@ def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
     namespace_info = extract_room_namespace(room_name)
     namespace_value = namespace_info.namespace if namespace_info is not None else ""
     room_id = str(row["room_id"] or "").strip()
-    session_id = str(row["session_id"] or "").strip()
+    call_session_id = str(row["call_session_id"] or row["session_id"] or "").strip()
+    transcript_session_id = str(row["transcript_session_id"] or "").strip() or None
     vertical = str(row["vertical"] or "").strip()
     slug = str(row["slug"] or "").strip()
     firestore_doc_path = str(row["firestore_doc_path"] or "").strip()
     storage_base_path = str(row["storage_base_path"] or "").strip()
 
-    if not room_name or not room_id or not session_id:
-        raise RuntimeError("session routing context incompleto: room_name/room_id/session_id")
+    if not room_name or not room_id or not call_session_id:
+        raise RuntimeError("session routing context incompleto: room_name/room_id/call_session_id")
     if not vertical or not slug:
         raise RuntimeError("session routing context incompleto: vertical/slug")
     if not firestore_doc_path or not storage_base_path:
@@ -1630,15 +2123,14 @@ def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
         namespace=namespace_value,
         room_name=room_name,
         room_id=room_id,
-        session_id=session_id,
+        call_session_id=call_session_id,
+        transcript_session_id=transcript_session_id,
         vertical=vertical,
         slug=slug,
         firestore_doc_path=firestore_doc_path,
         storage_base_path=storage_base_path,
     )
-
-
-def db_get_done_chunks_for_session(room_name: str, session_id: str) -> list[sqlite3.Row]:
+def db_get_done_chunks_for_session(room_name: str, call_session_id: str) -> list[sqlite3.Row]:
     conn = read_db_connection()
     try:
         return conn.execute(
@@ -1658,7 +2150,7 @@ def db_get_done_chunks_for_session(room_name: str, session_id: str) -> list[sqli
             WHERE c.room_name=? AND c.session_id=? AND c.status='done'
             ORDER BY c.chunk_ended_at ASC, c.participant_identity ASC, c.seq ASC
             """,
-            (room_name, session_id),
+            (room_name, call_session_id),
         ).fetchall()
     finally:
         conn.close()
@@ -1666,7 +2158,8 @@ def db_get_done_chunks_for_session(room_name: str, session_id: str) -> list[sqli
 
 def build_minute_shards(
     room_name: str,
-    session_id: str,
+    call_session_id: str,
+    transcript_session_id: str | None,
     storage_base_path: str,
     started_at: str,
     done_chunks: list[sqlite3.Row],
@@ -1711,7 +2204,8 @@ def build_minute_shards(
         shards.append(
             MinuteShardPayload(
                 room_name=room_name,
-                session_id=session_id,
+                call_session_id=call_session_id,
+                transcript_session_id=transcript_session_id,
                 minute_index=minute_index,
                 minute_started_at=minute_start_dt.isoformat(),
                 minute_ended_at=minute_end_dt.isoformat(),
@@ -1724,10 +2218,8 @@ def build_minute_shards(
             )
         )
     return shards
-
-
 def db_get_minute_export(
-    room_name: str, session_id: str, minute_index: int
+    room_name: str, call_session_id: str, minute_index: int
 ) -> sqlite3.Row | None:
     conn = read_db_connection()
     try:
@@ -1737,7 +2229,7 @@ def db_get_minute_export(
             FROM minute_exports
             WHERE room_name=? AND session_id=? AND minute_index=?
             """,
-            (room_name, session_id, minute_index),
+            (room_name, call_session_id, minute_index),
         ).fetchone()
     finally:
         conn.close()
@@ -1766,7 +2258,7 @@ def db_upsert_minute_export(payload: MinuteShardPayload, now_iso: str) -> None:
             """,
             (
                 payload.room_name,
-                payload.session_id,
+                payload.call_session_id,
                 payload.minute_index,
                 payload.transcript_json_path,
                 payload.summary_json_path,
@@ -1782,7 +2274,7 @@ def db_upsert_minute_export(payload: MinuteShardPayload, now_iso: str) -> None:
         conn.close()
 
 
-def db_upsert_summary_task(room_name: str, session_id: str, minute_index: int, now_iso: str) -> None:
+def db_upsert_summary_task(room_name: str, call_session_id: str, minute_index: int, now_iso: str) -> None:
     conn = read_db_connection()
     try:
         conn.execute(
@@ -1798,7 +2290,7 @@ def db_upsert_summary_task(room_name: str, session_id: str, minute_index: int, n
                 error_message=NULL,
                 updated_at=excluded.updated_at
             """,
-            (room_name, session_id, minute_index, now_iso, now_iso, now_iso),
+            (room_name, call_session_id, minute_index, now_iso, now_iso, now_iso),
         )
     finally:
         conn.close()
@@ -1810,7 +2302,7 @@ def db_claim_summary_task(now_iso: str) -> sqlite3.Row | None:
         conn.execute("BEGIN IMMEDIATE")
         task = conn.execute(
             """
-            SELECT room_name, session_id, minute_index, retries
+            SELECT room_name, session_id AS call_session_id, minute_index, retries
             FROM summary_tasks
             WHERE status IN ('pending', 'error')
               AND next_attempt_at <= ?
@@ -1829,7 +2321,7 @@ def db_claim_summary_task(now_iso: str) -> sqlite3.Row | None:
             SET status='processing', updated_at=?
             WHERE room_name=? AND session_id=? AND minute_index=?
             """,
-            (now_iso, task["room_name"], task["session_id"], task["minute_index"]),
+            (now_iso, task["room_name"], task["call_session_id"], task["minute_index"]),
         )
         conn.execute("COMMIT")
         return task
@@ -1840,7 +2332,7 @@ def db_claim_summary_task(now_iso: str) -> sqlite3.Row | None:
         conn.close()
 
 
-def db_mark_summary_task_done(room_name: str, session_id: str, minute_index: int, now_iso: str) -> None:
+def db_mark_summary_task_done(room_name: str, call_session_id: str, minute_index: int, now_iso: str) -> None:
     conn = read_db_connection()
     try:
         conn.execute(
@@ -1849,7 +2341,7 @@ def db_mark_summary_task_done(room_name: str, session_id: str, minute_index: int
             SET status='done', updated_at=?, error_message=NULL
             WHERE room_name=? AND session_id=? AND minute_index=?
             """,
-            (now_iso, room_name, session_id, minute_index),
+            (now_iso, room_name, call_session_id, minute_index),
         )
     finally:
         conn.close()
@@ -1857,7 +2349,7 @@ def db_mark_summary_task_done(room_name: str, session_id: str, minute_index: int
 
 def db_mark_summary_task_error(
     room_name: str,
-    session_id: str,
+    call_session_id: str,
     minute_index: int,
     retries: int,
     error_message: str,
@@ -1882,7 +2374,7 @@ def db_mark_summary_task_error(
                 next_attempt_iso,
                 now_iso,
                 room_name,
-                session_id,
+                call_session_id,
                 minute_index,
             ),
         )
@@ -1890,7 +2382,7 @@ def db_mark_summary_task_error(
         conn.close()
 
 
-def db_get_session_minute_exports(room_name: str, session_id: str) -> list[sqlite3.Row]:
+def db_get_session_minute_exports(room_name: str, call_session_id: str) -> list[sqlite3.Row]:
     conn = read_db_connection()
     try:
         return conn.execute(
@@ -1900,14 +2392,14 @@ def db_get_session_minute_exports(room_name: str, session_id: str) -> list[sqlit
             WHERE room_name=? AND session_id=?
             ORDER BY minute_index ASC
             """,
-            (room_name, session_id),
+            (room_name, call_session_id),
         ).fetchall()
     finally:
         conn.close()
 
 
 def db_update_minute_export_summary_path(
-    room_name: str, session_id: str, minute_index: int, summary_json_path: str, now_iso: str
+    room_name: str, call_session_id: str, minute_index: int, summary_json_path: str, now_iso: str
 ) -> None:
     conn = read_db_connection()
     try:
@@ -1917,7 +2409,7 @@ def db_update_minute_export_summary_path(
             SET summary_json_path=?, updated_at=?
             WHERE room_name=? AND session_id=? AND minute_index=?
             """,
-            (summary_json_path, now_iso, room_name, session_id, minute_index),
+            (summary_json_path, now_iso, room_name, call_session_id, minute_index),
         )
     finally:
         conn.close()
@@ -2001,6 +2493,54 @@ def db_mark_room_finalized(room_name: str, session_id: str) -> None:
             WHERE room_name=? AND session_id=?
             """,
             (utc_now_iso(), utc_now_iso(), room_name, session_id),
+        )
+    finally:
+        conn.close()
+
+
+def db_claim_room_finalization(room_name: str, session_id: str, now_iso: str) -> bool:
+    conn = read_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM sessions
+            WHERE room_name=? AND session_id=? AND finalized_at IS NULL AND state='room_ended'
+            """,
+            (room_name, session_id),
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return False
+        conn.execute(
+            """
+            UPDATE sessions
+            SET state='finalizing', updated_at=?
+            WHERE room_name=? AND session_id=? AND finalized_at IS NULL AND state='room_ended'
+            """,
+            (now_iso, room_name, session_id),
+        )
+        claimed = int(conn.total_changes) > 0
+        conn.execute("COMMIT")
+        return claimed
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def db_release_room_finalization(room_name: str, session_id: str, now_iso: str) -> None:
+    conn = read_db_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET state='room_ended', updated_at=?
+            WHERE room_name=? AND session_id=? AND finalized_at IS NULL AND state='finalizing'
+            """,
+            (now_iso, room_name, session_id),
         )
     finally:
         conn.close()
@@ -2265,36 +2805,72 @@ class SummaryEngine:
             raise RuntimeError("OpenAI retornou resposta sem texto")
         return text
 
-    def summarize_minute(self, minute_lines: list[dict], system_prompt: str | None = None) -> str:
+    def _request_json(
+        self,
+        kind: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict:
+        raw_output = self._request_text(model, system_prompt, user_prompt)
+        return parse_and_validate_summary_output(kind, raw_output)
+
+    def summarize_minute(
+        self,
+        minute_lines: list[dict],
+        system_prompt: str | None = None,
+    ) -> dict:
         minute_text = "\n".join(f"[{line['speaker']}] {line['text']}" for line in minute_lines)
-        resolved_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
-        return self._request_text(
+        effective_prompt = build_effective_system_prompt(
+            system_prompt,
+            DEFAULT_SUMMARIZE_MINUTE_PROMPT,
+            CONTRACT_SUFFIX_MINUTE,
+        )
+        return self._request_json(
+            SUMMARY_KIND_MINUTE,
             self.minute_model,
-            resolved_prompt or DEFAULT_SUMMARIZE_MINUTE_PROMPT,
+            effective_prompt,
             f"Minuto da chamada:\n{minute_text}",
         )
 
     def merge_summaries(
         self,
-        previous_summary: str,
-        minute_summary: str,
+        previous_summary: dict,
+        minute_summary: dict,
         system_prompt: str | None = None,
-    ) -> str:
-        resolved_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
-        return self._request_text(
+    ) -> dict:
+        effective_prompt = build_effective_system_prompt(
+            system_prompt,
+            DEFAULT_MERGE_SUMMARIES_PROMPT,
+            CONTRACT_SUFFIX_ACCUMULATED,
+        )
+        previous_payload = (
+            previous_summary if isinstance(previous_summary, dict) else default_accumulated_summary_payload()
+        )
+        minute_payload = minute_summary if isinstance(minute_summary, dict) else {}
+        return self._request_json(
+            SUMMARY_KIND_ACCUMULATED,
             self.accumulated_model,
-            resolved_prompt or DEFAULT_MERGE_SUMMARIES_PROMPT,
+            effective_prompt,
             "Resumo acumulado atual:\n"
-            f"{previous_summary or '(vazio)'}\n\n"
-            f"Resumo novo do minuto:\n{minute_summary}",
+            f"{json.dumps(previous_payload, ensure_ascii=True, indent=2)}\n\n"
+            "Resumo novo do minuto:\n"
+            f"{json.dumps(minute_payload, ensure_ascii=True, indent=2)}",
         )
 
-    def finalize_summary(self, merged_summary: str, system_prompt: str | None = None) -> str:
-        resolved_prompt = system_prompt.strip() if isinstance(system_prompt, str) else ""
-        return self._request_text(
+    def finalize_summary(self, merged_summary: dict, system_prompt: str | None = None) -> dict:
+        effective_prompt = build_effective_system_prompt(
+            system_prompt,
+            DEFAULT_FINALIZE_SUMMARY_PROMPT,
+            CONTRACT_SUFFIX_FINAL,
+        )
+        merged_payload = merged_summary if isinstance(merged_summary, dict) else default_accumulated_summary_payload()
+        return self._request_json(
+            SUMMARY_KIND_FINAL,
             self.final_model,
-            resolved_prompt or DEFAULT_FINALIZE_SUMMARY_PROMPT,
-            f"Resumo acumulado da chamada:\n{merged_summary}",
+            effective_prompt,
+            "Resumo acumulado da chamada:\n"
+            f"{json.dumps(merged_payload, ensure_ascii=True, indent=2)}",
         )
 
 def session_summary_accumulated_path(storage_base_path: str) -> str:
@@ -2309,11 +2885,17 @@ def session_final_transcript_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "final/final_transcript.json")
 
 
-def build_final_transcript_payload(room_name: str, session_id: str, now_iso: str) -> dict:
-    transcript, lines = db_get_room_aggregate(room_name, session_id)
+def build_final_transcript_payload(
+    room_name: str,
+    call_session_id: str,
+    transcript_session_id: str | None,
+    now_iso: str,
+) -> dict:
+    transcript, lines = db_get_room_aggregate(room_name, call_session_id)
     return {
         "room_name": room_name,
-        "session_id": session_id,
+        "transcript_session_id": transcript_session_id,
+        "call_session_id": call_session_id,
         "transcript": transcript,
         "lines": lines,
         "line_count": len(lines),
@@ -2324,19 +2906,20 @@ def build_final_transcript_payload(room_name: str, session_id: str, now_iso: str
 def publish_session_minute_exports(
     firebase_router: FirebaseRouter,
     room_name: str,
-    session_id: str,
+    call_session_id: str,
     now_iso: str,
     finalized: bool,
     summary_enabled: bool,
 ) -> int:
-    session_row = db_get_session_row(room_name, session_id)
+    session_row = db_get_session_row(room_name, call_session_id)
     if session_row is None:
         return -1
     routing = routing_context_from_session_row(session_row)
-    done_chunks = db_get_done_chunks_for_session(room_name, session_id)
+    done_chunks = db_get_done_chunks_for_session(room_name, call_session_id)
     shards = build_minute_shards(
         room_name=room_name,
-        session_id=session_id,
+        call_session_id=routing.call_session_id,
+        transcript_session_id=routing.transcript_session_id,
         storage_base_path=routing.storage_base_path,
         started_at=session_row["started_at"],
         done_chunks=done_chunks,
@@ -2345,7 +2928,7 @@ def publish_session_minute_exports(
     )
     last_minute_index = shards[-1].minute_index if shards else -1
     for shard in shards:
-        previous = db_get_minute_export(room_name, session_id, shard.minute_index)
+        previous = db_get_minute_export(room_name, call_session_id, shard.minute_index)
         should_upload = (
             previous is None
             or previous["content_hash"] != shard.transcript_hash
@@ -2356,9 +2939,8 @@ def publish_session_minute_exports(
         if summary_enabled and (
             should_upload or previous is None or not previous["summary_json_path"]
         ):
-            db_upsert_summary_task(room_name, session_id, shard.minute_index, now_iso)
+            db_upsert_summary_task(room_name, call_session_id, shard.minute_index, now_iso)
         db_upsert_minute_export(shard, now_iso)
-        firebase_router.upsert_minute_shard(routing, shard)
 
     firebase_router.publish_call_index(
         routing=routing,
@@ -2385,23 +2967,23 @@ async def flush_due_sessions(firebase_router: FirebaseRouter, summary_enabled: b
     )
     for session_row in sessions:
         room_name = session_row["room_name"]
-        session_id = session_row["session_id"]
+        call_session_id = session_row["call_session_id"]
         try:
             await asyncio.to_thread(
                 publish_session_minute_exports,
                 firebase_router,
                 room_name,
-                session_id,
+                call_session_id,
                 now_iso,
                 False,
                 summary_enabled,
             )
-            await asyncio.to_thread(db_mark_session_flushed, room_name, session_id, now_iso)
+            await asyncio.to_thread(db_mark_session_flushed, room_name, call_session_id, now_iso)
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception(
                 "flush session failed room=%s session=%s error=%s",
                 room_name,
-                session_id,
+                call_session_id,
                 exc,
             )
 
@@ -2410,27 +2992,37 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
     participants = db_get_finalizable_participants()
     for participant in participants:
         room_name = participant["room_name"]
-        session_id = participant["session_id"]
+        call_session_id = participant["session_id"]
         participant_identity = participant["participant_identity"]
-        db_mark_participant_finalized(room_name, session_id, participant_identity)
+        db_mark_participant_finalized(room_name, call_session_id, participant_identity)
         logger.info(
             "participant finalized room=%s session=%s participant=%s",
             room_name,
-            session_id,
+            call_session_id,
             participant_identity,
         )
 
     rooms = db_get_finalizable_rooms()
     for room in rooms:
         room_name = room["room_name"]
-        session_id = room["session_id"]
+        call_session_id = room["session_id"]
         now_iso = utc_now_iso()
+        claimed = await asyncio.to_thread(
+            db_claim_room_finalization, room_name, call_session_id, now_iso
+        )
+        if not claimed:
+            logger.info(
+                "room finalization skipped room=%s session=%s reason=already_claimed_or_finalized",
+                room_name,
+                call_session_id,
+            )
+            continue
         try:
             last_minute_index = await asyncio.to_thread(
                 publish_session_minute_exports,
                 firebase_router,
                 room_name,
-                session_id,
+                call_session_id,
                 now_iso,
                 True,
                 summary_engine.enabled,
@@ -2438,7 +3030,11 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
             routing = routing_context_from_session_row(room)
             final_transcript_path = session_final_transcript_path(routing.storage_base_path)
             final_transcript_payload = await asyncio.to_thread(
-                build_final_transcript_payload, room_name, session_id, now_iso
+                build_final_transcript_payload,
+                room_name,
+                call_session_id,
+                routing.transcript_session_id,
+                now_iso,
             )
             await asyncio.to_thread(
                 firebase_router.upload_json,
@@ -2449,7 +3045,7 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
             logger.info(
                 "final transcript uploaded room=%s session=%s path=%s line_count=%s",
                 room_name,
-                session_id,
+                call_session_id,
                 final_transcript_path,
                 final_transcript_payload["line_count"],
             )
@@ -2471,20 +3067,23 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
             )
 
             if summary_engine.enabled:
-                await asyncio.to_thread(db_upsert_summary_task, room_name, session_id, -1, now_iso)
+                await asyncio.to_thread(db_upsert_summary_task, room_name, call_session_id, -1, now_iso)
                 logger.info(
                     "final summary task queued room=%s session=%s minute=-1",
                     room_name,
-                    session_id,
+                    call_session_id,
                 )
-            db_mark_room_finalized(room_name, session_id)
-            logger.info("room finalized room=%s session=%s", room_name, session_id)
+            db_mark_room_finalized(room_name, call_session_id)
+            logger.info("room finalized room=%s session=%s", room_name, call_session_id)
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception(
                 "room finalization failed room=%s session=%s error=%s",
                 room_name,
-                session_id,
+                call_session_id,
                 exc,
+            )
+            await asyncio.to_thread(
+                db_release_room_finalization, room_name, call_session_id, utc_now_iso()
             )
 
 
@@ -2506,25 +3105,25 @@ async def summary_worker_loop(
             continue
 
         room_name = task["room_name"]
-        session_id = task["session_id"]
+        call_session_id = task["call_session_id"]
         minute_index = int(task["minute_index"])
         retries = int(task["retries"])
         try:
-            session_row = await asyncio.to_thread(db_get_session_row, room_name, session_id)
+            session_row = await asyncio.to_thread(db_get_session_row, room_name, call_session_id)
             if session_row is None:
                 await asyncio.to_thread(
-                    db_mark_summary_task_done, room_name, session_id, minute_index, now_iso
+                    db_mark_summary_task_done, room_name, call_session_id, minute_index, now_iso
                 )
                 continue
             routing = routing_context_from_session_row(session_row)
             session_is_finalized = bool(session_row["finalized_at"])
             if minute_index >= 0:
                 export_row = await asyncio.to_thread(
-                    db_get_minute_export, room_name, session_id, minute_index
+                    db_get_minute_export, room_name, call_session_id, minute_index
                 )
                 if export_row is None:
                     await asyncio.to_thread(
-                        db_mark_summary_task_done, room_name, session_id, minute_index, now_iso
+                        db_mark_summary_task_done, room_name, call_session_id, minute_index, now_iso
                     )
                     continue
                 minute_payload = await asyncio.to_thread(
@@ -2546,7 +3145,8 @@ async def summary_worker_loop(
                     summary_path,
                     {
                         "room_name": room_name,
-                        "session_id": session_id,
+                        "transcript_session_id": routing.transcript_session_id,
+                        "call_session_id": routing.call_session_id,
                         "minute_index": minute_index,
                         "summary": minute_summary,
                         "updated_at": now_iso,
@@ -2555,25 +3155,21 @@ async def summary_worker_loop(
                 await asyncio.to_thread(
                     db_update_minute_export_summary_path,
                     room_name,
-                    session_id,
+                    call_session_id,
                     minute_index,
                     summary_path,
                     now_iso,
-                )
-                await asyncio.to_thread(
-                    firebase_router.update_minute_summary_link,
-                    routing,
-                    minute_index,
-                    summary_path,
                 )
 
                 accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
                 previous_payload = await asyncio.to_thread(
                     firebase_router.fetch_json, routing, accumulated_path
                 )
-                previous_summary = ""
+                previous_summary: dict = default_accumulated_summary_payload()
                 if isinstance(previous_payload, dict):
-                    previous_summary = str(previous_payload.get("summary", "")).strip()
+                    raw_previous_summary = previous_payload.get("summary")
+                    if isinstance(raw_previous_summary, dict):
+                        previous_summary = validate_accumulated_summary_payload(raw_previous_summary)
                 merge_system_prompt = await asyncio.to_thread(
                     firebase_router.fetch_agent_prompt, routing, "stt_merge_summaries"
                 )
@@ -2589,7 +3185,8 @@ async def summary_worker_loop(
                     accumulated_path,
                     {
                         "room_name": room_name,
-                        "session_id": session_id,
+                        "transcript_session_id": routing.transcript_session_id,
+                        "call_session_id": routing.call_session_id,
                         "last_minute_index": minute_index,
                         "summary": merged_summary,
                         "updated_at": now_iso,
@@ -2607,27 +3204,22 @@ async def summary_worker_loop(
                     final_transcript_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
                 )
             else:
-                exports = await asyncio.to_thread(db_get_session_minute_exports, room_name, session_id)
-                summary_parts: list[str] = []
-                for export_row in exports:
-                    summary_path = export_row["summary_json_path"]
-                    if not summary_path:
-                        continue
-                    payload = await asyncio.to_thread(
-                        firebase_router.fetch_json, routing, summary_path
-                    )
-                    if isinstance(payload, dict):
-                        text = str(payload.get("summary", "")).strip()
-                        if text:
-                            summary_parts.append(text)
-                merged = "\n".join(summary_parts).strip()
-                if merged:
+                accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
+                accumulated_payload = await asyncio.to_thread(
+                    firebase_router.fetch_json, routing, accumulated_path
+                )
+                merged_summary: dict | None = None
+                if isinstance(accumulated_payload, dict):
+                    raw_summary = accumulated_payload.get("summary")
+                    if isinstance(raw_summary, dict):
+                        merged_summary = validate_accumulated_summary_payload(raw_summary)
+                if merged_summary is not None:
                     final_system_prompt = await asyncio.to_thread(
                         firebase_router.fetch_agent_prompt, routing, "stt_finalize_summary"
                     )
                     final_summary = await asyncio.to_thread(
                         summary_engine.finalize_summary,
-                        merged,
+                        merged_summary,
                         final_system_prompt,
                     )
                     final_path = session_final_summary_path(routing.storage_base_path)
@@ -2637,12 +3229,15 @@ async def summary_worker_loop(
                         final_path,
                         {
                             "room_name": room_name,
-                            "session_id": session_id,
+                            "transcript_session_id": routing.transcript_session_id,
+                            "call_session_id": routing.call_session_id,
                             "summary": final_summary,
                             "updated_at": now_iso,
                         },
                     )
-                    accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
+                    exports = await asyncio.to_thread(
+                        db_get_session_minute_exports, room_name, call_session_id
+                    )
                     final_transcript_path = session_final_transcript_path(routing.storage_base_path)
                     await asyncio.to_thread(
                         firebase_router.publish_call_index,
@@ -2659,25 +3254,25 @@ async def summary_worker_loop(
                     logger.info(
                         "final summary uploaded room=%s session=%s path=%s",
                         room_name,
-                        session_id,
+                        call_session_id,
                         final_path,
                     )
 
             await asyncio.to_thread(
-                db_mark_summary_task_done, room_name, session_id, minute_index, utc_now_iso()
+                db_mark_summary_task_done, room_name, call_session_id, minute_index, utc_now_iso()
             )
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception(
                 "summary task failed room=%s session=%s minute=%s error=%s",
                 room_name,
-                session_id,
+                call_session_id,
                 minute_index,
                 exc,
             )
             await asyncio.to_thread(
                 db_mark_summary_task_error,
                 room_name,
-                session_id,
+                call_session_id,
                 minute_index,
                 retries + 1,
                 str(exc),
@@ -2838,18 +3433,20 @@ async def session_start(request: Request) -> JSONResponse:
         routing = await asyncio.to_thread(
             runtime.firebase_router.resolve_room_routing_context,
             payload.room_name,
-            payload.session_id,
+            payload.call_session_id,
+            payload.transcript_session_id,
         )
     except RoomRoutingError as exc:
         raise HTTPException(status_code=409, detail=exc.code) from exc
 
     try:
-        await asyncio.to_thread(runtime.firebase_router.upsert_agent_stt_id_on_start, routing)
+        await asyncio.to_thread(runtime.firebase_router.upsert_room_session_links_on_start, routing)
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception(
-            "session start failed while writing agent_stt_id room=%s session=%s error=%s",
+            "session start failed while writing room_session_links room=%s transcript_session=%s call_session=%s error=%s",
             payload.room_name,
-            payload.session_id,
+            payload.transcript_session_id,
+            payload.call_session_id,
             exc,
         )
         raise HTTPException(status_code=500, detail="firebase_start_write_failed") from exc
@@ -2939,3 +3536,53 @@ async def session_end(request: Request) -> JSONResponse:
 
     await finalize_entities(runtime.firebase_router, runtime.summary_engine)
     return JSONResponse({"status": "accepted"}, status_code=202)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

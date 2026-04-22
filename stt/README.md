@@ -67,15 +67,14 @@ Quando `FIREBASE_ENABLED=true`:
 
 Firestore:
 
-- `VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/TRANSCRIPT/{session_id}`: metadados, status, heartbeat, ponteiros de resumo
-- `.../minute_shards/{minute_index}`: ponteiros dos JSONs por minuto
+- `VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/SESSIONS/{call_session_id}`: metadados, status, heartbeat, ponteiros de resumo/transcricao final
 
 Storage:
 
-- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}/minutes/{minute_index}/transcript.json`
-- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}/minutes/{minute_index}/summary.json`
-- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}/summary/accumulated.json`
-- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{session_id}/final/final_summary.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/minutes/{minute_index}/transcript.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/minutes/{minute_index}/summary.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/summary/accumulated.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary.json`
 
 ## OpenAI Summary (opcional)
 
