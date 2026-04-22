@@ -79,13 +79,16 @@ OPENAI_MODEL_FINAL_SUMMARY = os.environ.get(
     "OPENAI_MODEL_FINAL_SUMMARY", "gpt-4.1"
 ).strip()
 OPENAI_REQUEST_TIMEOUT_SECONDS = max(
-    5, int(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "20"))
+    5, int(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "45"))
 )
 OPENAI_REQUEST_RETRIES = max(0, int(os.environ.get("OPENAI_REQUEST_RETRIES", "2")))
 OPENAI_REQUEST_RETRY_BASE_SECONDS = max(
     0.1, float(os.environ.get("OPENAI_REQUEST_RETRY_BASE_SECONDS", "1.5"))
 )
 OPENAI_MAX_RETRIES = max(1, int(os.environ.get("OPENAI_MAX_RETRIES", "3")))
+OPENAI_ACCUMULATED_MAX_ITEMS = max(
+    1, int(os.environ.get("OPENAI_ACCUMULATED_MAX_ITEMS", "40"))
+)
 
 ALLOWED_LIVEKIT_NAMESPACES = frozenset(
     (
@@ -489,7 +492,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         "facts": validate_summary_list(
             payload.get("facts"),
             "facts",
-            20,
+            OPENAI_ACCUMULATED_MAX_ITEMS,
             lambda item, label: validate_summary_item(
                 item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed", "uncertain"}, 240, True
             ),
@@ -497,7 +500,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         "hypotheses": validate_summary_list(
             payload.get("hypotheses"),
             "hypotheses",
-            20,
+            OPENAI_ACCUMULATED_MAX_ITEMS,
             lambda item, label: validate_summary_item(
                 item, label, {"medium", "low"}, {"uncertain"}, 240, True
             ),
@@ -505,7 +508,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         "decisions": validate_summary_list(
             payload.get("decisions"),
             "decisions",
-            20,
+            OPENAI_ACCUMULATED_MAX_ITEMS,
             lambda item, label: validate_summary_item(
                 item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True
             ),
@@ -513,7 +516,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         "open_items": validate_summary_list(
             payload.get("open_items"),
             "open_items",
-            20,
+            OPENAI_ACCUMULATED_MAX_ITEMS,
             lambda item, label: validate_summary_item(
                 item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True
             ),
@@ -521,7 +524,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         "next_steps": validate_summary_list(
             payload.get("next_steps"),
             "next_steps",
-            20,
+            OPENAI_ACCUMULATED_MAX_ITEMS,
             lambda item, label: validate_summary_item(
                 item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True
             ),
@@ -529,7 +532,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         "notes": validate_summary_list(
             payload.get("notes"),
             "notes",
-            20,
+            OPENAI_ACCUMULATED_MAX_ITEMS,
             lambda item, label: validate_summary_item(
                 item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True
             ),

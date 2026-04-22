@@ -327,6 +327,8 @@ class SummaryEnginePromptTests(unittest.TestCase):
             accumulated_model="accumulated-model",
             final_model="final-model",
             timeout_seconds=20,
+            request_retries=2,
+            retry_base_seconds=1.5,
         )
 
     def test_summarize_minute_uses_external_and_fallback_prompts(self):
@@ -421,6 +423,103 @@ class SummarySchemaValidationTests(unittest.TestCase):
                 STT_APP.SUMMARY_KIND_MINUTE,
                 json.dumps({"chunk_type": "tecnica"}),
             )
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class AccumulatedSummaryLimitsTests(unittest.TestCase):
+    def _item(self, text: str, status: str, confidence: str = "medium") -> dict:
+        return {
+            "text": text,
+            "confidence": confidence,
+            "status": status,
+            "tags": ["tag"],
+        }
+
+    def _payload(self, notes_count: int = 0, facts_count: int = 0) -> dict:
+        return {
+            "conversation_types": [],
+            "facts": [self._item(f"fact {i}", "confirmed", "high") for i in range(facts_count)],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [self._item(f"note {i}", "info") for i in range(notes_count)],
+        }
+
+    def test_validate_accumulated_summary_accepts_40_notes(self):
+        with patch.object(STT_APP, "OPENAI_ACCUMULATED_MAX_ITEMS", 40):
+            payload = self._payload(notes_count=40)
+            normalized = STT_APP.validate_accumulated_summary_payload(payload)
+        self.assertEqual(len(normalized["notes"]), 40)
+
+    def test_validate_accumulated_summary_rejects_41_notes(self):
+        with patch.object(STT_APP, "OPENAI_ACCUMULATED_MAX_ITEMS", 40):
+            payload = self._payload(notes_count=41)
+            with self.assertRaises(RuntimeError):
+                STT_APP.validate_accumulated_summary_payload(payload)
+
+    def test_validate_accumulated_summary_rejects_41_facts(self):
+        with patch.object(STT_APP, "OPENAI_ACCUMULATED_MAX_ITEMS", 40):
+            payload = self._payload(facts_count=41)
+            with self.assertRaises(RuntimeError):
+                STT_APP.validate_accumulated_summary_payload(payload)
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class SummaryEngineRetryTests(unittest.TestCase):
+    def build_engine(self) -> object:
+        return STT_APP.SummaryEngine(
+            enabled=True,
+            api_key="test-key",
+            minute_model="minute-model",
+            accumulated_model="accumulated-model",
+            final_model="final-model",
+            timeout_seconds=45,
+            request_retries=2,
+            retry_base_seconds=1.5,
+        )
+
+    def _response(self, body: dict):
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(body).encode("utf-8")
+
+        return _Response()
+
+    def test_request_text_retries_and_succeeds_after_timeouts(self):
+        engine = self.build_engine()
+        success_payload = {"output_text": "{}"}
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            side_effect=[TimeoutError("timeout-1"), TimeoutError("timeout-2"), self._response(success_payload)],
+        ) as urlopen_mock:
+            with patch.object(STT_APP.time, "sleep") as sleep_mock:
+                raw = engine._request_text("gpt-4.1-mini", "system", "user")
+
+        self.assertEqual(raw, "{}")
+        self.assertEqual(urlopen_mock.call_count, 3)
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_request_text_raises_after_exhausting_retries(self):
+        engine = self.build_engine()
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            side_effect=[TimeoutError("timeout-1"), TimeoutError("timeout-2"), TimeoutError("timeout-3")],
+        ) as urlopen_mock:
+            with patch.object(STT_APP.time, "sleep") as sleep_mock:
+                with self.assertRaises(RuntimeError):
+                    engine._request_text("gpt-4.1-mini", "system", "user")
+
+        self.assertEqual(urlopen_mock.call_count, 3)
+        self.assertEqual(sleep_mock.call_count, 2)
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")

@@ -100,8 +100,10 @@ Storage:
 - `OPENAI_MODEL_MINUTE_SUMMARY` (padrao `gpt-4.1-mini`)
 - `OPENAI_MODEL_ACCUMULATED_SUMMARY` (padrao `gpt-4.1`)
 - `OPENAI_MODEL_FINAL_SUMMARY` (padrao `gpt-4.1`)
-- `OPENAI_REQUEST_TIMEOUT_SECONDS` (padrao `20`)
+- `OPENAI_REQUEST_TIMEOUT_SECONDS` (padrao `45`)
+- `OPENAI_REQUEST_RETRIES` (padrao `2`, total de 3 tentativas por request)
 - `OPENAI_MAX_RETRIES` (padrao `3`)
+- `OPENAI_ACCUMULATED_MAX_ITEMS` (padrao `40`)
 
 Exemplo de `FIREBASE_NAMESPACE_CONFIG_JSON`:
 
