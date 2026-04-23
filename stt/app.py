@@ -89,6 +89,21 @@ OPENAI_MAX_RETRIES = max(1, int(os.environ.get("OPENAI_MAX_RETRIES", "3")))
 OPENAI_ACCUMULATED_MAX_ITEMS = max(
     1, int(os.environ.get("OPENAI_ACCUMULATED_MAX_ITEMS", "40"))
 )
+SUMMARY_RECONCILE_INTERVAL_SECONDS = max(
+    10, int(os.environ.get("SUMMARY_RECONCILE_INTERVAL_SECONDS", "60"))
+)
+SUMMARY_PROCESSING_STALE_SECONDS = max(
+    30, int(os.environ.get("SUMMARY_PROCESSING_STALE_SECONDS", "300"))
+)
+SUMMARY_FINALIZATION_GRACE_SECONDS = max(
+    0, int(os.environ.get("SUMMARY_FINALIZATION_GRACE_SECONDS", "180"))
+)
+SUMMARY_FINAL_REEMIT_ON_LATE_MINUTES = (
+    os.environ.get("SUMMARY_FINAL_REEMIT_ON_LATE_MINUTES", "true").lower() == "true"
+)
+SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK = (
+    os.environ.get("SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK", "true").lower() == "true"
+)
 
 ALLOWED_LIVEKIT_NAMESPACES = frozenset(
     (
@@ -117,6 +132,8 @@ Entrada:
 
 Tarefa:
 - Extrair informacoes estruturadas APENAS do trecho recebido, de forma conservadora e confiavel.
+- Identificar os assuntos efetivamente tratados no trecho.
+- Associar cada fato, hipotese, decisao, pendencia, proximo passo e nota a um assunto principal.
 - Seguir estritamente o contrato JSON de saida fornecido separadamente.
 
 Regras obrigatorias:
@@ -133,9 +150,12 @@ Regras obrigatorias:
 - Elimine duplicacao semantica entre categorias.
 - Se houver duvida entre facts e hypotheses, priorize hypotheses.
 - hypotheses e notes nao podem ter confidence=high.
-- Tags curtas e especificas.
-- Limites: text max 240 caracteres; tags entre 1 e 4 itens; maximo 8 itens por categoria.
+- Detecte mudancas de assunto dentro do trecho.
+- Crie nomes curtos, estaveis e objetivos para os assuntos.
+- Nao criar assunto para ruido social isolado, como agradecimentos, despedidas, confirmacoes vazias ou fillers.
 - Se o trecho for inutil/ruidoso, retornar arrays vazios e registrar 1 note curta.
+- Tags curtas e especificas.
+- Limites: text max 240 caracteres; tags entre 0 e 4 itens (preferencialmente curtas); maximo 8 itens por categoria; maximo 6 assuntos por trecho.
 """
 
 DEFAULT_MERGE_SUMMARIES_PROMPT = """Voce e um assistente responsavel por atualizar o estado acumulado de uma chamada corporativa em portugues do Brasil.
@@ -146,6 +166,7 @@ Entrada:
 
 Tarefa:
 - Atualizar o estado acumulado usando apenas as informacoes recebidas.
+- Manter uma memoria consolidada da chamada organizada por assuntos.
 - Nao reescrever do zero.
 - Seguir estritamente o contrato JSON de saida fornecido separadamente.
 
@@ -163,21 +184,42 @@ Regras obrigatorias:
 - hypotheses so remove com confirmacao/invalidacao explicita.
 - Consolidar agressivamente para evitar listas infladas.
 - hypotheses e notes nao podem ter confidence=high.
-- Limites: text max 240 caracteres; tags entre 1 e 4 itens; maximo 20 itens por categoria.
+
+Regras especificas para assuntos:
+- Mesclar assuntos equivalentes mesmo com nomes levemente diferentes.
+- Preferir nomes curtos, claros e reutilizaveis para assuntos recorrentes.
+- Nao criar microassuntos desnecessarios.
+- Se um novo item pertencer claramente a um assunto ja existente, reutilizar esse assunto.
+- Atualizar o summary do assunto para refletir o estado mais atual e mais util do tema.
+- Cada item deve permanecer associado a exatamente um assunto principal.
+- Um assunto pode ter status: active, open, resolved ou uncertain.
+- Nao remover assunto antigo so porque ele nao apareceu no trecho atual.
+- Se houver continuidade clara, manter o mesmo nome do assunto anterior.
+
+Limites:
+- text max 240 caracteres
+- tags entre 0 e 4 itens
+- maximo 20 itens por categoria
+- maximo 20 assuntos acumulados
 - Retornar arrays vazios quando categoria nao tiver itens.
 """
 
-DEFAULT_FINALIZE_SUMMARY_PROMPT = """Voce e um assistente especializado em produzir resumo final estruturado de chamadas corporativas em portugues do Brasil.
+DEFAULT_FINALIZE_SUMMARY_PROMPT = """Voce e um assistente especializado em produzir ata final estruturada de chamadas corporativas em portugues do Brasil.
 
 Entrada:
 - Estado acumulado em JSON.
 
 Tarefa:
-- Gerar resumo final fiel, claro, conservador e util para exibicao em frontend.
+- Gerar uma ata final fiel, clara, conservadora e util para exibicao em frontend.
+- Organizar a ata por assuntos tratados ao longo da chamada.
 - Seguir estritamente o contrato JSON de saida fornecido separadamente.
 
 Objetivo:
-- Explicar o que aconteceu, o que foi decidido, o que esta em aberto, proximos passos e pontos de baixa confianca/ambiguidade.
+- Explicar os principais assuntos tratados.
+- Mostrar o que foi decidido em cada assunto.
+- Mostrar o que ficou em aberto.
+- Mostrar proximos passos.
+- Preservar pontos de baixa confianca ou ambiguidade sem trata-los como fato.
 
 Regras obrigatorias:
 - Use apenas informacoes do estado acumulado.
@@ -187,12 +229,15 @@ Regras obrigatorias:
 - Nao transformar pending_items em decisoes.
 - Consolidar redundancias e manter apenas o que for mais claro/relevante/confiavel.
 - Nao repetir o mesmo conteudo em secoes diferentes sem necessidade.
-- Se nao houver decisao explicita, inserir exatamente:
+- A secao topics deve refletir os principais assuntos efetivamente discutidos.
+- Para cada assunto, gerar um resumo objetivo do que foi tratado.
+- Para cada assunto, incluir decisoes, pending_items e next_steps quando existirem.
+- Se nao houver decisao explicita global, inserir exatamente:
   "Nenhuma decisao explicita foi registrada."
 - title deve ser exatamente: "Resumo Final Executivo da Chamada".
 - conversation_types deve refletir o estado acumulado.
-- Limites: text max 280 caracteres; tags entre 1 e 4 itens; maximo 12 itens por categoria.
-- Retornar arrays vazios quando categoria nao tiver itens (exceto regra de decisions acima).
+- Limites: text max 280 caracteres; tags entre 0 e 4 itens; maximo 12 itens por categoria; maximo 12 assuntos.
+- Retornar arrays vazios quando categoria nao tiver itens (exceto regra de global_decisions acima).
 """
 
 SUMMARY_KIND_MINUTE = "minute"
@@ -201,35 +246,183 @@ SUMMARY_KIND_FINAL = "final"
 
 SUMMARY_ALLOWED_TYPES = {"tecnica", "executiva", "operacional", "comercial", "mista"}
 SUMMARY_ALLOWED_CONFIDENCE = {"high", "medium", "low"}
+SUMMARY_ALLOWED_TOPIC_STATUS_MINUTE = {"new", "continuing", "uncertain"}
+SUMMARY_ALLOWED_TOPIC_STATUS_ACCUMULATED = {"active", "open", "resolved", "uncertain"}
 
 SUMMARY_SCHEMA_MINUTE = {
     "chunk_type": "tecnica|executiva|operacional|comercial|mista",
-    "facts": [{"text": "string", "confidence": "high|medium|low", "status": "confirmed|uncertain", "tags": ["string"]}],
-    "hypotheses": [{"text": "string", "confidence": "medium|low", "status": "uncertain", "tags": ["string"]}],
-    "decisions": [{"text": "string", "confidence": "high|medium|low", "status": "confirmed", "tags": ["string"]}],
-    "open_items": [{"text": "string", "confidence": "high|medium|low", "status": "open", "tags": ["string"]}],
-    "next_steps": [{"text": "string", "confidence": "high|medium|low", "status": "planned", "tags": ["string"]}],
-    "notes": [{"text": "string", "confidence": "medium|low", "status": "uncertain|info", "tags": ["string"]}],
+    "topics": [
+        {
+            "name": "string",
+            "summary": "string",
+            "status": "new|continuing|uncertain",
+            "tags": ["string"]
+        }
+    ],
+    "facts": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "status": "confirmed|uncertain",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "hypotheses": [
+        {
+            "text": "string",
+            "confidence": "medium|low",
+            "status": "uncertain",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "decisions": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "status": "confirmed",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "open_items": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "status": "open",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "next_steps": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "status": "planned",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "notes": [
+        {
+            "text": "string",
+            "confidence": "medium|low",
+            "status": "uncertain|info",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
 }
 
 SUMMARY_SCHEMA_ACCUMULATED = {
     "conversation_types": ["tecnica|executiva|operacional|comercial|mista"],
-    "facts": [{"text": "string", "confidence": "high|medium|low", "status": "confirmed|uncertain", "tags": ["string"]}],
-    "hypotheses": [{"text": "string", "confidence": "medium|low", "status": "uncertain", "tags": ["string"]}],
-    "decisions": [{"text": "string", "confidence": "high|medium|low", "status": "confirmed", "tags": ["string"]}],
-    "open_items": [{"text": "string", "confidence": "high|medium|low", "status": "open", "tags": ["string"]}],
-    "next_steps": [{"text": "string", "confidence": "high|medium|low", "status": "planned", "tags": ["string"]}],
-    "notes": [{"text": "string", "confidence": "medium|low", "status": "uncertain|info", "tags": ["string"]}],
+    "topics": [
+        {
+            "name": "string",
+            "summary": "string",
+            "status": "active|open|resolved|uncertain",
+            "tags": ["string"]
+        }
+    ],
+    "facts": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "status": "confirmed|uncertain",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "hypotheses": [
+        {
+            "text": "string",
+            "confidence": "medium|low",
+            "status": "uncertain",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "decisions": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "status": "confirmed",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "open_items": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "status": "open",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "next_steps": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "status": "planned",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
+    "notes": [
+        {
+            "text": "string",
+            "confidence": "medium|low",
+            "status": "uncertain|info",
+            "tags": ["string"],
+            "name": "string"
+        }
+    ],
 }
 
 SUMMARY_SCHEMA_FINAL = {
     "title": "Resumo Final Executivo da Chamada",
     "conversation_types": ["tecnica|executiva|operacional|comercial|mista"],
-    "main_points": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
-    "decisions": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
-    "pending_items": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
-    "next_steps": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
-    "additional_notes": [{"text": "string", "confidence": "high|medium|low", "tags": ["string"]}],
+    "executive_summary": "string",
+    "topics": [
+        {
+            "name": "string",
+            "summary": "string",
+            "decisions": ["string"],
+            "pending_items": ["string"],
+            "next_steps": ["string"],
+            "tags": ["string"]
+        }
+    ],
+    "global_decisions": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "tags": ["string"]
+        }
+    ],
+    "global_pending_items": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "tags": ["string"]
+        }
+    ],
+    "global_next_steps": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "tags": ["string"]
+        }
+    ],
+    "additional_notes": [
+        {
+            "text": "string",
+            "confidence": "high|medium|low",
+            "tags": ["string"]
+        }
+    ],
 }
 
 CONTRACT_SUFFIX_MINUTE = (
@@ -239,6 +432,10 @@ CONTRACT_SUFFIX_MINUTE = (
     "- Regra obrigatoria de confidence por secao:\n"
     "  * hypotheses[].confidence: apenas low ou medium (nunca high)\n"
     "  * notes[].confidence: apenas low ou medium (nunca high)\n"
+    "- Regra obrigatoria de topicos:\n"
+    "  * Cada item em facts, hypotheses, decisions, open_items, next_steps e notes deve ter um campo name.\n"
+    "  * Se vier campo topic, normalize para name.\n"
+    "  * name deve corresponder ao name de um item em topics, exceto quando o trecho for inutil/ruidoso.\n"
     "Use exatamente este schema:\n"
     f"{json.dumps(SUMMARY_SCHEMA_MINUTE, ensure_ascii=True, indent=2)}"
 )
@@ -247,6 +444,10 @@ CONTRACT_SUFFIX_ACCUMULATED = (
     "Saida:\n"
     "- Retorne APENAS JSON valido, sem markdown, sem explicacoes e sem texto adicional.\n"
     "- Nao adicionar campos fora do contrato.\n"
+    "- Regra obrigatoria de topicos:\n"
+    "  * Cada item em facts, hypotheses, decisions, open_items, next_steps e notes deve ter um campo name.\n"
+    "  * Se vier campo topic, normalize para name.\n"
+    "  * name deve corresponder ao name de um item em topics.\n"
     "Use exatamente este schema:\n"
     f"{json.dumps(SUMMARY_SCHEMA_ACCUMULATED, ensure_ascii=True, indent=2)}"
 )
@@ -255,10 +456,11 @@ CONTRACT_SUFFIX_FINAL = (
     "Saida:\n"
     "- Retorne APENAS JSON valido, sem markdown, sem explicacoes e sem texto adicional.\n"
     "- Nao adicionar campos fora do contrato.\n"
+    "- executive_summary deve ser um texto curto e claro.\n"
+    "- topics deve conter os principais assuntos da chamada, ja consolidados.\n"
     "Use exatamente este schema:\n"
     f"{json.dumps(SUMMARY_SCHEMA_FINAL, ensure_ascii=True, indent=2)}"
 )
-
 
 def build_effective_system_prompt(
     system_prompt_override: str | None,
@@ -301,10 +503,10 @@ def assert_no_extra_keys(payload: dict, allowed_keys: set[str], label: str) -> N
 
 
 def validate_summary_tags(tags: Any, label: str) -> list[str]:
+    if tags is None:
+        return []
     if not isinstance(tags, list):
         raise RuntimeError(f"{label}.tags deve ser array")
-    if len(tags) < 1 or len(tags) > 4:
-        raise RuntimeError(f"{label}.tags deve conter entre 1 e 4 itens")
     normalized: list[str] = []
     for index, tag in enumerate(tags):
         if not isinstance(tag, str):
@@ -315,6 +517,14 @@ def validate_summary_tags(tags: Any, label: str) -> list[str]:
         if len(clean) > 32:
             raise RuntimeError(f"{label}.tags[{index}] excede 32 caracteres")
         normalized.append(clean)
+    if len(normalized) > 4:
+        logger.warning(
+            "summary tags normalized field=%s raw_len=%s kept=%s",
+            label,
+            len(normalized),
+            4,
+        )
+        normalized = normalized[:4]
     return normalized
 
 
@@ -325,12 +535,16 @@ def validate_summary_item(
     allowed_status: set[str] | None,
     max_text: int,
     include_status: bool,
+    include_topic: bool,
 ) -> dict:
     if not isinstance(item, dict):
         raise RuntimeError(f"{label} deve ser objeto")
     expected_keys = {"text", "confidence", "tags"}
     if include_status:
         expected_keys.add("status")
+    if include_topic:
+        # Accept both for backward compatibility, normalize to `name`.
+        expected_keys.update({"name", "topic"})
     assert_no_extra_keys(item, expected_keys, label)
     text = item.get("text")
     if not isinstance(text, str):
@@ -366,6 +580,25 @@ def validate_summary_item(
         if not isinstance(status, str) or (allowed_status is not None and status not in allowed_status):
             raise RuntimeError(f"{label}.status invalido")
         normalized["status"] = status
+    if include_topic:
+        raw_name = item.get("name")
+        raw_topic = item.get("topic")
+        resolved_name: str | None = None
+        if isinstance(raw_name, str):
+            resolved_name = raw_name.strip()
+        elif isinstance(raw_topic, str):
+            resolved_name = raw_topic.strip()
+            logger.warning(
+                "summary topic alias normalized field=%s alias=topic->name",
+                label,
+            )
+        if not isinstance(resolved_name, str):
+            raise RuntimeError(f"{label}.name deve ser string")
+        if not resolved_name:
+            raise RuntimeError(f"{label}.name nao pode ser vazio")
+        if len(resolved_name) > 80:
+            raise RuntimeError(f"{label}.name excede 80 caracteres")
+        normalized["name"] = resolved_name
     return normalized
 
 
@@ -382,9 +615,143 @@ def validate_summary_list(
     return [item_validator(item, f"{key}[{index}]") for index, item in enumerate(value)]
 
 
+def validate_text_list(
+    value: Any,
+    key: str,
+    max_items: int,
+    max_len: int,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise RuntimeError(f"{key} deve ser array")
+    if len(value) > max_items:
+        raise RuntimeError(f"{key} excede maximo de {max_items} itens")
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str):
+            raise RuntimeError(f"{key}[{index}] deve ser string")
+        text = item.strip()
+        if not text:
+            raise RuntimeError(f"{key}[{index}] nao pode ser vazio")
+        if len(text) > max_len:
+            raise RuntimeError(f"{key}[{index}] excede {max_len} caracteres")
+        normalized.append(text)
+    return normalized
+
+
+def validate_summary_topic(
+    item: Any,
+    label: str,
+    allowed_status: set[str],
+    max_summary: int,
+) -> dict:
+    if not isinstance(item, dict):
+        raise RuntimeError(f"{label} deve ser objeto")
+    expected_keys = {"name", "summary", "status", "tags"}
+    assert_no_extra_keys(item, expected_keys, label)
+    name = item.get("name")
+    if not isinstance(name, str):
+        raise RuntimeError(f"{label}.name deve ser string")
+    name = name.strip()
+    if not name:
+        raise RuntimeError(f"{label}.name nao pode ser vazio")
+    if len(name) > 80:
+        raise RuntimeError(f"{label}.name excede 80 caracteres")
+    summary = item.get("summary")
+    if not isinstance(summary, str):
+        raise RuntimeError(f"{label}.summary deve ser string")
+    summary = summary.strip()
+    if not summary:
+        raise RuntimeError(f"{label}.summary nao pode ser vazio")
+    if len(summary) > max_summary:
+        raise RuntimeError(f"{label}.summary excede {max_summary} caracteres")
+    status = item.get("status")
+    if not isinstance(status, str) or status not in allowed_status:
+        raise RuntimeError(f"{label}.status invalido")
+    return {
+        "name": name,
+        "summary": summary,
+        "status": status,
+        "tags": validate_summary_tags(item.get("tags"), label),
+    }
+
+
+def validate_summary_topics(
+    value: Any,
+    key: str,
+    max_items: int,
+    allowed_status: set[str],
+    max_summary: int,
+) -> list[dict]:
+    if not isinstance(value, list):
+        raise RuntimeError(f"{key} deve ser array")
+    if len(value) > max_items:
+        raise RuntimeError(f"{key} excede maximo de {max_items} itens")
+    normalized: list[dict] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(value):
+        topic = validate_summary_topic(
+            item,
+            f"{key}[{index}]",
+            allowed_status,
+            max_summary,
+        )
+        if topic["name"] in seen_names:
+            raise RuntimeError(f"{key}[{index}].name duplicado")
+        seen_names.add(topic["name"])
+        normalized.append(topic)
+    return normalized
+
+
+def validate_topic_reference(
+    items: list[dict],
+    key: str,
+    topic_names: set[str],
+    allow_unmapped_without_topics: bool = False,
+) -> None:
+    for index, item in enumerate(items):
+        topic_name = item.get("name")
+        if topic_name in topic_names:
+            continue
+        if allow_unmapped_without_topics and not topic_names:
+            continue
+        raise RuntimeError(f"{key}[{index}].name deve corresponder a um topics[].name")
+
+
+def validate_final_topic_item(item: Any, label: str) -> dict:
+    if not isinstance(item, dict):
+        raise RuntimeError(f"{label} deve ser objeto")
+    expected_keys = {"name", "summary", "decisions", "pending_items", "next_steps", "tags"}
+    assert_no_extra_keys(item, expected_keys, label)
+    name = item.get("name")
+    if not isinstance(name, str):
+        raise RuntimeError(f"{label}.name deve ser string")
+    name = name.strip()
+    if not name:
+        raise RuntimeError(f"{label}.name nao pode ser vazio")
+    if len(name) > 80:
+        raise RuntimeError(f"{label}.name excede 80 caracteres")
+    summary = item.get("summary")
+    if not isinstance(summary, str):
+        raise RuntimeError(f"{label}.summary deve ser string")
+    summary = summary.strip()
+    if not summary:
+        raise RuntimeError(f"{label}.summary nao pode ser vazio")
+    if len(summary) > 280:
+        raise RuntimeError(f"{label}.summary excede 280 caracteres")
+    return {
+        "name": name,
+        "summary": summary,
+        "decisions": validate_text_list(item.get("decisions"), f"{label}.decisions", 12, 280),
+        "pending_items": validate_text_list(item.get("pending_items"), f"{label}.pending_items", 12, 280),
+        "next_steps": validate_text_list(item.get("next_steps"), f"{label}.next_steps", 12, 280),
+        "tags": validate_summary_tags(item.get("tags"), label),
+    }
+
+
 def default_accumulated_summary_payload() -> dict:
     return {
         "conversation_types": [],
+        "topics": [],
         "facts": [],
         "hypotheses": [],
         "decisions": [],
@@ -395,7 +762,7 @@ def default_accumulated_summary_payload() -> dict:
 
 
 def validate_minute_summary_payload(payload: dict) -> dict:
-    required_keys = {"chunk_type", "facts", "hypotheses", "decisions", "open_items", "next_steps", "notes"}
+    required_keys = {"chunk_type", "topics", "facts", "hypotheses", "decisions", "open_items", "next_steps", "notes"}
     assert_no_extra_keys(payload, required_keys, SUMMARY_KIND_MINUTE)
     for key in required_keys:
         if key not in payload:
@@ -403,67 +770,110 @@ def validate_minute_summary_payload(payload: dict) -> dict:
     chunk_type = payload.get("chunk_type")
     if not isinstance(chunk_type, str) or chunk_type not in SUMMARY_ALLOWED_TYPES:
         raise RuntimeError("minute.chunk_type invalido")
+    topics = validate_summary_topics(
+        payload.get("topics"),
+        "topics",
+        6,
+        SUMMARY_ALLOWED_TOPIC_STATUS_MINUTE,
+        240,
+    )
+    topic_names = {topic["name"] for topic in topics}
+    facts = validate_summary_list(
+        payload.get("facts"),
+        "facts",
+        8,
+        lambda item, label: validate_summary_item(
+            item,
+            label,
+            SUMMARY_ALLOWED_CONFIDENCE,
+            {"confirmed", "uncertain"},
+            240,
+            True,
+            True,
+        ),
+    )
+    hypotheses = validate_summary_list(
+        payload.get("hypotheses"),
+        "hypotheses",
+        8,
+        lambda item, label: validate_summary_item(
+            item, label, {"medium", "low"}, {"uncertain"}, 240, True, True
+        ),
+    )
+    decisions = validate_summary_list(
+        payload.get("decisions"),
+        "decisions",
+        8,
+        lambda item, label: validate_summary_item(
+            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True, True
+        ),
+    )
+    open_items = validate_summary_list(
+        payload.get("open_items"),
+        "open_items",
+        8,
+        lambda item, label: validate_summary_item(
+            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True, True
+        ),
+    )
+    next_steps = validate_summary_list(
+        payload.get("next_steps"),
+        "next_steps",
+        8,
+        lambda item, label: validate_summary_item(
+            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True, True
+        ),
+    )
+    notes = validate_summary_list(
+        payload.get("notes"),
+        "notes",
+        8,
+        lambda item, label: validate_summary_item(
+            item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True, True
+        ),
+    )
+    validate_topic_reference(facts, "facts", topic_names, allow_unmapped_without_topics=True)
+    validate_topic_reference(
+        hypotheses,
+        "hypotheses",
+        topic_names,
+        allow_unmapped_without_topics=True,
+    )
+    validate_topic_reference(
+        decisions,
+        "decisions",
+        topic_names,
+        allow_unmapped_without_topics=True,
+    )
+    validate_topic_reference(
+        open_items,
+        "open_items",
+        topic_names,
+        allow_unmapped_without_topics=True,
+    )
+    validate_topic_reference(
+        next_steps,
+        "next_steps",
+        topic_names,
+        allow_unmapped_without_topics=True,
+    )
+    validate_topic_reference(notes, "notes", topic_names, allow_unmapped_without_topics=True)
     return {
         "chunk_type": chunk_type,
-        "facts": validate_summary_list(
-            payload.get("facts"),
-            "facts",
-            8,
-            lambda item, label: validate_summary_item(
-                item,
-                label,
-                SUMMARY_ALLOWED_CONFIDENCE,
-                {"confirmed", "uncertain"},
-                240,
-                True,
-            ),
-        ),
-        "hypotheses": validate_summary_list(
-            payload.get("hypotheses"),
-            "hypotheses",
-            8,
-            lambda item, label: validate_summary_item(
-                item, label, {"medium", "low"}, {"uncertain"}, 240, True
-            ),
-        ),
-        "decisions": validate_summary_list(
-            payload.get("decisions"),
-            "decisions",
-            8,
-            lambda item, label: validate_summary_item(
-                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True
-            ),
-        ),
-        "open_items": validate_summary_list(
-            payload.get("open_items"),
-            "open_items",
-            8,
-            lambda item, label: validate_summary_item(
-                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True
-            ),
-        ),
-        "next_steps": validate_summary_list(
-            payload.get("next_steps"),
-            "next_steps",
-            8,
-            lambda item, label: validate_summary_item(
-                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True
-            ),
-        ),
-        "notes": validate_summary_list(
-            payload.get("notes"),
-            "notes",
-            8,
-            lambda item, label: validate_summary_item(
-                item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True
-            ),
-        ),
+        "topics": topics,
+        "facts": facts,
+        "hypotheses": hypotheses,
+        "decisions": decisions,
+        "open_items": open_items,
+        "next_steps": next_steps,
+        "notes": notes,
     }
 
 
 def validate_accumulated_summary_payload(payload: dict) -> dict:
     required_keys = {
         "conversation_types",
+        "topics",
         "facts",
         "hypotheses",
         "decisions",
@@ -487,56 +897,77 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
             continue
         seen_types.add(item)
         conversation_types.append(item)
+    topics = validate_summary_topics(
+        payload.get("topics"),
+        "topics",
+        20,
+        SUMMARY_ALLOWED_TOPIC_STATUS_ACCUMULATED,
+        240,
+    )
+    topic_names = {topic["name"] for topic in topics}
+    facts = validate_summary_list(
+        payload.get("facts"),
+        "facts",
+        OPENAI_ACCUMULATED_MAX_ITEMS,
+        lambda item, label: validate_summary_item(
+            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed", "uncertain"}, 240, True, True
+        ),
+    )
+    hypotheses = validate_summary_list(
+        payload.get("hypotheses"),
+        "hypotheses",
+        OPENAI_ACCUMULATED_MAX_ITEMS,
+        lambda item, label: validate_summary_item(
+            item, label, {"medium", "low"}, {"uncertain"}, 240, True, True
+        ),
+    )
+    decisions = validate_summary_list(
+        payload.get("decisions"),
+        "decisions",
+        OPENAI_ACCUMULATED_MAX_ITEMS,
+        lambda item, label: validate_summary_item(
+            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True, True
+        ),
+    )
+    open_items = validate_summary_list(
+        payload.get("open_items"),
+        "open_items",
+        OPENAI_ACCUMULATED_MAX_ITEMS,
+        lambda item, label: validate_summary_item(
+            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True, True
+        ),
+    )
+    next_steps = validate_summary_list(
+        payload.get("next_steps"),
+        "next_steps",
+        OPENAI_ACCUMULATED_MAX_ITEMS,
+        lambda item, label: validate_summary_item(
+            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True, True
+        ),
+    )
+    notes = validate_summary_list(
+        payload.get("notes"),
+        "notes",
+        OPENAI_ACCUMULATED_MAX_ITEMS,
+        lambda item, label: validate_summary_item(
+            item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True, True
+        ),
+    )
+    validate_topic_reference(facts, "facts", topic_names)
+    validate_topic_reference(hypotheses, "hypotheses", topic_names)
+    validate_topic_reference(decisions, "decisions", topic_names)
+    validate_topic_reference(open_items, "open_items", topic_names)
+    validate_topic_reference(next_steps, "next_steps", topic_names)
+    validate_topic_reference(notes, "notes", topic_names)
     return {
         "conversation_types": conversation_types,
-        "facts": validate_summary_list(
-            payload.get("facts"),
-            "facts",
-            OPENAI_ACCUMULATED_MAX_ITEMS,
-            lambda item, label: validate_summary_item(
-                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed", "uncertain"}, 240, True
-            ),
-        ),
-        "hypotheses": validate_summary_list(
-            payload.get("hypotheses"),
-            "hypotheses",
-            OPENAI_ACCUMULATED_MAX_ITEMS,
-            lambda item, label: validate_summary_item(
-                item, label, {"medium", "low"}, {"uncertain"}, 240, True
-            ),
-        ),
-        "decisions": validate_summary_list(
-            payload.get("decisions"),
-            "decisions",
-            OPENAI_ACCUMULATED_MAX_ITEMS,
-            lambda item, label: validate_summary_item(
-                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True
-            ),
-        ),
-        "open_items": validate_summary_list(
-            payload.get("open_items"),
-            "open_items",
-            OPENAI_ACCUMULATED_MAX_ITEMS,
-            lambda item, label: validate_summary_item(
-                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True
-            ),
-        ),
-        "next_steps": validate_summary_list(
-            payload.get("next_steps"),
-            "next_steps",
-            OPENAI_ACCUMULATED_MAX_ITEMS,
-            lambda item, label: validate_summary_item(
-                item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True
-            ),
-        ),
-        "notes": validate_summary_list(
-            payload.get("notes"),
-            "notes",
-            OPENAI_ACCUMULATED_MAX_ITEMS,
-            lambda item, label: validate_summary_item(
-                item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True
-            ),
-        ),
+        "topics": topics,
+        "facts": facts,
+        "hypotheses": hypotheses,
+        "decisions": decisions,
+        "open_items": open_items,
+        "next_steps": next_steps,
+        "notes": notes,
     }
 
 
@@ -544,10 +975,11 @@ def validate_final_summary_payload(payload: dict) -> dict:
     required_keys = {
         "title",
         "conversation_types",
-        "main_points",
-        "decisions",
-        "pending_items",
-        "next_steps",
+        "executive_summary",
+        "topics",
+        "global_decisions",
+        "global_pending_items",
+        "global_next_steps",
         "additional_notes",
     }
     assert_no_extra_keys(payload, required_keys, SUMMARY_KIND_FINAL)
@@ -569,6 +1001,26 @@ def validate_final_summary_payload(payload: dict) -> dict:
             continue
         seen_types.add(item)
         conversation_types.append(item)
+    executive_summary = payload.get("executive_summary")
+    if not isinstance(executive_summary, str):
+        raise RuntimeError("final.executive_summary deve ser string")
+    executive_summary = executive_summary.strip()
+    if not executive_summary:
+        raise RuntimeError("final.executive_summary nao pode ser vazio")
+
+    topics_raw = payload.get("topics")
+    if not isinstance(topics_raw, list):
+        raise RuntimeError("final.topics deve ser array")
+    if len(topics_raw) > 12:
+        raise RuntimeError("final.topics excede maximo de 12 itens")
+    topics: list[dict] = []
+    seen_topic_names: set[str] = set()
+    for index, item in enumerate(topics_raw):
+        topic = validate_final_topic_item(item, f"topics[{index}]")
+        if topic["name"] in seen_topic_names:
+            raise RuntimeError(f"topics[{index}].name duplicado")
+        seen_topic_names.add(topic["name"])
+        topics.append(topic)
 
     def _final_item(item: Any, label: str) -> dict:
         return validate_summary_item(
@@ -578,15 +1030,32 @@ def validate_final_summary_payload(payload: dict) -> dict:
             None,
             280,
             False,
+            False,
         )
 
     return {
         "title": title,
         "conversation_types": conversation_types,
-        "main_points": validate_summary_list(payload.get("main_points"), "main_points", 12, _final_item),
-        "decisions": validate_summary_list(payload.get("decisions"), "decisions", 12, _final_item),
-        "pending_items": validate_summary_list(payload.get("pending_items"), "pending_items", 12, _final_item),
-        "next_steps": validate_summary_list(payload.get("next_steps"), "next_steps", 12, _final_item),
+        "executive_summary": executive_summary,
+        "topics": topics,
+        "global_decisions": validate_summary_list(
+            payload.get("global_decisions"),
+            "global_decisions",
+            12,
+            _final_item,
+        ),
+        "global_pending_items": validate_summary_list(
+            payload.get("global_pending_items"),
+            "global_pending_items",
+            12,
+            _final_item,
+        ),
+        "global_next_steps": validate_summary_list(
+            payload.get("global_next_steps"),
+            "global_next_steps",
+            12,
+            _final_item,
+        ),
         "additional_notes": validate_summary_list(payload.get("additional_notes"), "additional_notes", 12, _final_item),
     }
 
@@ -2385,6 +2854,180 @@ def db_mark_summary_task_error(
         conn.close()
 
 
+def db_reschedule_summary_task(
+    room_name: str,
+    call_session_id: str,
+    minute_index: int,
+    next_attempt_at: str,
+    error_message: str,
+    now_iso: str,
+) -> None:
+    conn = read_db_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE summary_tasks
+            SET status='pending',
+                next_attempt_at=?,
+                error_message=?,
+                updated_at=?
+            WHERE room_name=? AND session_id=? AND minute_index=?
+            """,
+            (
+                next_attempt_at,
+                error_message[:1000],
+                now_iso,
+                room_name,
+                call_session_id,
+                minute_index,
+            ),
+        )
+    finally:
+        conn.close()
+
+
+def db_get_summary_task_rows(room_name: str, call_session_id: str) -> list[sqlite3.Row]:
+    conn = read_db_connection()
+    try:
+        return conn.execute(
+            """
+            SELECT minute_index, status, retries, next_attempt_at, error_message, updated_at
+            FROM summary_tasks
+            WHERE room_name=? AND session_id=?
+            ORDER BY minute_index ASC
+            """,
+            (room_name, call_session_id),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_schedule_final_summary_task(
+    room_name: str,
+    call_session_id: str,
+    now_iso: str,
+    force: bool = False,
+) -> bool:
+    conn = read_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT status
+            FROM summary_tasks
+            WHERE room_name=? AND session_id=? AND minute_index=-1
+            """,
+            (room_name, call_session_id),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO summary_tasks(
+                    room_name, session_id, minute_index,
+                    status, retries, next_attempt_at,
+                    error_message, created_at, updated_at
+                ) VALUES (?, ?, -1, 'pending', 0, ?, NULL, ?, ?)
+                """,
+                (room_name, call_session_id, now_iso, now_iso, now_iso),
+            )
+            conn.execute("COMMIT")
+            return True
+        status = str(row["status"])
+        if not force and status in {"processing", "done"}:
+            conn.execute("COMMIT")
+            return False
+        conn.execute(
+            """
+            UPDATE summary_tasks
+            SET status='pending',
+                retries=0,
+                next_attempt_at=?,
+                error_message=NULL,
+                updated_at=?
+            WHERE room_name=? AND session_id=? AND minute_index=-1
+            """,
+            (now_iso, now_iso, room_name, call_session_id),
+        )
+        conn.execute("COMMIT")
+        return int(conn.total_changes) > 0
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def db_get_finalized_sessions_for_summary_reconcile() -> list[sqlite3.Row]:
+    conn = read_db_connection()
+    try:
+        return conn.execute(
+            """
+            SELECT room_name, COALESCE(call_session_id, session_id) AS call_session_id, finalized_at
+            FROM sessions
+            WHERE finalized_at IS NOT NULL
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_recover_stale_summary_tasks(now_iso: str, stale_seconds: int) -> int:
+    now_dt = parse_iso_datetime(now_iso)
+    cutoff_dt = now_dt - timedelta(seconds=stale_seconds)
+    conn = read_db_connection()
+    recovered = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        candidates = conn.execute(
+            """
+            SELECT room_name, session_id, minute_index, retries, updated_at
+            FROM summary_tasks
+            WHERE status='processing'
+            """
+        ).fetchall()
+        for row in candidates:
+            raw_updated_at = str(row["updated_at"] or "")
+            try:
+                updated_dt = parse_iso_datetime(raw_updated_at)
+            except ValueError:
+                continue
+            if updated_dt > cutoff_dt:
+                continue
+            retries = int(row["retries"]) + 1
+            next_attempt_iso = (now_dt + timedelta(seconds=15 * retries)).isoformat()
+            changes_before = int(conn.total_changes)
+            conn.execute(
+                """
+                UPDATE summary_tasks
+                SET status='error',
+                    retries=?,
+                    error_message=?,
+                    next_attempt_at=?,
+                    updated_at=?
+                WHERE room_name=? AND session_id=? AND minute_index=?
+                  AND status='processing'
+                """,
+                (
+                    retries,
+                    f"task processing stale timeout>{stale_seconds}s",
+                    next_attempt_iso,
+                    now_iso,
+                    row["room_name"],
+                    row["session_id"],
+                    int(row["minute_index"]),
+                ),
+            )
+            if int(conn.total_changes) > changes_before:
+                recovered += 1
+        conn.execute("COMMIT")
+        return recovered
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def db_get_session_minute_exports(room_name: str, call_session_id: str) -> list[sqlite3.Row]:
     conn = read_db_connection()
     try:
@@ -2888,6 +3531,258 @@ def session_final_transcript_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "final/final_transcript.json")
 
 
+def _minutes_label(minutes: list[int]) -> str:
+    unique = sorted({int(minute) for minute in minutes})
+    return ", ".join(str(minute) for minute in unique)
+
+
+def _build_degradation_additional_note(missing_minutes: list[int], reasons: list[str]) -> dict:
+    minute_label = _minutes_label(missing_minutes)
+    reason = reasons[0] if reasons else "houve falha na consolidacao total da chamada"
+    text = f"Ata parcial: minutos nao processados [{minute_label}]; motivo: {reason}."
+    if len(text) > 280:
+        text = text[:277].rstrip() + "..."
+    return {
+        "text": text,
+        "confidence": "medium",
+        "tags": ["degradacao", "ata_parcial", "minutos"],
+    }
+
+
+def inject_degradation_disclosure(
+    final_summary: dict,
+    missing_minutes: list[int],
+    reasons: list[str],
+) -> dict:
+    if not missing_minutes:
+        return final_summary
+    summary = dict(final_summary)
+    minute_label = _minutes_label(missing_minutes)
+    disclosure = f"Documento parcial: minutos sem consolidacao completa [{minute_label}]."
+    executive_summary = str(summary.get("executive_summary", "")).strip()
+    if disclosure not in executive_summary:
+        executive_summary = (
+            f"{disclosure} {executive_summary}".strip() if executive_summary else disclosure
+        )
+    summary["executive_summary"] = executive_summary
+    notes = summary.get("additional_notes")
+    if not isinstance(notes, list):
+        notes = []
+    note_item = _build_degradation_additional_note(missing_minutes, reasons)
+    if note_item["text"] not in {str(item.get("text")) for item in notes if isinstance(item, dict)}:
+        notes.append(note_item)
+    if len(notes) > 12:
+        notes = notes[-12:]
+    summary["additional_notes"] = notes
+    return validate_final_summary_payload(summary)
+
+
+def _map_minute_topic_status_to_accumulated(status: str) -> str:
+    if status in {"new", "continuing"}:
+        return "active"
+    return "uncertain"
+
+
+def build_accumulated_from_minute_summaries(minute_summaries: list[dict]) -> dict:
+    accumulated = default_accumulated_summary_payload()
+    seen_types: set[str] = set()
+    topic_index: dict[str, int] = {}
+    seen_items: dict[str, set[tuple[str, str, str]]] = {
+        "facts": set(),
+        "hypotheses": set(),
+        "decisions": set(),
+        "open_items": set(),
+        "next_steps": set(),
+        "notes": set(),
+    }
+
+    def ensure_topic(name: str, summary: str, status: str, tags: list[str]) -> None:
+        if name in topic_index:
+            idx = topic_index[name]
+            current = accumulated["topics"][idx]
+            if summary:
+                current["summary"] = summary
+            current["status"] = status
+            current["tags"] = validate_summary_tags(current.get("tags", []) + tags, f"topics[{idx}]")
+            return
+        if len(accumulated["topics"]) >= 20:
+            return
+        idx = len(accumulated["topics"])
+        topic_index[name] = idx
+        accumulated["topics"].append(
+            {
+                "name": name,
+                "summary": summary or "Assunto consolidado a partir dos minutos recuperados.",
+                "status": status,
+                "tags": validate_summary_tags(tags, f"topics[{idx}]"),
+            }
+        )
+
+    for minute_summary in minute_summaries:
+        chunk_type = str(minute_summary.get("chunk_type", "")).strip()
+        if chunk_type in SUMMARY_ALLOWED_TYPES and chunk_type not in seen_types:
+            seen_types.add(chunk_type)
+            accumulated["conversation_types"].append(chunk_type)
+
+        for topic in minute_summary.get("topics", []):
+            if not isinstance(topic, dict):
+                continue
+            topic_name = str(topic.get("name", "")).strip()
+            if not topic_name:
+                continue
+            topic_summary = str(topic.get("summary", "")).strip()
+            topic_status = _map_minute_topic_status_to_accumulated(str(topic.get("status", "")).strip())
+            topic_tags = topic.get("tags")
+            tags = topic_tags if isinstance(topic_tags, list) else []
+            ensure_topic(topic_name, topic_summary, topic_status, tags)
+
+        for key in ("facts", "hypotheses", "decisions", "open_items", "next_steps", "notes"):
+            for item in minute_summary.get(key, []):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                ensure_topic(
+                    name,
+                    "Assunto consolidado a partir dos minutos recuperados.",
+                    "uncertain",
+                    [],
+                )
+                text = str(item.get("text", "")).strip()
+                status = str(item.get("status", "")).strip()
+                if not text or not status:
+                    continue
+                dedupe_key = (text, status, name)
+                if dedupe_key in seen_items[key]:
+                    continue
+                if len(accumulated[key]) >= OPENAI_ACCUMULATED_MAX_ITEMS:
+                    continue
+                seen_items[key].add(dedupe_key)
+                item_tags = item.get("tags")
+                tags = item_tags if isinstance(item_tags, list) else []
+                accumulated[key].append(
+                    {
+                        "text": text,
+                        "confidence": str(item.get("confidence", "medium")).strip().lower(),
+                        "status": status,
+                        "tags": validate_summary_tags(tags, f"{key}[{len(accumulated[key])}]"),
+                        "name": name,
+                    }
+                )
+
+    return validate_accumulated_summary_payload(accumulated)
+
+
+def build_deterministic_final_summary(
+    accumulated_summary: dict,
+    missing_minutes: list[int],
+    reasons: list[str],
+) -> dict:
+    normalized_acc = (
+        validate_accumulated_summary_payload(accumulated_summary)
+        if isinstance(accumulated_summary, dict)
+        else default_accumulated_summary_payload()
+    )
+
+    def _collect_topic_texts(source_key: str, topic_name: str, limit: int = 12) -> list[str]:
+        texts: list[str] = []
+        seen: set[str] = set()
+        for item in normalized_acc.get(source_key, []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name", "")).strip() != topic_name:
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            texts.append(text)
+            if len(texts) >= limit:
+                break
+        return texts
+
+    final_topics: list[dict] = []
+    for topic in normalized_acc.get("topics", []):
+        if not isinstance(topic, dict):
+            continue
+        if len(final_topics) >= 12:
+            break
+        name = str(topic.get("name", "")).strip()
+        if not name:
+            continue
+        summary = str(topic.get("summary", "")).strip() or "Resumo consolidado do assunto."
+        final_topics.append(
+            {
+                "name": name,
+                "summary": summary,
+                "decisions": _collect_topic_texts("decisions", name),
+                "pending_items": _collect_topic_texts("open_items", name),
+                "next_steps": _collect_topic_texts("next_steps", name),
+                "tags": validate_summary_tags(topic.get("tags"), f"final.topics[{len(final_topics)}]"),
+            }
+        )
+
+    def _global_items(source_key: str) -> list[dict]:
+        items: list[dict] = []
+        seen: set[str] = set()
+        for item in normalized_acc.get(source_key, []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            tags = item.get("tags")
+            items.append(
+                {
+                    "text": text,
+                    "confidence": str(item.get("confidence", "medium")).strip().lower(),
+                    "tags": validate_summary_tags(tags if isinstance(tags, list) else [], source_key),
+                }
+            )
+            if len(items) >= 12:
+                break
+        return items
+
+    additional_notes = _global_items("notes")
+    if missing_minutes:
+        additional_notes.append(_build_degradation_additional_note(missing_minutes, reasons))
+        if len(additional_notes) > 12:
+            additional_notes = additional_notes[-12:]
+
+    global_decisions = _global_items("decisions")
+    if not global_decisions:
+        global_decisions = [
+            {
+                "text": "Nenhuma decisao explicita foi registrada.",
+                "confidence": "medium",
+                "tags": [],
+            }
+        ]
+
+    executive_summary = "Ata final consolidada com os dados recuperados da chamada."
+    if final_topics:
+        executive_summary = f"Ata final consolidada com {len(final_topics)} assunto(s) principal(is)."
+    if missing_minutes:
+        executive_summary = (
+            f"Documento parcial: minutos sem consolidacao completa [{_minutes_label(missing_minutes)}]. "
+            f"{executive_summary}"
+        )
+
+    payload = {
+        "title": "Resumo Final Executivo da Chamada",
+        "conversation_types": normalized_acc.get("conversation_types", []),
+        "executive_summary": executive_summary,
+        "topics": final_topics,
+        "global_decisions": global_decisions,
+        "global_pending_items": _global_items("open_items"),
+        "global_next_steps": _global_items("next_steps"),
+        "additional_notes": additional_notes,
+    }
+    return validate_final_summary_payload(payload)
+
+
 def build_final_transcript_payload(
     room_name: str,
     call_session_id: str,
@@ -3070,12 +3965,19 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
             )
 
             if summary_engine.enabled:
-                await asyncio.to_thread(db_upsert_summary_task, room_name, call_session_id, -1, now_iso)
-                logger.info(
-                    "final summary task queued room=%s session=%s minute=-1",
+                queued = await asyncio.to_thread(
+                    db_schedule_final_summary_task,
                     room_name,
                     call_session_id,
+                    now_iso,
+                    False,
                 )
+                if queued:
+                    logger.info(
+                        "final summary task queued room=%s session=%s minute=-1",
+                        room_name,
+                        call_session_id,
+                    )
             db_mark_room_finalized(room_name, call_session_id)
             logger.info("room finalized room=%s session=%s", room_name, call_session_id)
         except Exception as exc:  # pylint: disable=broad-except
@@ -3090,16 +3992,113 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
             )
 
 
+async def run_summary_reconciliation_once() -> None:
+    now_iso = utc_now_iso()
+    recovered = await asyncio.to_thread(
+        db_recover_stale_summary_tasks,
+        now_iso,
+        SUMMARY_PROCESSING_STALE_SECONDS,
+    )
+    if recovered > 0:
+        logger.warning(
+            "summary reconcile recovered stale processing tasks count=%s stale_seconds=%s",
+            recovered,
+            SUMMARY_PROCESSING_STALE_SECONDS,
+        )
+
+    finalized_sessions = await asyncio.to_thread(db_get_finalized_sessions_for_summary_reconcile)
+    for row in finalized_sessions:
+        room_name = str(row["room_name"] or "")
+        call_session_id = str(row["call_session_id"] or "").strip()
+        if not room_name or not call_session_id:
+            continue
+        task_rows = await asyncio.to_thread(db_get_summary_task_rows, room_name, call_session_id)
+        final_row = next((task for task in task_rows if int(task["minute_index"]) < 0), None)
+        if final_row is None:
+            queued = await asyncio.to_thread(
+                db_schedule_final_summary_task,
+                room_name,
+                call_session_id,
+                now_iso,
+                False,
+            )
+            if queued:
+                logger.info(
+                    "summary reconcile queued missing final task room=%s session=%s minute=-1",
+                    room_name,
+                    call_session_id,
+                )
+            continue
+
+        final_status = str(final_row["status"] or "")
+        final_retries = int(final_row["retries"] or 0)
+        if (
+            final_status == "error"
+            and final_retries >= OPENAI_MAX_RETRIES
+            and SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK
+        ):
+            reopened = await asyncio.to_thread(
+                db_schedule_final_summary_task,
+                room_name,
+                call_session_id,
+                now_iso,
+                True,
+            )
+            if reopened:
+                logger.warning(
+                    "summary reconcile reopened exhausted final task room=%s session=%s",
+                    room_name,
+                    call_session_id,
+                )
+
+        if not SUMMARY_FINAL_REEMIT_ON_LATE_MINUTES or final_status != "done":
+            continue
+        minute_rows = [task for task in task_rows if int(task["minute_index"]) >= 0]
+        if not minute_rows:
+            continue
+        try:
+            latest_minute_update = max(
+                parse_iso_datetime(str(task["updated_at"])) for task in minute_rows
+            )
+            final_update = parse_iso_datetime(str(final_row["updated_at"]))
+        except ValueError:
+            continue
+        if latest_minute_update <= final_update:
+            continue
+        reopened = await asyncio.to_thread(
+            db_schedule_final_summary_task,
+            room_name,
+            call_session_id,
+            now_iso,
+            True,
+        )
+        if reopened:
+            logger.info(
+                "summary reconcile requeued final task after late minute room=%s session=%s",
+                room_name,
+                call_session_id,
+            )
+
+
 async def summary_worker_loop(
     stop_event: asyncio.Event,
     firebase_router: FirebaseRouter,
     summary_engine: SummaryEngine,
 ) -> None:
     logger.info("summary worker started enabled=%s", summary_engine.enabled)
+    next_reconcile_at = 0.0
     while not stop_event.is_set():
         if not summary_engine.enabled:
             await asyncio.sleep(1.0)
             continue
+
+        now_monotonic = time.monotonic()
+        if now_monotonic >= next_reconcile_at:
+            try:
+                await run_summary_reconciliation_once()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("summary reconcile failed: %s", exc)
+            next_reconcile_at = now_monotonic + SUMMARY_RECONCILE_INTERVAL_SECONDS
 
         now_iso = utc_now_iso()
         task = await asyncio.to_thread(db_claim_summary_task, now_iso)
@@ -3206,60 +4205,219 @@ async def summary_worker_loop(
                     final_transcript_path=None if not session_is_finalized else CALL_INDEX_UNSET,
                     final_transcript_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
                 )
+                if session_is_finalized and SUMMARY_FINAL_REEMIT_ON_LATE_MINUTES:
+                    await asyncio.to_thread(
+                        db_schedule_final_summary_task,
+                        room_name,
+                        call_session_id,
+                        utc_now_iso(),
+                        True,
+                    )
             else:
+                task_rows = await asyncio.to_thread(db_get_summary_task_rows, room_name, call_session_id)
+                exports = await asyncio.to_thread(
+                    db_get_session_minute_exports, room_name, call_session_id
+                )
+                expected_minutes = {
+                    int(export["minute_index"])
+                    for export in exports
+                    if int(export["minute_index"]) >= 0
+                }
+                status_by_minute: dict[int, str] = {
+                    int(row["minute_index"]): str(row["status"] or "")
+                    for row in task_rows
+                    if int(row["minute_index"]) >= 0
+                }
+                pending_task_minutes = {
+                    minute
+                    for minute, status in status_by_minute.items()
+                    if status != "done"
+                }
+                for minute in expected_minutes:
+                    if status_by_minute.get(minute) != "done":
+                        pending_task_minutes.add(minute)
+
+                if pending_task_minutes:
+                    finalized_at_raw = str(session_row["finalized_at"] or "").strip()
+                    if finalized_at_raw and SUMMARY_FINALIZATION_GRACE_SECONDS > 0:
+                        try:
+                            now_dt = parse_iso_datetime(now_iso)
+                            finalized_dt = parse_iso_datetime(finalized_at_raw)
+                            elapsed = (now_dt - finalized_dt).total_seconds()
+                        except ValueError:
+                            elapsed = float(SUMMARY_FINALIZATION_GRACE_SECONDS)
+                            now_dt = parse_iso_datetime(now_iso)
+                            finalized_dt = now_dt
+                        if elapsed < SUMMARY_FINALIZATION_GRACE_SECONDS:
+                            deadline_dt = finalized_dt + timedelta(
+                                seconds=SUMMARY_FINALIZATION_GRACE_SECONDS
+                            )
+                            if deadline_dt <= now_dt:
+                                deadline_dt = now_dt + timedelta(seconds=5)
+                            await asyncio.to_thread(
+                                db_reschedule_summary_task,
+                                room_name,
+                                call_session_id,
+                                minute_index,
+                                deadline_dt.isoformat(),
+                                (
+                                    "aguardando minutos pendentes antes da ata final: "
+                                    f"[{_minutes_label(sorted(pending_task_minutes))}]"
+                                ),
+                                now_iso,
+                            )
+                            logger.info(
+                                "final summary delayed by grace room=%s session=%s pending_minutes=%s grace_seconds=%s",
+                                room_name,
+                                call_session_id,
+                                sorted(pending_task_minutes),
+                                SUMMARY_FINALIZATION_GRACE_SECONDS,
+                            )
+                            continue
+
                 accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
                 accumulated_payload = await asyncio.to_thread(
                     firebase_router.fetch_json, routing, accumulated_path
                 )
                 merged_summary: dict | None = None
+                recovery_reasons: list[str] = []
                 if isinstance(accumulated_payload, dict):
                     raw_summary = accumulated_payload.get("summary")
                     if isinstance(raw_summary, dict):
-                        merged_summary = validate_accumulated_summary_payload(raw_summary)
-                if merged_summary is not None:
+                        try:
+                            merged_summary = validate_accumulated_summary_payload(raw_summary)
+                        except RuntimeError as exc:
+                            recovery_reasons.append("resumo acumulado invalido")
+                            logger.warning(
+                                "invalid accumulated payload before finalization room=%s session=%s error=%s",
+                                room_name,
+                                call_session_id,
+                                exc,
+                            )
+                else:
+                    recovery_reasons.append("resumo acumulado indisponivel")
+
+                recovered_minute_summaries: list[dict] = []
+                unavailable_minutes: set[int] = set()
+                for export in exports:
+                    minute = int(export["minute_index"])
+                    if minute < 0:
+                        continue
+                    summary_path = str(export["summary_json_path"] or "").strip()
+                    if not summary_path:
+                        unavailable_minutes.add(minute)
+                        continue
+                    try:
+                        minute_payload = await asyncio.to_thread(
+                            firebase_router.fetch_json,
+                            routing,
+                            summary_path,
+                        )
+                        if not isinstance(minute_payload, dict):
+                            unavailable_minutes.add(minute)
+                            continue
+                        raw_minute_summary = minute_payload.get("summary")
+                        if not isinstance(raw_minute_summary, dict):
+                            unavailable_minutes.add(minute)
+                            continue
+                        recovered_minute_summaries.append(
+                            validate_minute_summary_payload(raw_minute_summary)
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        unavailable_minutes.add(minute)
+                        logger.warning(
+                            "failed to recover minute summary for finalization room=%s session=%s minute=%s error=%s",
+                            room_name,
+                            call_session_id,
+                            minute,
+                            exc,
+                        )
+
+                if merged_summary is None:
+                    if recovered_minute_summaries:
+                        merged_summary = build_accumulated_from_minute_summaries(
+                            recovered_minute_summaries
+                        )
+                        recovery_reasons.append(
+                            "acumulado reconstruido a partir de minutos recuperados"
+                        )
+                    else:
+                        merged_summary = default_accumulated_summary_payload()
+                        recovery_reasons.append("nenhum minuto valido recuperado")
+
+                missing_minutes = sorted(pending_task_minutes | unavailable_minutes)
+                if missing_minutes:
+                    recovery_reasons.append(
+                        f"minutos sem consolidacao total: [{_minutes_label(missing_minutes)}]"
+                    )
+
+                final_path = session_final_summary_path(routing.storage_base_path)
+                final_summary: dict
+                try:
                     final_system_prompt = await asyncio.to_thread(
-                        firebase_router.fetch_agent_prompt, routing, "stt_finalize_summary"
+                        firebase_router.fetch_agent_prompt,
+                        routing,
+                        "stt_finalize_summary",
                     )
                     final_summary = await asyncio.to_thread(
                         summary_engine.finalize_summary,
                         merged_summary,
                         final_system_prompt,
                     )
-                    final_path = session_final_summary_path(routing.storage_base_path)
-                    await asyncio.to_thread(
-                        firebase_router.upload_json,
-                        routing,
-                        final_path,
-                        {
-                            "room_name": room_name,
-                            "transcript_session_id": routing.transcript_session_id,
-                            "call_session_id": routing.call_session_id,
-                            "summary": final_summary,
-                            "updated_at": now_iso,
-                        },
+                    final_summary = inject_degradation_disclosure(
+                        final_summary,
+                        missing_minutes,
+                        recovery_reasons,
                     )
-                    exports = await asyncio.to_thread(
-                        db_get_session_minute_exports, room_name, call_session_id
-                    )
-                    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
-                    await asyncio.to_thread(
-                        firebase_router.publish_call_index,
-                        routing=routing,
-                        status="finalized",
-                        last_minute_index=exports[-1]["minute_index"] if exports else -1,
-                        finalized=True,
-                        final_summary_path=final_path,
-                        summary_accumulated_path=accumulated_path,
-                        final_summary_ready=True,
-                        final_transcript_path=final_transcript_path,
-                        final_transcript_ready=True,
-                    )
-                    logger.info(
-                        "final summary uploaded room=%s session=%s path=%s",
+                except Exception as exc:  # pylint: disable=broad-except
+                    if not SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK:
+                        raise
+                    logger.warning(
+                        "final summary fallback deterministic room=%s session=%s error=%s",
                         room_name,
                         call_session_id,
-                        final_path,
+                        exc,
                     )
+                    fallback_reasons = list(recovery_reasons)
+                    fallback_reasons.append("falha na geracao final via LLM")
+                    final_summary = build_deterministic_final_summary(
+                        merged_summary,
+                        missing_minutes,
+                        fallback_reasons,
+                    )
+
+                await asyncio.to_thread(
+                    firebase_router.upload_json,
+                    routing,
+                    final_path,
+                    {
+                        "room_name": room_name,
+                        "transcript_session_id": routing.transcript_session_id,
+                        "call_session_id": routing.call_session_id,
+                        "summary": final_summary,
+                        "updated_at": now_iso,
+                    },
+                )
+                final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+                await asyncio.to_thread(
+                    firebase_router.publish_call_index,
+                    routing=routing,
+                    status="finalized",
+                    last_minute_index=exports[-1]["minute_index"] if exports else -1,
+                    finalized=True,
+                    final_summary_path=final_path,
+                    summary_accumulated_path=accumulated_path,
+                    final_summary_ready=True,
+                    final_transcript_path=final_transcript_path,
+                    final_transcript_ready=True,
+                )
+                logger.info(
+                    "final summary uploaded room=%s session=%s path=%s partial=%s",
+                    room_name,
+                    call_session_id,
+                    final_path,
+                    bool(missing_minutes),
+                )
 
             await asyncio.to_thread(
                 db_mark_summary_task_done, room_name, call_session_id, minute_index, utc_now_iso()
@@ -3355,6 +4513,8 @@ async def lifespan(_: FastAPI):
     hmac_keys = parse_hmac_keys()
     firebase_router = FirebaseRouter.create()
     summary_engine = SummaryEngine.create()
+    if summary_engine.enabled:
+        await run_summary_reconciliation_once()
     worker_stop_event = asyncio.Event()
     worker_task = asyncio.create_task(
         worker_loop(worker_stop_event, recognizer, firebase_router, summary_engine)
@@ -3412,6 +4572,11 @@ async def health() -> dict:
         "openai_model_minute_summary": runtime.summary_engine.minute_model,
         "openai_model_accumulated_summary": runtime.summary_engine.accumulated_model,
         "openai_model_final_summary": runtime.summary_engine.final_model,
+        "summary_reconcile_interval_seconds": SUMMARY_RECONCILE_INTERVAL_SECONDS,
+        "summary_processing_stale_seconds": SUMMARY_PROCESSING_STALE_SECONDS,
+        "summary_finalization_grace_seconds": SUMMARY_FINALIZATION_GRACE_SECONDS,
+        "summary_final_reemit_on_late_minutes": SUMMARY_FINAL_REEMIT_ON_LATE_MINUTES,
+        "summary_final_enable_deterministic_fallback": SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK,
     }
 
 

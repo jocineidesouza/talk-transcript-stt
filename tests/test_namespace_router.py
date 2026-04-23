@@ -355,6 +355,7 @@ class SummaryEnginePromptTests(unittest.TestCase):
         previous_summary = STT_APP.default_accumulated_summary_payload()
         minute_summary = {
             "chunk_type": "mista",
+            "topics": [],
             "facts": [],
             "hypotheses": [],
             "decisions": [],
@@ -406,6 +407,7 @@ class SummarySchemaValidationTests(unittest.TestCase):
         raw = json.dumps(
             {
                 "chunk_type": "tecnica",
+                "topics": [],
                 "facts": [],
                 "hypotheses": [],
                 "decisions": [],
@@ -424,20 +426,347 @@ class SummarySchemaValidationTests(unittest.TestCase):
                 json.dumps({"chunk_type": "tecnica"}),
             )
 
+    def test_parse_and_validate_summary_output_accepts_final_payload(self):
+        raw = json.dumps(
+            {
+                "title": "Resumo Final Executivo da Chamada",
+                "conversation_types": ["executiva"],
+                "executive_summary": "Resumo objetivo da reuniao.",
+                "topics": [
+                    {
+                        "name": "Cronograma de entrega",
+                        "summary": "Alinhado prazo inicial e dependencias.",
+                        "decisions": ["Prazo preliminar confirmado para sexta."],
+                        "pending_items": ["Confirmar disponibilidade da equipe de QA."],
+                        "next_steps": ["Enviar plano consolidado ate amanha."],
+                        "tags": ["cronograma"],
+                    }
+                ],
+                "global_decisions": [
+                    {"text": "Priorizar fase 1.", "confidence": "high", "tags": ["prioridade"]}
+                ],
+                "global_pending_items": [
+                    {"text": "Definir responsavel tecnico.", "confidence": "medium", "tags": ["responsavel"]}
+                ],
+                "global_next_steps": [
+                    {"text": "Agendar reuniao de acompanhamento.", "confidence": "medium", "tags": ["followup"]}
+                ],
+                "additional_notes": [
+                    {"text": "Dependencia externa pode atrasar entrega.", "confidence": "low", "tags": ["risco"]}
+                ],
+            }
+        )
+        parsed = STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_FINAL, raw)
+        self.assertEqual(parsed["title"], "Resumo Final Executivo da Chamada")
+        self.assertEqual(parsed["topics"][0]["name"], "Cronograma de entrega")
+
+    def test_parse_and_validate_summary_output_rejects_legacy_final_fields(self):
+        raw = json.dumps(
+            {
+                "title": "Resumo Final Executivo da Chamada",
+                "conversation_types": [],
+                "main_points": [],
+                "decisions": [],
+                "pending_items": [],
+                "next_steps": [],
+                "additional_notes": [],
+            }
+        )
+        with self.assertRaises(RuntimeError):
+            STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_FINAL, raw)
+
+    def test_parse_and_validate_summary_output_rejects_missing_topics_in_minute(self):
+        raw = json.dumps(
+            {
+                "chunk_type": "tecnica",
+                "facts": [],
+                "hypotheses": [],
+                "decisions": [],
+                "open_items": [],
+                "next_steps": [],
+                "notes": [],
+            }
+        )
+        with self.assertRaises(RuntimeError):
+            STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_MINUTE, raw)
+
+    def test_parse_and_validate_summary_output_rejects_missing_topic_in_item(self):
+        raw = json.dumps(
+            {
+                "chunk_type": "tecnica",
+                "topics": [
+                    {
+                        "name": "Planejamento",
+                        "summary": "Tema principal do trecho.",
+                        "status": "new",
+                        "tags": ["planejamento"],
+                    }
+                ],
+                "facts": [
+                    {
+                        "text": "Equipe confirmou a agenda.",
+                        "confidence": "high",
+                        "status": "confirmed",
+                        "tags": ["agenda"],
+                    }
+                ],
+                "hypotheses": [],
+                "decisions": [],
+                "open_items": [],
+                "next_steps": [],
+                "notes": [],
+            }
+        )
+        with self.assertRaises(RuntimeError):
+            STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_MINUTE, raw)
+
+    def test_parse_and_validate_summary_output_rejects_unknown_topic_reference(self):
+        raw = json.dumps(
+            {
+                "chunk_type": "tecnica",
+                "topics": [
+                    {
+                        "name": "Planejamento",
+                        "summary": "Tema principal do trecho.",
+                        "status": "new",
+                        "tags": ["planejamento"],
+                    }
+                ],
+                "facts": [
+                    {
+                        "text": "Equipe confirmou a agenda.",
+                        "confidence": "high",
+                        "status": "confirmed",
+                        "tags": ["agenda"],
+                        "topic": "Tema inexistente",
+                    }
+                ],
+                "hypotheses": [],
+                "decisions": [],
+                "open_items": [],
+                "next_steps": [],
+                "notes": [],
+            }
+        )
+        with self.assertRaises(RuntimeError):
+            STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_MINUTE, raw)
+
+    def test_parse_and_validate_summary_output_accepts_name_field_in_items(self):
+        raw = json.dumps(
+            {
+                "chunk_type": "tecnica",
+                "topics": [
+                    {
+                        "name": "Planejamento",
+                        "summary": "Tema principal do trecho.",
+                        "status": "new",
+                        "tags": ["planejamento"],
+                    }
+                ],
+                "facts": [
+                    {
+                        "text": "Equipe confirmou a agenda.",
+                        "confidence": "high",
+                        "status": "confirmed",
+                        "tags": ["agenda"],
+                        "name": "Planejamento",
+                    }
+                ],
+                "hypotheses": [],
+                "decisions": [],
+                "open_items": [],
+                "next_steps": [],
+                "notes": [],
+            }
+        )
+        parsed = STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_MINUTE, raw)
+        self.assertEqual(parsed["facts"][0]["name"], "Planejamento")
+
+    def test_parse_and_validate_summary_output_normalizes_topic_alias_to_name(self):
+        raw = json.dumps(
+            {
+                "chunk_type": "tecnica",
+                "topics": [
+                    {
+                        "name": "Planejamento",
+                        "summary": "Tema principal do trecho.",
+                        "status": "new",
+                        "tags": ["planejamento"],
+                    }
+                ],
+                "facts": [
+                    {
+                        "text": "Equipe confirmou a agenda.",
+                        "confidence": "high",
+                        "status": "confirmed",
+                        "tags": ["agenda"],
+                        "topic": "Planejamento",
+                    }
+                ],
+                "hypotheses": [],
+                "decisions": [],
+                "open_items": [],
+                "next_steps": [],
+                "notes": [],
+            }
+        )
+        parsed = STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_MINUTE, raw)
+        self.assertEqual(parsed["facts"][0]["name"], "Planejamento")
+
+    def test_validate_minute_summary_payload_accepts_multiple_topics(self):
+        payload = {
+            "chunk_type": "mista",
+            "topics": [
+                {
+                    "name": "Escopo do projeto",
+                    "summary": "Definicao de entregas da fase inicial.",
+                    "status": "new",
+                    "tags": ["escopo"],
+                },
+                {
+                    "name": "Riscos operacionais",
+                    "summary": "Levantados riscos de dependencia externa.",
+                    "status": "continuing",
+                    "tags": ["riscos"],
+                },
+            ],
+            "facts": [
+                {
+                    "text": "A fase inicial inclui modulo de autenticacao.",
+                    "confidence": "high",
+                    "status": "confirmed",
+                    "tags": ["escopo"],
+                    "topic": "Escopo do projeto",
+                }
+            ],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [
+                {
+                    "text": "Dependencia externa ainda sem prazo final.",
+                    "confidence": "low",
+                    "status": "uncertain",
+                    "tags": ["riscos"],
+                    "topic": "Riscos operacionais",
+                }
+            ],
+        }
+        normalized = STT_APP.validate_minute_summary_payload(payload)
+        self.assertEqual(len(normalized["topics"]), 2)
+
+    def test_validate_accumulated_summary_payload_accepts_topics_with_item_reference(self):
+        payload = {
+            "conversation_types": ["mista"],
+            "topics": [
+                {
+                    "name": "Escopo do projeto",
+                    "summary": "Escopo consolidado da fase inicial.",
+                    "status": "active",
+                    "tags": ["escopo"],
+                }
+            ],
+            "facts": [
+                {
+                    "text": "Escopo da fase 1 foi confirmado.",
+                    "confidence": "high",
+                    "status": "confirmed",
+                    "tags": ["escopo"],
+                    "topic": "Escopo do projeto",
+                }
+            ],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        normalized = STT_APP.validate_accumulated_summary_payload(payload)
+        self.assertEqual(normalized["topics"][0]["status"], "active")
+
+    def test_validate_minute_summary_payload_rejects_invalid_topic_status(self):
+        payload = {
+            "chunk_type": "mista",
+            "topics": [
+                {
+                    "name": "Escopo do projeto",
+                    "summary": "Tema principal.",
+                    "status": "active",
+                    "tags": ["escopo"],
+                }
+            ],
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        with self.assertRaises(RuntimeError):
+            STT_APP.validate_minute_summary_payload(payload)
+
+    def test_validate_minute_summary_payload_rejects_invalid_notes_status(self):
+        payload = {
+            "chunk_type": "mista",
+            "topics": [
+                {
+                    "name": "Escopo do projeto",
+                    "summary": "Tema principal.",
+                    "status": "new",
+                    "tags": ["escopo"],
+                }
+            ],
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [
+                {
+                    "text": "Nota invalida",
+                    "confidence": "low",
+                    "status": "open",
+                    "tags": ["escopo"],
+                    "topic": "Escopo do projeto",
+                }
+            ],
+        }
+        with self.assertRaises(RuntimeError):
+            STT_APP.validate_minute_summary_payload(payload)
+
+    def test_validate_summary_tags_allows_empty_and_missing(self):
+        self.assertEqual(STT_APP.validate_summary_tags([], "item"), [])
+        self.assertEqual(STT_APP.validate_summary_tags(None, "item"), [])
+
+    def test_validate_summary_tags_truncates_above_4(self):
+        tags = ["a", "b", "c", "d", "e", "f"]
+        normalized = STT_APP.validate_summary_tags(tags, "item")
+        self.assertEqual(normalized, ["a", "b", "c", "d"])
+
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
 class AccumulatedSummaryLimitsTests(unittest.TestCase):
-    def _item(self, text: str, status: str, confidence: str = "medium") -> dict:
+    def _item(self, text: str, status: str, confidence: str = "medium", topic: str = "topico_1") -> dict:
         return {
             "text": text,
             "confidence": confidence,
             "status": status,
             "tags": ["tag"],
+            "topic": topic,
         }
 
     def _payload(self, notes_count: int = 0, facts_count: int = 0) -> dict:
         return {
             "conversation_types": [],
+            "topics": [
+                {
+                    "name": "topico_1",
+                    "summary": "topico consolidado",
+                    "status": "active",
+                    "tags": ["tag"],
+                }
+            ],
             "facts": [self._item(f"fact {i}", "confirmed", "high") for i in range(facts_count)],
             "hypotheses": [],
             "decisions": [],
@@ -683,6 +1012,14 @@ class SummaryToleranceAndFinalizationClaimTests(unittest.TestCase):
     def test_validate_minute_summary_payload_normalizes_invalid_notes_confidence(self):
         payload = {
             "chunk_type": "mista",
+            "topics": [
+                {
+                    "name": "ruido",
+                    "summary": "Trecho com informacoes pouco confiaveis.",
+                    "status": "new",
+                    "tags": ["ruido"],
+                }
+            ],
             "facts": [],
             "hypotheses": [],
             "decisions": [],
@@ -694,6 +1031,7 @@ class SummaryToleranceAndFinalizationClaimTests(unittest.TestCase):
                     "confidence": "HIGH",
                     "status": "info",
                     "tags": ["ruido"],
+                    "topic": "ruido",
                 }
             ],
         }
@@ -703,6 +1041,14 @@ class SummaryToleranceAndFinalizationClaimTests(unittest.TestCase):
     def test_validate_minute_summary_payload_normalizes_invalid_hypotheses_confidence(self):
         payload = {
             "chunk_type": "mista",
+            "topics": [
+                {
+                    "name": "hipoteses",
+                    "summary": "Pontos ainda nao confirmados.",
+                    "status": "new",
+                    "tags": ["hipotese"],
+                }
+            ],
             "facts": [],
             "hypotheses": [
                 {
@@ -710,6 +1056,7 @@ class SummaryToleranceAndFinalizationClaimTests(unittest.TestCase):
                     "confidence": "unknown",
                     "status": "uncertain",
                     "tags": ["hipotese"],
+                    "topic": "hipoteses",
                 }
             ],
             "decisions": [],
@@ -770,6 +1117,190 @@ class SummaryToleranceAndFinalizationClaimTests(unittest.TestCase):
 
                     row = STT_APP.db_get_session_row("talk__dev__roomA", "RM_session-1")
                     self.assertEqual(row["state"], "finalizing")
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class SummaryFinalResilienceTests(unittest.TestCase):
+    def test_build_accumulated_from_minute_summaries_generates_valid_payload(self):
+        minute = {
+            "chunk_type": "mista",
+            "topics": [
+                {
+                    "name": "Planejamento",
+                    "summary": "Escopo inicial discutido.",
+                    "status": "new",
+                    "tags": ["escopo"],
+                }
+            ],
+            "facts": [
+                {
+                    "text": "Prazo preliminar definido para sexta.",
+                    "confidence": "high",
+                    "status": "confirmed",
+                    "tags": ["prazo"],
+                    "name": "Planejamento",
+                }
+            ],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        accumulated = STT_APP.build_accumulated_from_minute_summaries([minute])
+        self.assertEqual(accumulated["conversation_types"], ["mista"])
+        self.assertEqual(accumulated["topics"][0]["status"], "active")
+        self.assertEqual(accumulated["facts"][0]["name"], "Planejamento")
+
+    def test_build_deterministic_final_summary_includes_partial_disclosure(self):
+        accumulated = {
+            "conversation_types": ["executiva"],
+            "topics": [
+                {
+                    "name": "Cronograma",
+                    "summary": "Discussao do cronograma.",
+                    "status": "active",
+                    "tags": ["prazo"],
+                }
+            ],
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [
+                {
+                    "text": "Follow-up marcado para sexta.",
+                    "confidence": "high",
+                    "status": "confirmed",
+                    "tags": ["followup"],
+                    "name": "Cronograma",
+                }
+            ],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        final_payload = STT_APP.build_deterministic_final_summary(
+            accumulated,
+            [2, 5],
+            ["acumulado reconstruido"],
+        )
+        self.assertIn("Documento parcial", final_payload["executive_summary"])
+        self.assertTrue(
+            any("Ata parcial" in note["text"] for note in final_payload["additional_notes"])
+        )
+
+    def test_inject_degradation_disclosure_adds_summary_and_note(self):
+        final_payload = {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": ["executiva"],
+            "executive_summary": "Resumo principal da chamada.",
+            "topics": [
+                {
+                    "name": "Cronograma",
+                    "summary": "Resumo do tema.",
+                    "decisions": [],
+                    "pending_items": [],
+                    "next_steps": [],
+                    "tags": [],
+                }
+            ],
+            "global_decisions": [
+                {"text": "Decisao A", "confidence": "medium", "tags": []}
+            ],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [],
+        }
+        updated = STT_APP.inject_degradation_disclosure(
+            final_payload,
+            [1, 4],
+            ["minutos ausentes"],
+        )
+        self.assertIn("Documento parcial", updated["executive_summary"])
+        self.assertEqual(len(updated["additional_notes"]), 1)
+        self.assertIn("Ata parcial", updated["additional_notes"][0]["text"])
+
+    def test_db_schedule_final_summary_task_force_requeues_done(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.db"
+            spool_dir = Path(tmpdir) / "spool"
+            with patch.object(STT_APP, "SQLITE_PATH", db_path):
+                with patch.object(STT_APP, "SPOOL_DIR", spool_dir):
+                    STT_APP.init_db()
+                    now = "2026-04-23T15:00:00+00:00"
+                    conn = STT_APP.read_db_connection()
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO summary_tasks(
+                                room_name, session_id, minute_index,
+                                status, retries, next_attempt_at,
+                                error_message, created_at, updated_at
+                            ) VALUES (?, ?, -1, 'done', 2, ?, NULL, ?, ?)
+                            """,
+                            ("talk__dev__roomA", "RM_session-1", now, now, now),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    changed = STT_APP.db_schedule_final_summary_task(
+                        "talk__dev__roomA",
+                        "RM_session-1",
+                        now,
+                        False,
+                    )
+                    self.assertFalse(changed)
+
+                    changed_force = STT_APP.db_schedule_final_summary_task(
+                        "talk__dev__roomA",
+                        "RM_session-1",
+                        now,
+                        True,
+                    )
+                    self.assertTrue(changed_force)
+                    rows = STT_APP.db_get_summary_task_rows("talk__dev__roomA", "RM_session-1")
+                    final_row = [row for row in rows if int(row["minute_index"]) < 0][0]
+                    self.assertEqual(final_row["status"], "pending")
+                    self.assertEqual(int(final_row["retries"]), 0)
+
+    def test_db_recover_stale_summary_tasks_moves_processing_to_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.db"
+            spool_dir = Path(tmpdir) / "spool"
+            with patch.object(STT_APP, "SQLITE_PATH", db_path):
+                with patch.object(STT_APP, "SPOOL_DIR", spool_dir):
+                    STT_APP.init_db()
+                    updated_at = "2026-04-23T14:00:00+00:00"
+                    now = "2026-04-23T14:10:00+00:00"
+                    conn = STT_APP.read_db_connection()
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO summary_tasks(
+                                room_name, session_id, minute_index,
+                                status, retries, next_attempt_at,
+                                error_message, created_at, updated_at
+                            ) VALUES (?, ?, ?, 'processing', 0, ?, NULL, ?, ?)
+                            """,
+                            (
+                                "talk__dev__roomA",
+                                "RM_session-1",
+                                2,
+                                updated_at,
+                                updated_at,
+                                updated_at,
+                            ),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    recovered = STT_APP.db_recover_stale_summary_tasks(now, 300)
+                    self.assertEqual(recovered, 1)
+                    rows = STT_APP.db_get_summary_task_rows("talk__dev__roomA", "RM_session-1")
+                    self.assertEqual(rows[0]["status"], "error")
+                    self.assertEqual(int(rows[0]["retries"]), 1)
+
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
 class FinalTranscriptTests(unittest.TestCase):
