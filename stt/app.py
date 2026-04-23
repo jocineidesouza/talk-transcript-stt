@@ -73,10 +73,10 @@ OPENAI_MODEL_MINUTE_SUMMARY = os.environ.get(
     "OPENAI_MODEL_MINUTE_SUMMARY", "gpt-4.1-mini"
 ).strip()
 OPENAI_MODEL_ACCUMULATED_SUMMARY = os.environ.get(
-    "OPENAI_MODEL_ACCUMULATED_SUMMARY", "gpt-4.1"
+    "OPENAI_MODEL_ACCUMULATED_SUMMARY", "gpt-4.1-mini"
 ).strip()
 OPENAI_MODEL_FINAL_SUMMARY = os.environ.get(
-    "OPENAI_MODEL_FINAL_SUMMARY", "gpt-4.1"
+    "OPENAI_MODEL_FINAL_SUMMARY", "gpt-4.1-mini"
 ).strip()
 OPENAI_REQUEST_TIMEOUT_SECONDS = max(
     5, int(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "45"))
@@ -248,182 +248,214 @@ SUMMARY_ALLOWED_TYPES = {"tecnica", "executiva", "operacional", "comercial", "mi
 SUMMARY_ALLOWED_CONFIDENCE = {"high", "medium", "low"}
 SUMMARY_ALLOWED_TOPIC_STATUS_MINUTE = {"new", "continuing", "uncertain"}
 SUMMARY_ALLOWED_TOPIC_STATUS_ACCUMULATED = {"active", "open", "resolved", "uncertain"}
+SUMMARY_RESPONSE_FORMAT_NAME_BY_KIND = {
+    SUMMARY_KIND_MINUTE: "summary_minute_v1",
+    SUMMARY_KIND_ACCUMULATED: "summary_accumulated_v1",
+    SUMMARY_KIND_FINAL: "summary_final_v1",
+}
+
+SUMMARY_STRING_ARRAY_SCHEMA = {"type": "array", "items": {"type": "string"}}
+SUMMARY_CONVERSATION_TYPE_ENUM = ["tecnica", "executiva", "operacional", "comercial", "mista"]
+
+
+def _topic_schema(topic_status: list[str]) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"type": "string"},
+            "summary": {"type": "string"},
+            "status": {"type": "string", "enum": topic_status},
+            "tags": SUMMARY_STRING_ARRAY_SCHEMA,
+        },
+        "required": ["name", "summary", "status", "tags"],
+    }
+
+
+def _summary_item_schema(status_values: list[str], confidence_values: list[str]) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "text": {"type": "string"},
+            "confidence": {"type": "string", "enum": confidence_values},
+            "status": {"type": "string", "enum": status_values},
+            "tags": SUMMARY_STRING_ARRAY_SCHEMA,
+            "name": {"type": "string"},
+        },
+        "required": ["text", "confidence", "status", "tags", "name"],
+    }
+
+
+def _final_item_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "text": {"type": "string"},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "tags": SUMMARY_STRING_ARRAY_SCHEMA,
+        },
+        "required": ["text", "confidence", "tags"],
+    }
+
 
 SUMMARY_SCHEMA_MINUTE = {
-    "chunk_type": "tecnica|executiva|operacional|comercial|mista",
-    "topics": [
-        {
-            "name": "string",
-            "summary": "string",
-            "status": "new|continuing|uncertain",
-            "tags": ["string"]
-        }
-    ],
-    "facts": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "status": "confirmed|uncertain",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "hypotheses": [
-        {
-            "text": "string",
-            "confidence": "medium|low",
-            "status": "uncertain",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "decisions": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "status": "confirmed",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "open_items": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "status": "open",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "next_steps": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "status": "planned",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "notes": [
-        {
-            "text": "string",
-            "confidence": "medium|low",
-            "status": "uncertain|info",
-            "tags": ["string"],
-            "name": "string"
-        }
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "chunk_type": {"type": "string", "enum": SUMMARY_CONVERSATION_TYPE_ENUM},
+        "topics": {"type": "array", "items": _topic_schema(["new", "continuing", "uncertain"])},
+        "facts": {
+            "type": "array",
+            "items": _summary_item_schema(["confirmed", "uncertain"], ["high", "medium", "low"]),
+        },
+        "hypotheses": {
+            "type": "array",
+            "items": _summary_item_schema(["uncertain"], ["medium", "low"]),
+        },
+        "decisions": {
+            "type": "array",
+            "items": _summary_item_schema(["confirmed"], ["high", "medium", "low"]),
+        },
+        "open_items": {
+            "type": "array",
+            "items": _summary_item_schema(["open"], ["high", "medium", "low"]),
+        },
+        "next_steps": {
+            "type": "array",
+            "items": _summary_item_schema(["planned"], ["high", "medium", "low"]),
+        },
+        "notes": {
+            "type": "array",
+            "items": _summary_item_schema(["uncertain", "info"], ["medium", "low"]),
+        },
+    },
+    "required": [
+        "chunk_type",
+        "topics",
+        "facts",
+        "hypotheses",
+        "decisions",
+        "open_items",
+        "next_steps",
+        "notes",
     ],
 }
 
 SUMMARY_SCHEMA_ACCUMULATED = {
-    "conversation_types": ["tecnica|executiva|operacional|comercial|mista"],
-    "topics": [
-        {
-            "name": "string",
-            "summary": "string",
-            "status": "active|open|resolved|uncertain",
-            "tags": ["string"]
-        }
-    ],
-    "facts": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "status": "confirmed|uncertain",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "hypotheses": [
-        {
-            "text": "string",
-            "confidence": "medium|low",
-            "status": "uncertain",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "decisions": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "status": "confirmed",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "open_items": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "status": "open",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "next_steps": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "status": "planned",
-            "tags": ["string"],
-            "name": "string"
-        }
-    ],
-    "notes": [
-        {
-            "text": "string",
-            "confidence": "medium|low",
-            "status": "uncertain|info",
-            "tags": ["string"],
-            "name": "string"
-        }
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "conversation_types": {
+            "type": "array",
+            "items": {"type": "string", "enum": SUMMARY_CONVERSATION_TYPE_ENUM},
+        },
+        "topics": {"type": "array", "items": _topic_schema(["active", "open", "resolved", "uncertain"])},
+        "facts": {
+            "type": "array",
+            "items": _summary_item_schema(["confirmed", "uncertain"], ["high", "medium", "low"]),
+        },
+        "hypotheses": {
+            "type": "array",
+            "items": _summary_item_schema(["uncertain"], ["medium", "low"]),
+        },
+        "decisions": {
+            "type": "array",
+            "items": _summary_item_schema(["confirmed"], ["high", "medium", "low"]),
+        },
+        "open_items": {
+            "type": "array",
+            "items": _summary_item_schema(["open"], ["high", "medium", "low"]),
+        },
+        "next_steps": {
+            "type": "array",
+            "items": _summary_item_schema(["planned"], ["high", "medium", "low"]),
+        },
+        "notes": {
+            "type": "array",
+            "items": _summary_item_schema(["uncertain", "info"], ["medium", "low"]),
+        },
+    },
+    "required": [
+        "conversation_types",
+        "topics",
+        "facts",
+        "hypotheses",
+        "decisions",
+        "open_items",
+        "next_steps",
+        "notes",
     ],
 }
 
 SUMMARY_SCHEMA_FINAL = {
-    "title": "Resumo Final Executivo da Chamada",
-    "conversation_types": ["tecnica|executiva|operacional|comercial|mista"],
-    "executive_summary": "string",
-    "topics": [
-        {
-            "name": "string",
-            "summary": "string",
-            "decisions": ["string"],
-            "pending_items": ["string"],
-            "next_steps": ["string"],
-            "tags": ["string"]
-        }
-    ],
-    "global_decisions": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "tags": ["string"]
-        }
-    ],
-    "global_pending_items": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "tags": ["string"]
-        }
-    ],
-    "global_next_steps": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "tags": ["string"]
-        }
-    ],
-    "additional_notes": [
-        {
-            "text": "string",
-            "confidence": "high|medium|low",
-            "tags": ["string"]
-        }
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "conversation_types": {
+            "type": "array",
+            "items": {"type": "string", "enum": SUMMARY_CONVERSATION_TYPE_ENUM},
+        },
+        "executive_summary": {"type": "string"},
+        "topics": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "decisions": SUMMARY_STRING_ARRAY_SCHEMA,
+                    "pending_items": SUMMARY_STRING_ARRAY_SCHEMA,
+                    "next_steps": SUMMARY_STRING_ARRAY_SCHEMA,
+                    "tags": SUMMARY_STRING_ARRAY_SCHEMA,
+                },
+                "required": ["name", "summary", "decisions", "pending_items", "next_steps", "tags"],
+            },
+        },
+        "global_decisions": {"type": "array", "items": _final_item_schema()},
+        "global_pending_items": {"type": "array", "items": _final_item_schema()},
+        "global_next_steps": {"type": "array", "items": _final_item_schema()},
+        "additional_notes": {"type": "array", "items": _final_item_schema()},
+    },
+    "required": [
+        "title",
+        "conversation_types",
+        "executive_summary",
+        "topics",
+        "global_decisions",
+        "global_pending_items",
+        "global_next_steps",
+        "additional_notes",
     ],
 }
+
+SUMMARY_SCHEMA_BY_KIND = {
+    SUMMARY_KIND_MINUTE: SUMMARY_SCHEMA_MINUTE,
+    SUMMARY_KIND_ACCUMULATED: SUMMARY_SCHEMA_ACCUMULATED,
+    SUMMARY_KIND_FINAL: SUMMARY_SCHEMA_FINAL,
+}
+
+
+def build_openai_structured_output_schema(kind: str) -> dict:
+    schema = SUMMARY_SCHEMA_BY_KIND.get(kind)
+    if not schema:
+        raise RuntimeError(f"tipo de resumo nao suportado: {kind}")
+    return schema
+
+
+def build_openai_response_format(kind: str) -> dict:
+    schema_name = SUMMARY_RESPONSE_FORMAT_NAME_BY_KIND.get(kind)
+    if not schema_name:
+        raise RuntimeError(f"tipo de resumo nao suportado: {kind}")
+    return {
+        "type": "json_schema",
+        "name": schema_name,
+        "strict": True,
+        "schema": build_openai_structured_output_schema(kind),
+    }
 
 CONTRACT_SUFFIX_MINUTE = (
     "Saida:\n"
@@ -436,8 +468,15 @@ CONTRACT_SUFFIX_MINUTE = (
     "  * Cada item em facts, hypotheses, decisions, open_items, next_steps e notes deve ter um campo name.\n"
     "  * Se vier campo topic, normalize para name.\n"
     "  * name deve corresponder ao name de um item em topics, exceto quando o trecho for inutil/ruidoso.\n"
-    "Use exatamente este schema:\n"
-    f"{json.dumps(SUMMARY_SCHEMA_MINUTE, ensure_ascii=True, indent=2)}"
+    "- O formato final e controlado por schema estrito da API; siga as regras sem adicionar texto fora do JSON.\n"
+    "- Para cada item em facts, hypotheses, decisions, open_items, next_steps e notes:\n"
+    "  * item.name deve ser EXATAMENTE igual a um topics[].name.\n"
+    "  * Nao use sinonimo, variacao, plural/singular ou caixa diferente.\n"
+    "- Processo obrigatorio:\n"
+    "  1) Gere topics primeiro.\n"
+    "  2) Reutilize SOMENTE nomes existentes em topics.\n"
+    "  3) Rode checklist de consistencia e corrija antes de responder.\n"
+    "- Se nao conseguir mapear com seguranca, reduza saida (menos itens), nunca quebre a regra.\n"
 )
 
 CONTRACT_SUFFIX_ACCUMULATED = (
@@ -448,8 +487,7 @@ CONTRACT_SUFFIX_ACCUMULATED = (
     "  * Cada item em facts, hypotheses, decisions, open_items, next_steps e notes deve ter um campo name.\n"
     "  * Se vier campo topic, normalize para name.\n"
     "  * name deve corresponder ao name de um item em topics.\n"
-    "Use exatamente este schema:\n"
-    f"{json.dumps(SUMMARY_SCHEMA_ACCUMULATED, ensure_ascii=True, indent=2)}"
+    "- O formato final e controlado por schema estrito da API; siga as regras sem adicionar texto fora do JSON.\n"
 )
 
 CONTRACT_SUFFIX_FINAL = (
@@ -458,8 +496,7 @@ CONTRACT_SUFFIX_FINAL = (
     "- Nao adicionar campos fora do contrato.\n"
     "- executive_summary deve ser um texto curto e claro.\n"
     "- topics deve conter os principais assuntos da chamada, ja consolidados.\n"
-    "Use exatamente este schema:\n"
-    f"{json.dumps(SUMMARY_SCHEMA_FINAL, ensure_ascii=True, indent=2)}"
+    "- O formato final e controlado por schema estrito da API; siga as regras sem adicionar texto fora do JSON.\n"
 )
 
 def build_effective_system_prompt(
@@ -3337,6 +3374,30 @@ def extract_openai_output_text(payload: dict) -> str:
     return "\n".join(chunks).strip()
 
 
+def extract_openai_refusal_reason(payload: dict) -> str:
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return ""
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            refusal = part.get("refusal")
+            if isinstance(refusal, str) and refusal.strip():
+                return refusal.strip()
+            if part.get("type") == "refusal":
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+                return "model refusal"
+    return ""
+
+
 @dataclass(frozen=True)
 class SummaryEngine:
     enabled: bool
@@ -3376,7 +3437,7 @@ class SummaryEngine:
     def _retry_delay_seconds(self, attempt: int) -> float:
         return min(8.0, self.retry_base_seconds * (2**attempt))
 
-    def _request_text(self, model: str, system_prompt: str, user_prompt: str) -> str:
+    def _request_text(self, kind: str, model: str, system_prompt: str, user_prompt: str) -> str:
         if not self.enabled:
             raise RuntimeError("summary engine disabled")
         request_body = {
@@ -3391,6 +3452,9 @@ class SummaryEngine:
                     "content": [{"type": "input_text", "text": user_prompt}],
                 },
             ],
+            "text": {
+                "format": build_openai_response_format(kind),
+            },
         }
         req = urllib.request.Request(
             "https://api.openai.com/v1/responses",
@@ -3446,9 +3510,12 @@ class SummaryEngine:
                 raise RuntimeError(f"OpenAI request failed model={model} error={exc}") from exc
         else:
             raise RuntimeError(f"OpenAI request failed model={model} error=retry loop exhausted")
+        refusal = extract_openai_refusal_reason(payload)
+        if refusal:
+            raise RuntimeError(f"OpenAI refusal model={model} kind={kind} detail={refusal[:800]}")
         text = extract_openai_output_text(payload)
         if not text:
-            raise RuntimeError("OpenAI retornou resposta sem texto")
+            raise RuntimeError(f"OpenAI retornou resposta sem texto model={model} kind={kind}")
         return text
 
     def _request_json(
@@ -3458,7 +3525,7 @@ class SummaryEngine:
         system_prompt: str,
         user_prompt: str,
     ) -> dict:
-        raw_output = self._request_text(model, system_prompt, user_prompt)
+        raw_output = self._request_text(kind, model, system_prompt, user_prompt)
         return parse_and_validate_summary_output(kind, raw_output)
 
     def summarize_minute(

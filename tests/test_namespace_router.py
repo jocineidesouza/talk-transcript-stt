@@ -821,6 +821,42 @@ class SummaryEngineRetryTests(unittest.TestCase):
 
         return _Response()
 
+    def _minute_payload(self) -> dict:
+        return {
+            "chunk_type": "mista",
+            "topics": [],
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+
+    def _accumulated_payload(self) -> dict:
+        return {
+            "conversation_types": [],
+            "topics": [],
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+
+    def _final_payload(self) -> dict:
+        return {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": [],
+            "executive_summary": "Resumo executivo objetivo.",
+            "topics": [],
+            "global_decisions": [],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [],
+        }
+
     def test_request_text_retries_and_succeeds_after_timeouts(self):
         engine = self.build_engine()
         success_payload = {"output_text": "{}"}
@@ -830,7 +866,7 @@ class SummaryEngineRetryTests(unittest.TestCase):
             side_effect=[TimeoutError("timeout-1"), TimeoutError("timeout-2"), self._response(success_payload)],
         ) as urlopen_mock:
             with patch.object(STT_APP.time, "sleep") as sleep_mock:
-                raw = engine._request_text("gpt-4.1-mini", "system", "user")
+                raw = engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "gpt-4.1-mini", "system", "user")
 
         self.assertEqual(raw, "{}")
         self.assertEqual(urlopen_mock.call_count, 3)
@@ -845,10 +881,117 @@ class SummaryEngineRetryTests(unittest.TestCase):
         ) as urlopen_mock:
             with patch.object(STT_APP.time, "sleep") as sleep_mock:
                 with self.assertRaises(RuntimeError):
-                    engine._request_text("gpt-4.1-mini", "system", "user")
+                    engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "gpt-4.1-mini", "system", "user")
 
         self.assertEqual(urlopen_mock.call_count, 3)
         self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_request_text_sends_strict_json_schema_format_for_minute(self):
+        engine = self.build_engine()
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": "{}"}),
+        ) as urlopen_mock:
+            raw = engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
+
+        self.assertEqual(raw, "{}")
+        req = urlopen_mock.call_args.args[0]
+        body = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(body["text"]["format"]["type"], "json_schema")
+        self.assertTrue(body["text"]["format"]["strict"])
+        self.assertEqual(body["text"]["format"]["name"], "summary_minute_v1")
+        self.assertEqual(
+            body["text"]["format"]["schema"]["properties"]["chunk_type"]["enum"],
+            ["tecnica", "executiva", "operacional", "comercial", "mista"],
+        )
+
+    def test_request_text_sends_strict_json_schema_format_for_accumulated_and_final(self):
+        engine = self.build_engine()
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": "{}"}),
+        ) as urlopen_mock:
+            engine._request_text(STT_APP.SUMMARY_KIND_ACCUMULATED, "accumulated-model", "system", "user")
+        req_acc = urlopen_mock.call_args.args[0]
+        body_acc = json.loads(req_acc.data.decode("utf-8"))
+        self.assertEqual(body_acc["text"]["format"]["name"], "summary_accumulated_v1")
+        self.assertEqual(
+            body_acc["text"]["format"]["schema"]["properties"]["topics"]["items"]["properties"]["status"]["enum"],
+            ["active", "open", "resolved", "uncertain"],
+        )
+
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": "{}"}),
+        ) as urlopen_mock:
+            engine._request_text(STT_APP.SUMMARY_KIND_FINAL, "final-model", "system", "user")
+        req_final = urlopen_mock.call_args.args[0]
+        body_final = json.loads(req_final.data.decode("utf-8"))
+        self.assertEqual(body_final["text"]["format"]["name"], "summary_final_v1")
+        self.assertIn("executive_summary", body_final["text"]["format"]["schema"]["required"])
+
+    def test_request_text_raises_on_model_refusal(self):
+        engine = self.build_engine()
+        refusal_payload = {
+            "output": [
+                {
+                    "content": [
+                        {
+                            "type": "refusal",
+                            "text": "nao posso atender este pedido",
+                        }
+                    ]
+                }
+            ]
+        }
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response(refusal_payload),
+        ):
+            with self.assertRaises(RuntimeError):
+                engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
+
+    def test_request_json_succeeds_for_each_kind_with_valid_payload(self):
+        engine = self.build_engine()
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": json.dumps(self._minute_payload())}),
+        ):
+            minute = engine._request_json(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
+        self.assertEqual(minute["chunk_type"], "mista")
+
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": json.dumps(self._accumulated_payload())}),
+        ):
+            accumulated = engine._request_json(
+                STT_APP.SUMMARY_KIND_ACCUMULATED, "accumulated-model", "system", "user"
+            )
+        self.assertEqual(accumulated["conversation_types"], [])
+
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": json.dumps(self._final_payload())}),
+        ):
+            final = engine._request_json(STT_APP.SUMMARY_KIND_FINAL, "final-model", "system", "user")
+        self.assertEqual(final["title"], "Resumo Final Executivo da Chamada")
+
+    def test_request_json_fail_closed_when_model_returns_non_json(self):
+        engine = self.build_engine()
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": "nao-json"}),
+        ):
+            with self.assertRaises(RuntimeError):
+                engine._request_json(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
