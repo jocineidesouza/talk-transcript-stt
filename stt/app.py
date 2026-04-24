@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -68,27 +68,41 @@ STORAGE_MINUTE_WINDOW_SECONDS = max(
     10, int(os.environ.get("STORAGE_MINUTE_WINDOW_SECONDS", "60"))
 )
 
-OPENAI_SUMMARY_ENABLED = os.environ.get("OPENAI_SUMMARY_ENABLED", "false").lower() == "true"
+SUMMARY_ENABLED = os.environ.get("SUMMARY_ENABLED", "false").lower() == "true"
+SUMMARY_PROVIDER = os.environ.get("SUMMARY_PROVIDER", "openrouter").strip().lower()
+if SUMMARY_PROVIDER not in {"openrouter", "openai"}:
+    SUMMARY_PROVIDER = "openrouter"
+
 OPENAI_APIKEY_FILE = Path(os.environ.get("OPENAI_APIKEY_FILE", "/secrets/openai_apikey.json"))
-OPENAI_MODEL_MINUTE_SUMMARY = os.environ.get(
-    "OPENAI_MODEL_MINUTE_SUMMARY", "gpt-4.1-mini"
-).strip()
-OPENAI_MODEL_ACCUMULATED_SUMMARY = os.environ.get(
-    "OPENAI_MODEL_ACCUMULATED_SUMMARY", "gpt-4.1-mini"
-).strip()
-OPENAI_MODEL_FINAL_SUMMARY = os.environ.get(
-    "OPENAI_MODEL_FINAL_SUMMARY", "gpt-4.1-mini"
-).strip()
-OPENAI_REQUEST_TIMEOUT_SECONDS = max(
-    5, int(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "300"))
+OPENROUTER_APIKEY_FILE = Path(
+    os.environ.get("OPENROUTER_APIKEY_FILE", "/secrets/openrouter_apikey.json")
 )
-OPENAI_REQUEST_RETRIES = max(0, int(os.environ.get("OPENAI_REQUEST_RETRIES", "2")))
-OPENAI_REQUEST_RETRY_BASE_SECONDS = max(
-    0.1, float(os.environ.get("OPENAI_REQUEST_RETRY_BASE_SECONDS", "1.5"))
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+OPENROUTER_BASE_URL = os.environ.get(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+).strip()
+OPENROUTER_HTTP_REFERER = os.environ.get("OPENROUTER_HTTP_REFERER", "").strip()
+OPENROUTER_X_TITLE = os.environ.get("OPENROUTER_X_TITLE", "").strip()
+
+SUMMARY_MODEL_MINUTE = os.environ.get(
+    "SUMMARY_MODEL_MINUTE", "gpt-4.1-mini"
+).strip()
+SUMMARY_MODEL_ACCUMULATED = os.environ.get(
+    "SUMMARY_MODEL_ACCUMULATED", "gpt-4.1-mini"
+).strip()
+SUMMARY_MODEL_FINAL = os.environ.get(
+    "SUMMARY_MODEL_FINAL", "gpt-4.1-mini"
+).strip()
+SUMMARY_REQUEST_TIMEOUT_SECONDS = max(
+    5, int(os.environ.get("SUMMARY_REQUEST_TIMEOUT_SECONDS", "300"))
 )
-OPENAI_MAX_RETRIES = max(1, int(os.environ.get("OPENAI_MAX_RETRIES", "3")))
-OPENAI_ACCUMULATED_MAX_ITEMS = max(
-    1, int(os.environ.get("OPENAI_ACCUMULATED_MAX_ITEMS", "40"))
+SUMMARY_REQUEST_RETRIES = max(0, int(os.environ.get("SUMMARY_REQUEST_RETRIES", "2")))
+SUMMARY_REQUEST_RETRY_BASE_SECONDS = max(
+    0.1, float(os.environ.get("SUMMARY_REQUEST_RETRY_BASE_SECONDS", "1.5"))
+)
+SUMMARY_MAX_RETRIES = max(1, int(os.environ.get("SUMMARY_MAX_RETRIES", "3")))
+SUMMARY_ACCUMULATED_MAX_ITEMS = max(
+    1, int(os.environ.get("SUMMARY_ACCUMULATED_MAX_ITEMS", "40"))
 )
 SUMMARY_RECONCILE_INTERVAL_SECONDS = max(
     10, int(os.environ.get("SUMMARY_RECONCILE_INTERVAL_SECONDS", "60"))
@@ -1064,7 +1078,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
     facts = validate_summary_list(
         payload.get("facts"),
         "facts",
-        OPENAI_ACCUMULATED_MAX_ITEMS,
+        SUMMARY_ACCUMULATED_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed", "uncertain"}, 240, True, True
         ),
@@ -1073,7 +1087,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
     hypotheses = validate_summary_list(
         payload.get("hypotheses"),
         "hypotheses",
-        OPENAI_ACCUMULATED_MAX_ITEMS,
+        SUMMARY_ACCUMULATED_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, {"medium", "low"}, {"uncertain"}, 240, True, True
         ),
@@ -1082,7 +1096,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
     decisions = validate_summary_list(
         payload.get("decisions"),
         "decisions",
-        OPENAI_ACCUMULATED_MAX_ITEMS,
+        SUMMARY_ACCUMULATED_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True, True
         ),
@@ -1091,7 +1105,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
     open_items = validate_summary_list(
         payload.get("open_items"),
         "open_items",
-        OPENAI_ACCUMULATED_MAX_ITEMS,
+        SUMMARY_ACCUMULATED_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True, True
         ),
@@ -1100,7 +1114,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
     next_steps = validate_summary_list(
         payload.get("next_steps"),
         "next_steps",
-        OPENAI_ACCUMULATED_MAX_ITEMS,
+        SUMMARY_ACCUMULATED_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True, True
         ),
@@ -1109,7 +1123,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
     notes = validate_summary_list(
         payload.get("notes"),
         "notes",
-        OPENAI_ACCUMULATED_MAX_ITEMS,
+        SUMMARY_ACCUMULATED_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True, True
         ),
@@ -3040,7 +3054,7 @@ def db_claim_summary_task(now_iso: str) -> sqlite3.Row | None:
               updated_at ASC
             LIMIT 1
             """,
-            (now_iso, OPENAI_MAX_RETRIES),
+            (now_iso, SUMMARY_MAX_RETRIES),
         ).fetchone()
         if task is None:
             conn.execute("COMMIT")
@@ -3697,28 +3711,57 @@ def decode_pcm_file(recognizer: sherpa_onnx.OfflineRecognizer, path: Path) -> st
     return decode_with_tail_padding(recognizer, samples)
 
 
-def load_openai_api_key() -> str | None:
-    if not OPENAI_SUMMARY_ENABLED:
+def summary_provider_apikey_file(provider: str) -> Path:
+    if provider == "openai":
+        return OPENAI_APIKEY_FILE
+    return OPENROUTER_APIKEY_FILE
+
+
+def summary_provider_base_url(provider: str) -> str:
+    if provider == "openai":
+        return OPENAI_BASE_URL.rstrip("/")
+    return OPENROUTER_BASE_URL.rstrip("/")
+
+
+def summary_provider_extra_headers(provider: str) -> dict[str, str]:
+    if provider != "openrouter":
+        return {}
+    headers: dict[str, str] = {}
+    if OPENROUTER_HTTP_REFERER:
+        headers["HTTP-Referer"] = OPENROUTER_HTTP_REFERER
+    if OPENROUTER_X_TITLE:
+        headers["X-Title"] = OPENROUTER_X_TITLE
+    return headers
+
+
+def load_summary_api_key(provider: str) -> str | None:
+    if not SUMMARY_ENABLED:
         return None
-    if not OPENAI_APIKEY_FILE.is_file():
+    apikey_file = summary_provider_apikey_file(provider)
+    if not apikey_file.is_file():
         logger.warning(
-            "OPENAI_SUMMARY_ENABLED=true, mas arquivo de secret nao encontrado: %s",
-            OPENAI_APIKEY_FILE,
+            "SUMMARY_ENABLED=true, mas arquivo de secret nao encontrado provider=%s file=%s",
+            provider,
+            apikey_file,
         )
         return None
     try:
-        raw = json.loads(OPENAI_APIKEY_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(apikey_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        logger.warning("arquivo OPENAI_APIKEY_FILE invalido: JSON malformado")
+        logger.warning("arquivo de secret invalido provider=%s file=%s", provider, apikey_file)
         return None
     api_key = str(raw.get("api_key", "")).strip() if isinstance(raw, dict) else ""
     if not api_key:
-        logger.warning("arquivo OPENAI_APIKEY_FILE sem campo api_key valido")
+        logger.warning(
+            "arquivo de secret sem campo api_key valido provider=%s file=%s",
+            provider,
+            apikey_file,
+        )
         return None
     return api_key
 
 
-def extract_openai_output_text(payload: dict) -> str:
+def extract_summary_output_text(payload: dict) -> str:
     output_text = payload.get("output_text")
     if isinstance(output_text, str) and output_text.strip():
         return output_text.strip()
@@ -3741,7 +3784,7 @@ def extract_openai_output_text(payload: dict) -> str:
     return "\n".join(chunks).strip()
 
 
-def extract_openai_refusal_reason(payload: dict) -> str:
+def extract_summary_refusal_reason(payload: dict) -> str:
     output = payload.get("output")
     if not isinstance(output, list):
         return ""
@@ -3768,7 +3811,10 @@ def extract_openai_refusal_reason(payload: dict) -> str:
 @dataclass(frozen=True)
 class SummaryEngine:
     enabled: bool
+    provider: str
     api_key: str
+    base_url: str
+    extra_headers: dict[str, str]
     minute_model: str
     accumulated_model: str
     final_model: str
@@ -3778,27 +3824,36 @@ class SummaryEngine:
 
     @staticmethod
     def create() -> "SummaryEngine":
-        api_key = load_openai_api_key()
+        provider = SUMMARY_PROVIDER
+        api_key = load_summary_api_key(provider)
+        base_url = summary_provider_base_url(provider)
+        extra_headers = summary_provider_extra_headers(provider)
         if not api_key:
             return SummaryEngine(
                 False,
+                provider,
                 "",
-                OPENAI_MODEL_MINUTE_SUMMARY,
-                OPENAI_MODEL_ACCUMULATED_SUMMARY,
-                OPENAI_MODEL_FINAL_SUMMARY,
-                OPENAI_REQUEST_TIMEOUT_SECONDS,
-                OPENAI_REQUEST_RETRIES,
-                OPENAI_REQUEST_RETRY_BASE_SECONDS,
+                base_url,
+                extra_headers,
+                SUMMARY_MODEL_MINUTE,
+                SUMMARY_MODEL_ACCUMULATED,
+                SUMMARY_MODEL_FINAL,
+                SUMMARY_REQUEST_TIMEOUT_SECONDS,
+                SUMMARY_REQUEST_RETRIES,
+                SUMMARY_REQUEST_RETRY_BASE_SECONDS,
             )
         return SummaryEngine(
             True,
+            provider,
             api_key,
-            OPENAI_MODEL_MINUTE_SUMMARY,
-            OPENAI_MODEL_ACCUMULATED_SUMMARY,
-            OPENAI_MODEL_FINAL_SUMMARY,
-            OPENAI_REQUEST_TIMEOUT_SECONDS,
-            OPENAI_REQUEST_RETRIES,
-            OPENAI_REQUEST_RETRY_BASE_SECONDS,
+            base_url,
+            extra_headers,
+            SUMMARY_MODEL_MINUTE,
+            SUMMARY_MODEL_ACCUMULATED,
+            SUMMARY_MODEL_FINAL,
+            SUMMARY_REQUEST_TIMEOUT_SECONDS,
+            SUMMARY_REQUEST_RETRIES,
+            SUMMARY_REQUEST_RETRY_BASE_SECONDS,
         )
 
     def _retry_delay_seconds(self, attempt: int) -> float:
@@ -3823,14 +3878,16 @@ class SummaryEngine:
                 "format": build_openai_response_format(kind),
             },
         }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        headers.update(self.extra_headers)
         req = urllib.request.Request(
-            "https://api.openai.com/v1/responses",
+            f"{self.base_url}/responses",
             data=json.dumps(request_body).encode("utf-8"),
             method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            headers=headers,
         )
         max_attempts = self.request_retries + 1
         for attempt in range(max_attempts):
@@ -3849,7 +3906,8 @@ class SummaryEngine:
                 if should_retry and attempt < (max_attempts - 1):
                     delay = self._retry_delay_seconds(attempt)
                     logger.warning(
-                        "OpenAI transient HTTP error model=%s status=%s attempt=%s/%s retry_in=%.1fs",
+                        "Summary request transient HTTP error provider=%s model=%s status=%s attempt=%s/%s retry_in=%.1fs",
+                        self.provider,
                         model,
                         exc.code,
                         attempt + 1,
@@ -3859,13 +3917,14 @@ class SummaryEngine:
                     time.sleep(delay)
                     continue
                 raise RuntimeError(
-                    f"OpenAI request failed status={exc.code} model={model} detail={detail}"
+                    f"Summary request failed provider={self.provider} status={exc.code} model={model} detail={detail}"
                 ) from exc
             except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
                 if attempt < (max_attempts - 1):
                     delay = self._retry_delay_seconds(attempt)
                     logger.warning(
-                        "OpenAI request retry model=%s attempt=%s/%s error=%s retry_in=%.1fs",
+                        "Summary request retry provider=%s model=%s attempt=%s/%s error=%s retry_in=%.1fs",
+                        self.provider,
                         model,
                         attempt + 1,
                         max_attempts,
@@ -3874,15 +3933,23 @@ class SummaryEngine:
                     )
                     time.sleep(delay)
                     continue
-                raise RuntimeError(f"OpenAI request failed model={model} error={exc}") from exc
+                raise RuntimeError(
+                    f"Summary request failed provider={self.provider} model={model} error={exc}"
+                ) from exc
         else:
-            raise RuntimeError(f"OpenAI request failed model={model} error=retry loop exhausted")
-        refusal = extract_openai_refusal_reason(payload)
+            raise RuntimeError(
+                f"Summary request failed provider={self.provider} model={model} error=retry loop exhausted"
+            )
+        refusal = extract_summary_refusal_reason(payload)
         if refusal:
-            raise RuntimeError(f"OpenAI refusal model={model} kind={kind} detail={refusal[:800]}")
-        text = extract_openai_output_text(payload)
+            raise RuntimeError(
+                f"Summary refusal provider={self.provider} model={model} kind={kind} detail={refusal[:800]}"
+            )
+        text = extract_summary_output_text(payload)
         if not text:
-            raise RuntimeError(f"OpenAI retornou resposta sem texto model={model} kind={kind}")
+            raise RuntimeError(
+                f"Summary provider={self.provider} retornou resposta sem texto model={model} kind={kind}"
+            )
         return text
 
     def _request_json(
@@ -4169,7 +4236,7 @@ def build_accumulated_from_minute_summaries(minute_summaries: list[dict]) -> dic
                 dedupe_key = (text, status, name)
                 if dedupe_key in seen_items[key]:
                     continue
-                if len(accumulated[key]) >= OPENAI_ACCUMULATED_MAX_ITEMS:
+                if len(accumulated[key]) >= SUMMARY_ACCUMULATED_MAX_ITEMS:
                     continue
                 seen_items[key].add(dedupe_key)
                 item_tags = item.get("tags")
@@ -4549,7 +4616,7 @@ async def run_summary_reconciliation_once() -> None:
         final_retries = int(final_row["retries"] or 0)
         if (
             final_status == "error"
-            and final_retries >= OPENAI_MAX_RETRIES
+            and final_retries >= SUMMARY_MAX_RETRIES
             and SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK
         ):
             reopened = await asyncio.to_thread(
@@ -4600,7 +4667,11 @@ async def summary_worker_loop(
     firebase_router: FirebaseRouter,
     summary_engine: SummaryEngine,
 ) -> None:
-    logger.info("summary worker started enabled=%s", summary_engine.enabled)
+    logger.info(
+        "summary worker started enabled=%s provider=%s",
+        summary_engine.enabled,
+        summary_engine.provider,
+    )
     next_reconcile_at = 0.0
     while not stop_event.is_set():
         if not summary_engine.enabled:
@@ -5129,10 +5200,11 @@ async def health() -> dict:
         "firebase_namespace_configs": len(runtime.firebase_router.configs_by_namespace),
         "firebase_flush_interval_seconds": FIREBASE_FLUSH_INTERVAL_SECONDS,
         "storage_minute_window_seconds": STORAGE_MINUTE_WINDOW_SECONDS,
-        "openai_summary_enabled": runtime.summary_engine.enabled,
-        "openai_model_minute_summary": runtime.summary_engine.minute_model,
-        "openai_model_accumulated_summary": runtime.summary_engine.accumulated_model,
-        "openai_model_final_summary": runtime.summary_engine.final_model,
+        "summary_enabled": runtime.summary_engine.enabled,
+        "summary_provider": runtime.summary_engine.provider,
+        "summary_model_minute": runtime.summary_engine.minute_model,
+        "summary_model_accumulated": runtime.summary_engine.accumulated_model,
+        "summary_model_final": runtime.summary_engine.final_model,
         "summary_reconcile_interval_seconds": SUMMARY_RECONCILE_INTERVAL_SECONDS,
         "summary_processing_stale_seconds": SUMMARY_PROCESSING_STALE_SECONDS,
         "summary_finalization_grace_seconds": SUMMARY_FINALIZATION_GRACE_SECONDS,
@@ -5308,11 +5380,11 @@ def build_summary_reprocess_status_payload(
     final_status = str(final_row["status"] if final_row is not None else "pending")
     final_retries = int(final_row["retries"]) if final_row is not None and final_row["retries"] is not None else 0
     final_error = str(final_row["error_message"] or "") if final_row is not None else ""
-    final_exhausted = final_status == "error" and final_retries >= OPENAI_MAX_RETRIES
+    final_exhausted = final_status == "error" and final_retries >= SUMMARY_MAX_RETRIES
     final_task = {
         "status": final_status,
         "retries": final_retries,
-        "max_retries": OPENAI_MAX_RETRIES,
+        "max_retries": SUMMARY_MAX_RETRIES,
         "error_message": final_error or None,
         "exhausted": final_exhausted,
     }
@@ -5516,53 +5588,3 @@ async def admin_summary_reprocess_status(
             }
 
     return JSONResponse(payload, status_code=200)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

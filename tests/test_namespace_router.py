@@ -324,7 +324,10 @@ class SummaryEnginePromptTests(unittest.TestCase):
     def build_engine(self) -> object:
         return STT_APP.SummaryEngine(
             enabled=True,
+            provider="openai",
             api_key="test-key",
+            base_url="https://api.openai.com/v1",
+            extra_headers={},
             minute_model="minute-model",
             accumulated_model="accumulated-model",
             final_model="final-model",
@@ -1027,13 +1030,13 @@ class AccumulatedSummaryLimitsTests(unittest.TestCase):
         }
 
     def test_validate_accumulated_summary_accepts_40_notes(self):
-        with patch.object(STT_APP, "OPENAI_ACCUMULATED_MAX_ITEMS", 40):
+        with patch.object(STT_APP, "SUMMARY_ACCUMULATED_MAX_ITEMS", 40):
             payload = self._payload(notes_count=40)
             normalized = STT_APP.validate_accumulated_summary_payload(payload)
         self.assertEqual(len(normalized["notes"]), 40)
 
     def test_validate_accumulated_summary_truncates_41_notes_to_40(self):
-        with patch.object(STT_APP, "OPENAI_ACCUMULATED_MAX_ITEMS", 40):
+        with patch.object(STT_APP, "SUMMARY_ACCUMULATED_MAX_ITEMS", 40):
             payload = self._payload(notes_count=41)
             normalized = STT_APP.validate_accumulated_summary_payload(payload)
         self.assertEqual(len(normalized["notes"]), 40)
@@ -1041,7 +1044,7 @@ class AccumulatedSummaryLimitsTests(unittest.TestCase):
         self.assertEqual(normalized["notes"][-1]["text"], "note 39")
 
     def test_validate_accumulated_summary_truncates_41_facts_to_40(self):
-        with patch.object(STT_APP, "OPENAI_ACCUMULATED_MAX_ITEMS", 40):
+        with patch.object(STT_APP, "SUMMARY_ACCUMULATED_MAX_ITEMS", 40):
             payload = self._payload(facts_count=41)
             normalized = STT_APP.validate_accumulated_summary_payload(payload)
         self.assertEqual(len(normalized["facts"]), 40)
@@ -1054,7 +1057,10 @@ class SummaryEngineRetryTests(unittest.TestCase):
     def build_engine(self) -> object:
         return STT_APP.SummaryEngine(
             enabled=True,
+            provider="openai",
             api_key="test-key",
+            base_url="https://api.openai.com/v1",
+            extra_headers={},
             minute_model="minute-model",
             accumulated_model="accumulated-model",
             final_model="final-model",
@@ -1160,6 +1166,7 @@ class SummaryEngineRetryTests(unittest.TestCase):
             body["text"]["format"]["schema"]["properties"]["chunk_type"]["enum"],
             ["tecnica", "executiva", "operacional", "comercial", "mista"],
         )
+        self.assertEqual(req.full_url, "https://api.openai.com/v1/responses")
 
     def test_request_text_sends_strict_json_schema_format_for_accumulated_and_final(self):
         engine = self.build_engine()
@@ -1192,6 +1199,32 @@ class SummaryEngineRetryTests(unittest.TestCase):
         self.assertEqual(title_schema["minLength"], STT_APP.SUMMARY_FINAL_TITLE_MIN_CHARS)
         self.assertEqual(title_schema["maxLength"], STT_APP.SUMMARY_FINAL_TITLE_MAX_CHARS)
         self.assertNotIn("enum", title_schema)
+
+    def test_request_text_includes_openrouter_optional_headers(self):
+        engine = STT_APP.SummaryEngine(
+            enabled=True,
+            provider="openrouter",
+            api_key="router-key",
+            base_url="https://openrouter.ai/api/v1",
+            extra_headers={"HTTP-Referer": "https://app.local", "X-Title": "Talk STT"},
+            minute_model="minute-model",
+            accumulated_model="accumulated-model",
+            final_model="final-model",
+            timeout_seconds=45,
+            request_retries=2,
+            retry_base_seconds=1.5,
+        )
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": "{}"}),
+        ) as urlopen_mock:
+            engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
+        req = urlopen_mock.call_args.args[0]
+        headers = {str(k).lower(): str(v) for k, v in req.headers.items()}
+        self.assertEqual(req.full_url, "https://openrouter.ai/api/v1/responses")
+        self.assertEqual(headers.get("http-referer"), "https://app.local")
+        self.assertEqual(headers.get("x-title"), "Talk STT")
 
     def test_request_text_raises_on_model_refusal(self):
         engine = self.build_engine()
@@ -1327,21 +1360,32 @@ class MinuteWindowTests(unittest.TestCase):
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
-class OpenAISecretTests(unittest.TestCase):
-    def test_load_openai_api_key_returns_key_from_json(self):
+class SummaryProviderConfigTests(unittest.TestCase):
+    def test_load_summary_api_key_returns_key_from_json(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             secret_path = Path(tmpdir) / "openai_apikey.json"
             secret_path.write_text(json.dumps({"api_key": "test-key"}), encoding="utf-8")
-            with patch.object(STT_APP, "OPENAI_SUMMARY_ENABLED", True):
+            with patch.object(STT_APP, "SUMMARY_ENABLED", True):
                 with patch.object(STT_APP, "OPENAI_APIKEY_FILE", secret_path):
-                    self.assertEqual(STT_APP.load_openai_api_key(), "test-key")
+                    self.assertEqual(STT_APP.load_summary_api_key("openai"), "test-key")
+
+    def test_load_summary_api_key_uses_openrouter_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secret_path = Path(tmpdir) / "openrouter_apikey.json"
+            secret_path.write_text(json.dumps({"api_key": "router-key"}), encoding="utf-8")
+            with patch.object(STT_APP, "SUMMARY_ENABLED", True):
+                with patch.object(STT_APP, "OPENROUTER_APIKEY_FILE", secret_path):
+                    self.assertEqual(STT_APP.load_summary_api_key("openrouter"), "router-key")
+
+    def test_summary_provider_defaults_to_openrouter_when_env_missing(self):
+        self.assertEqual(STT_APP.SUMMARY_PROVIDER, "openrouter")
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
 class ConfigDefaultsTests(unittest.TestCase):
     def test_openai_request_timeout_default_is_300_in_source(self):
         source = APP_PATH.read_text(encoding="utf-8")
-        self.assertIn('os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "300")', source)
+        self.assertIn('os.environ.get("SUMMARY_REQUEST_TIMEOUT_SECONDS", "300")', source)
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -2247,7 +2291,7 @@ class AdminSummaryReprocessTests(unittest.IsolatedAsyncioTestCase):
             {
                 "minute_index": -1,
                 "status": "error",
-                "retries": STT_APP.OPENAI_MAX_RETRIES,
+                "retries": STT_APP.SUMMARY_MAX_RETRIES,
                 "error_message": "exhausted",
             }
         ]

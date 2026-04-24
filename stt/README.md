@@ -82,11 +82,15 @@ Storage:
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary.json`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary_temp.json` (quando houver erro de contrato no final)
 
-## OpenAI Summary (opcional)
+## Summary LLM (OpenRouter/OpenAI, opcional)
 
-- habilitado por `OPENAI_SUMMARY_ENABLED=true`
-- secret esperado em `OPENAI_APIKEY_FILE` (padrao `/secrets/openai_apikey.json`)
-- formato do arquivo: `{"api_key":"..."}` (ver `stt/secrets/openai_apikey.example.json`)
+- habilitado por `SUMMARY_ENABLED=true`
+- provedor definido por `SUMMARY_PROVIDER` (`openrouter` ou `openai`, padrao `openrouter`)
+- secrets esperados:
+  - `OPENROUTER_APIKEY_FILE` (padrao `/secrets/openrouter_apikey.json`)
+  - `OPENAI_APIKEY_FILE` (padrao `/secrets/openai_apikey.json`)
+- formato do arquivo de secret: `{"api_key":"..."}`
+- para OpenRouter, endpoint padrao `https://openrouter.ai/api/v1` e headers opcionais `OPENROUTER_HTTP_REFERER` / `OPENROUTER_X_TITLE`
 - se secret estiver ausente/invalido, STT continua; resumo fica desabilitado com warning
 
 ## Reprocessamento administrativo de summary
@@ -156,15 +160,22 @@ Campos principais no retorno:
 - `FIREBASE_NAMESPACE_CONFIG_JSON`
 - `FIREBASE_FLUSH_INTERVAL_SECONDS` (padrao `30`)
 - `STORAGE_MINUTE_WINDOW_SECONDS` (padrao `60`)
-- `OPENAI_SUMMARY_ENABLED` (padrao `false`)
+- `SUMMARY_ENABLED` (padrao `false`)
+- `SUMMARY_PROVIDER` (padrao `openrouter`)
+- `SUMMARY_MODEL_MINUTE` (padrao `gpt-4.1-mini`)
+- `SUMMARY_MODEL_ACCUMULATED` (padrao `gpt-4.1-mini`)
+- `SUMMARY_MODEL_FINAL` (padrao `gpt-4.1-mini`)
+- `SUMMARY_REQUEST_TIMEOUT_SECONDS` (padrao `300`)
+- `SUMMARY_REQUEST_RETRIES` (padrao `2`, total de 3 tentativas por request)
+- `SUMMARY_REQUEST_RETRY_BASE_SECONDS` (padrao `1.5`)
+- `SUMMARY_MAX_RETRIES` (padrao `3`)
+- `SUMMARY_ACCUMULATED_MAX_ITEMS` (padrao `40`)
 - `OPENAI_APIKEY_FILE` (padrao `/secrets/openai_apikey.json`)
-- `OPENAI_MODEL_MINUTE_SUMMARY` (padrao `gpt-4.1-mini`)
-- `OPENAI_MODEL_ACCUMULATED_SUMMARY` (padrao `gpt-4.1-mini`)
-- `OPENAI_MODEL_FINAL_SUMMARY` (padrao `gpt-4.1-mini`)
-- `OPENAI_REQUEST_TIMEOUT_SECONDS` (padrao `300`)
-- `OPENAI_REQUEST_RETRIES` (padrao `2`, total de 3 tentativas por request)
-- `OPENAI_MAX_RETRIES` (padrao `3`)
-- `OPENAI_ACCUMULATED_MAX_ITEMS` (padrao `40`)
+- `OPENROUTER_APIKEY_FILE` (padrao `/secrets/openrouter_apikey.json`)
+- `OPENAI_BASE_URL` (padrao `https://api.openai.com/v1`)
+- `OPENROUTER_BASE_URL` (padrao `https://openrouter.ai/api/v1`)
+- `OPENROUTER_HTTP_REFERER` (opcional)
+- `OPENROUTER_X_TITLE` (opcional)
 
 Exemplo de `FIREBASE_NAMESPACE_CONFIG_JSON`:
 
