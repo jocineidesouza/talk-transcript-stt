@@ -79,7 +79,7 @@ OPENAI_MODEL_FINAL_SUMMARY = os.environ.get(
     "OPENAI_MODEL_FINAL_SUMMARY", "gpt-4.1-mini"
 ).strip()
 OPENAI_REQUEST_TIMEOUT_SECONDS = max(
-    5, int(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "45"))
+    5, int(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "300"))
 )
 OPENAI_REQUEST_RETRIES = max(0, int(os.environ.get("OPENAI_REQUEST_RETRIES", "2")))
 OPENAI_REQUEST_RETRY_BASE_SECONDS = max(
@@ -124,6 +124,14 @@ logger = logging.getLogger("stt")
 
 CALL_INDEX_UNSET = object()
 
+
+class SummaryContractValidationError(RuntimeError):
+    def __init__(self, kind: str, model: str, raw_output: str, message: str) -> None:
+        self.kind = kind
+        self.model = model
+        self.raw_output = raw_output
+        super().__init__(message)
+
 DEFAULT_SUMMARIZE_MINUTE_PROMPT = """Voce e um assistente especializado em analisar trechos de chamadas corporativas em portugues do Brasil.
 
 Entrada:
@@ -155,7 +163,7 @@ Regras obrigatorias:
 - Nao criar assunto para ruido social isolado, como agradecimentos, despedidas, confirmacoes vazias ou fillers.
 - Se o trecho for inutil/ruidoso, retornar arrays vazios e registrar 1 note curta.
 - Tags curtas e especificas.
-- Limites: text max 240 caracteres; tags entre 0 e 4 itens (preferencialmente curtas); maximo 8 itens por categoria; maximo 6 assuntos por trecho.
+- Limites: text max 240 caracteres; tags entre 0 e 4 itens (preferencialmente curtas); maximo 8 itens por categoria.
 """
 
 DEFAULT_MERGE_SUMMARIES_PROMPT = """Voce e um assistente responsavel por atualizar o estado acumulado de uma chamada corporativa em portugues do Brasil.
@@ -200,7 +208,6 @@ Limites:
 - text max 240 caracteres
 - tags entre 0 e 4 itens
 - maximo 20 itens por categoria
-- maximo 20 assuntos acumulados
 - Retornar arrays vazios quando categoria nao tiver itens.
 """
 
@@ -236,7 +243,7 @@ Regras obrigatorias:
   "Nenhuma decisao explicita foi registrada."
 - title deve ser exatamente: "Resumo Final Executivo da Chamada".
 - conversation_types deve refletir o estado acumulado.
-- Limites: text max 280 caracteres; tags entre 0 e 4 itens; maximo 12 itens por categoria; maximo 12 assuntos.
+- Limites: text max 280 caracteres; tags entre 0 e 4 itens; maximo 12 itens por categoria.
 - Retornar arrays vazios quando categoria nao tiver itens (exceto regra de global_decisions acima).
 """
 
@@ -715,13 +722,13 @@ def validate_summary_topic(
 def validate_summary_topics(
     value: Any,
     key: str,
-    max_items: int,
+    max_items: int | None,
     allowed_status: set[str],
     max_summary: int,
 ) -> list[dict]:
     if not isinstance(value, list):
         raise RuntimeError(f"{key} deve ser array")
-    if len(value) > max_items:
+    if max_items is not None and len(value) > max_items:
         raise RuntimeError(f"{key} excede maximo de {max_items} itens")
     normalized: list[dict] = []
     seen_names: set[str] = set()
@@ -810,7 +817,7 @@ def validate_minute_summary_payload(payload: dict) -> dict:
     topics = validate_summary_topics(
         payload.get("topics"),
         "topics",
-        6,
+        None,
         SUMMARY_ALLOWED_TOPIC_STATUS_MINUTE,
         240,
     )
@@ -937,7 +944,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
     topics = validate_summary_topics(
         payload.get("topics"),
         "topics",
-        20,
+        None,
         SUMMARY_ALLOWED_TOPIC_STATUS_ACCUMULATED,
         240,
     )
@@ -1048,8 +1055,6 @@ def validate_final_summary_payload(payload: dict) -> dict:
     topics_raw = payload.get("topics")
     if not isinstance(topics_raw, list):
         raise RuntimeError("final.topics deve ser array")
-    if len(topics_raw) > 12:
-        raise RuntimeError("final.topics excede maximo de 12 itens")
     topics: list[dict] = []
     seen_topic_names: set[str] = set()
     for index, item in enumerate(topics_raw):
@@ -3526,7 +3531,10 @@ class SummaryEngine:
         user_prompt: str,
     ) -> dict:
         raw_output = self._request_text(kind, model, system_prompt, user_prompt)
-        return parse_and_validate_summary_output(kind, raw_output)
+        try:
+            return parse_and_validate_summary_output(kind, raw_output)
+        except RuntimeError as exc:
+            raise SummaryContractValidationError(kind, model, raw_output, str(exc)) from exc
 
     def summarize_minute(
         self,
@@ -3594,8 +3602,34 @@ def session_final_summary_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "final/final_summary.json")
 
 
+def session_final_summary_temp_path(storage_base_path: str) -> str:
+    return join_storage_path(storage_base_path, "final/final_summary_temp.json")
+
+
 def session_final_transcript_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "final/final_transcript.json")
+
+
+def build_final_summary_temp_payload(
+    room_name: str,
+    transcript_session_id: str | None,
+    call_session_id: str,
+    model: str,
+    kind: str,
+    error: str,
+    raw_output: str,
+    updated_at: str,
+) -> dict:
+    return {
+        "room_name": room_name,
+        "transcript_session_id": transcript_session_id,
+        "call_session_id": call_session_id,
+        "model": model,
+        "kind": kind,
+        "error": error,
+        "raw_output": raw_output,
+        "updated_at": updated_at,
+    }
 
 
 def _minutes_label(minutes: list[int]) -> str:
@@ -3773,8 +3807,6 @@ def build_deterministic_final_summary(
     for topic in normalized_acc.get("topics", []):
         if not isinstance(topic, dict):
             continue
-        if len(final_topics) >= 12:
-            break
         name = str(topic.get("name", "")).strip()
         if not name:
             continue
@@ -4419,7 +4451,8 @@ async def summary_worker_loop(
                     )
 
                 final_path = session_final_summary_path(routing.storage_base_path)
-                final_summary: dict
+                final_temp_path = session_final_summary_temp_path(routing.storage_base_path)
+                final_summary: dict | None = None
                 try:
                     final_system_prompt = await asyncio.to_thread(
                         firebase_router.fetch_agent_prompt,
@@ -4435,6 +4468,50 @@ async def summary_worker_loop(
                         final_summary,
                         missing_minutes,
                         recovery_reasons,
+                    )
+                except SummaryContractValidationError as exc:
+                    logger.warning(
+                        "final summary contract invalid room=%s session=%s model=%s kind=%s error=%s",
+                        room_name,
+                        call_session_id,
+                        exc.model,
+                        exc.kind,
+                        exc,
+                    )
+                    temp_payload = build_final_summary_temp_payload(
+                        room_name=room_name,
+                        transcript_session_id=routing.transcript_session_id,
+                        call_session_id=routing.call_session_id,
+                        model=exc.model,
+                        kind=exc.kind,
+                        error=str(exc),
+                        raw_output=exc.raw_output,
+                        updated_at=now_iso,
+                    )
+                    await asyncio.to_thread(
+                        firebase_router.upload_json,
+                        routing,
+                        final_temp_path,
+                        temp_payload,
+                    )
+                    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+                    await asyncio.to_thread(
+                        firebase_router.publish_call_index,
+                        routing=routing,
+                        status="finalized",
+                        last_minute_index=exports[-1]["minute_index"] if exports else -1,
+                        finalized=True,
+                        final_summary_path=final_path,
+                        summary_accumulated_path=accumulated_path,
+                        final_summary_ready=False,
+                        final_transcript_path=final_transcript_path,
+                        final_transcript_ready=True,
+                    )
+                    logger.warning(
+                        "final summary temp uploaded room=%s session=%s path=%s",
+                        room_name,
+                        call_session_id,
+                        final_temp_path,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
                     if not SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK:
@@ -4453,38 +4530,39 @@ async def summary_worker_loop(
                         fallback_reasons,
                     )
 
-                await asyncio.to_thread(
-                    firebase_router.upload_json,
-                    routing,
-                    final_path,
-                    {
-                        "room_name": room_name,
-                        "transcript_session_id": routing.transcript_session_id,
-                        "call_session_id": routing.call_session_id,
-                        "summary": final_summary,
-                        "updated_at": now_iso,
-                    },
-                )
-                final_transcript_path = session_final_transcript_path(routing.storage_base_path)
-                await asyncio.to_thread(
-                    firebase_router.publish_call_index,
-                    routing=routing,
-                    status="finalized",
-                    last_minute_index=exports[-1]["minute_index"] if exports else -1,
-                    finalized=True,
-                    final_summary_path=final_path,
-                    summary_accumulated_path=accumulated_path,
-                    final_summary_ready=True,
-                    final_transcript_path=final_transcript_path,
-                    final_transcript_ready=True,
-                )
-                logger.info(
-                    "final summary uploaded room=%s session=%s path=%s partial=%s",
-                    room_name,
-                    call_session_id,
-                    final_path,
-                    bool(missing_minutes),
-                )
+                if final_summary is not None:
+                    await asyncio.to_thread(
+                        firebase_router.upload_json,
+                        routing,
+                        final_path,
+                        {
+                            "room_name": room_name,
+                            "transcript_session_id": routing.transcript_session_id,
+                            "call_session_id": routing.call_session_id,
+                            "summary": final_summary,
+                            "updated_at": now_iso,
+                        },
+                    )
+                    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+                    await asyncio.to_thread(
+                        firebase_router.publish_call_index,
+                        routing=routing,
+                        status="finalized",
+                        last_minute_index=exports[-1]["minute_index"] if exports else -1,
+                        finalized=True,
+                        final_summary_path=final_path,
+                        summary_accumulated_path=accumulated_path,
+                        final_summary_ready=True,
+                        final_transcript_path=final_transcript_path,
+                        final_transcript_ready=True,
+                    )
+                    logger.info(
+                        "final summary uploaded room=%s session=%s path=%s partial=%s",
+                        room_name,
+                        call_session_id,
+                        final_path,
+                        bool(missing_minutes),
+                    )
 
             await asyncio.to_thread(
                 db_mark_summary_task_done, room_name, call_session_id, minute_index, utc_now_iso()

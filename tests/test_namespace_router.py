@@ -1,9 +1,10 @@
+import asyncio
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -459,6 +460,74 @@ class SummarySchemaValidationTests(unittest.TestCase):
         parsed = STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_FINAL, raw)
         self.assertEqual(parsed["title"], "Resumo Final Executivo da Chamada")
         self.assertEqual(parsed["topics"][0]["name"], "Cronograma de entrega")
+
+    def test_validate_minute_summary_payload_allows_more_than_six_topics(self):
+        payload = {
+            "chunk_type": "tecnica",
+            "topics": [
+                {
+                    "name": f"Topico {index}",
+                    "summary": f"Resumo {index}",
+                    "status": "new",
+                    "tags": [],
+                }
+                for index in range(7)
+            ],
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        parsed = STT_APP.validate_minute_summary_payload(payload)
+        self.assertEqual(len(parsed["topics"]), 7)
+
+    def test_validate_accumulated_summary_payload_allows_more_than_twenty_topics(self):
+        payload = {
+            "conversation_types": [],
+            "topics": [
+                {
+                    "name": f"Topico {index}",
+                    "summary": f"Resumo {index}",
+                    "status": "active",
+                    "tags": [],
+                }
+                for index in range(21)
+            ],
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        parsed = STT_APP.validate_accumulated_summary_payload(payload)
+        self.assertEqual(len(parsed["topics"]), 21)
+
+    def test_validate_final_summary_payload_allows_more_than_twelve_topics(self):
+        payload = {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": [],
+            "executive_summary": "Resumo final.",
+            "topics": [
+                {
+                    "name": f"Topico {index}",
+                    "summary": f"Resumo {index}",
+                    "decisions": [],
+                    "pending_items": [],
+                    "next_steps": [],
+                    "tags": [],
+                }
+                for index in range(13)
+            ],
+            "global_decisions": [],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [],
+        }
+        parsed = STT_APP.validate_final_summary_payload(payload)
+        self.assertEqual(len(parsed["topics"]), 13)
 
     def test_parse_and_validate_summary_output_rejects_legacy_final_fields(self):
         raw = json.dumps(
@@ -990,8 +1059,22 @@ class SummaryEngineRetryTests(unittest.TestCase):
             "urlopen",
             return_value=self._response({"output_text": "nao-json"}),
         ):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(STT_APP.SummaryContractValidationError):
                 engine._request_json(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
+
+    def test_request_json_raises_typed_contract_error_with_raw_output(self):
+        engine = self.build_engine()
+        raw_output = json.dumps({"chunk_type": "tecnica"})
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": raw_output}),
+        ):
+            with self.assertRaises(STT_APP.SummaryContractValidationError) as ctx:
+                engine._request_json(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
+        self.assertEqual(ctx.exception.kind, STT_APP.SUMMARY_KIND_MINUTE)
+        self.assertEqual(ctx.exception.model, "minute-model")
+        self.assertEqual(ctx.exception.raw_output, raw_output)
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -1051,6 +1134,13 @@ class OpenAISecretTests(unittest.TestCase):
             with patch.object(STT_APP, "OPENAI_SUMMARY_ENABLED", True):
                 with patch.object(STT_APP, "OPENAI_APIKEY_FILE", secret_path):
                     self.assertEqual(STT_APP.load_openai_api_key(), "test-key")
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class ConfigDefaultsTests(unittest.TestCase):
+    def test_openai_request_timeout_default_is_300_in_source(self):
+        source = APP_PATH.read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "300")', source)
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -1443,6 +1533,109 @@ class SummaryFinalResilienceTests(unittest.TestCase):
                     rows = STT_APP.db_get_summary_task_rows("talk__dev__roomA", "RM_session-1")
                     self.assertEqual(rows[0]["status"], "error")
                     self.assertEqual(int(rows[0]["retries"]), 1)
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_final_contract_error_uploads_temp_and_keeps_final_not_ready(self):
+        stop_event = asyncio.Event()
+        routing = STT_APP.RoomRoutingContext(
+            namespace="talk__dev",
+            room_name="talk__dev__roomA",
+            room_id="roomA",
+            call_session_id="RM_session-1",
+            transcript_session_id="session-1",
+            vertical="HEALTH",
+            slug="acme",
+            firestore_doc_path="VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
+            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
+        )
+
+        router = MagicMock()
+        router.fetch_json.return_value = {"summary": STT_APP.default_accumulated_summary_payload()}
+        router.fetch_agent_prompt.return_value = None
+        router.upload_json = MagicMock()
+        router.publish_call_index = MagicMock()
+
+        summary_engine = MagicMock()
+        summary_engine.enabled = True
+        summary_engine.final_model = "final-model"
+        summary_engine.finalize_summary.side_effect = STT_APP.SummaryContractValidationError(
+            kind=STT_APP.SUMMARY_KIND_FINAL,
+            model="final-model",
+            raw_output='{"topics":[{"name":"A"}]}',
+            message="final.topics[0].summary deve ser string",
+        )
+
+        task = {
+            "room_name": "talk__dev__roomA",
+            "call_session_id": "RM_session-1",
+            "minute_index": -1,
+            "retries": 0,
+        }
+        session_row = {"finalized_at": "2026-04-24T12:00:00+00:00"}
+        final_task_rows = [
+            {
+                "minute_index": -1,
+                "status": "processing",
+                "retries": 0,
+                "updated_at": "2026-04-24T12:00:00+00:00",
+            }
+        ]
+
+        claim_calls = {"count": 0}
+
+        def fake_claim_summary_task(_now_iso: str):
+            if claim_calls["count"] == 0:
+                claim_calls["count"] += 1
+                return task
+            stop_event.set()
+            return None
+
+        done_calls: list[tuple[str, str, int]] = []
+
+        def fake_mark_done(room_name: str, call_session_id: str, minute_index: int, _now_iso: str):
+            done_calls.append((room_name, call_session_id, minute_index))
+            stop_event.set()
+
+        with patch.object(STT_APP, "run_summary_reconciliation_once", new=AsyncMock()):
+            with patch.object(STT_APP, "db_claim_summary_task", side_effect=fake_claim_summary_task):
+                with patch.object(STT_APP, "db_get_session_row", return_value=session_row):
+                    with patch.object(STT_APP, "routing_context_from_session_row", return_value=routing):
+                        with patch.object(STT_APP, "db_get_summary_task_rows", return_value=final_task_rows):
+                            with patch.object(STT_APP, "db_get_session_minute_exports", return_value=[]):
+                                with patch.object(STT_APP, "db_mark_summary_task_done", side_effect=fake_mark_done):
+                                    with patch.object(STT_APP, "db_mark_summary_task_error") as mark_error_mock:
+                                        await asyncio.wait_for(
+                                            STT_APP.summary_worker_loop(stop_event, router, summary_engine),
+                                            timeout=2,
+                                        )
+
+        self.assertEqual(done_calls, [("talk__dev__roomA", "RM_session-1", -1)])
+        mark_error_mock.assert_not_called()
+
+        upload_paths = [call.args[1] for call in router.upload_json.call_args_list]
+        self.assertIn(
+            STT_APP.session_final_summary_temp_path(routing.storage_base_path),
+            upload_paths,
+        )
+        self.assertNotIn(
+            STT_APP.session_final_summary_path(routing.storage_base_path),
+            upload_paths,
+        )
+
+        temp_upload_call = next(
+            call
+            for call in router.upload_json.call_args_list
+            if call.args[1] == STT_APP.session_final_summary_temp_path(routing.storage_base_path)
+        )
+        temp_payload = temp_upload_call.args[2]
+        self.assertEqual(temp_payload["model"], "final-model")
+        self.assertEqual(temp_payload["kind"], STT_APP.SUMMARY_KIND_FINAL)
+        self.assertIn('"name":"A"', temp_payload["raw_output"])
+
+        publish_kwargs = router.publish_call_index.call_args.kwargs
+        self.assertFalse(publish_kwargs["final_summary_ready"])
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")

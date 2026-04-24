@@ -75,6 +75,7 @@ Storage:
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/minutes/{minute_index}/summary.json`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/summary/accumulated.json`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary_temp.json` (quando houver erro de contrato no final)
 
 ## OpenAI Summary (opcional)
 
@@ -100,7 +101,7 @@ Storage:
 - `OPENAI_MODEL_MINUTE_SUMMARY` (padrao `gpt-4.1-mini`)
 - `OPENAI_MODEL_ACCUMULATED_SUMMARY` (padrao `gpt-4.1-mini`)
 - `OPENAI_MODEL_FINAL_SUMMARY` (padrao `gpt-4.1-mini`)
-- `OPENAI_REQUEST_TIMEOUT_SECONDS` (padrao `45`)
+- `OPENAI_REQUEST_TIMEOUT_SECONDS` (padrao `300`)
 - `OPENAI_REQUEST_RETRIES` (padrao `2`, total de 3 tentativas por request)
 - `OPENAI_MAX_RETRIES` (padrao `3`)
 - `OPENAI_ACCUMULATED_MAX_ITEMS` (padrao `40`)
