@@ -530,6 +530,69 @@ class SummarySchemaValidationTests(unittest.TestCase):
         parsed = STT_APP.validate_final_summary_payload(payload)
         self.assertEqual(len(parsed["topics"]), 13)
 
+    def test_validate_final_summary_payload_truncates_global_lists_to_30(self):
+        payload = {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": [],
+            "executive_summary": "Resumo final.",
+            "topics": [],
+            "global_decisions": [
+                {"text": f"decision {i}", "confidence": "medium", "tags": []}
+                for i in range(31)
+            ],
+            "global_pending_items": [
+                {"text": f"pending {i}", "confidence": "medium", "tags": []}
+                for i in range(31)
+            ],
+            "global_next_steps": [
+                {"text": f"next {i}", "confidence": "medium", "tags": []}
+                for i in range(31)
+            ],
+            "additional_notes": [
+                {"text": f"note {i}", "confidence": "low", "tags": []}
+                for i in range(31)
+            ],
+        }
+
+        parsed = STT_APP.validate_final_summary_payload(payload)
+
+        self.assertEqual(len(parsed["global_decisions"]), 30)
+        self.assertEqual(len(parsed["global_pending_items"]), 30)
+        self.assertEqual(len(parsed["global_next_steps"]), 30)
+        self.assertEqual(len(parsed["additional_notes"]), 30)
+        self.assertEqual(parsed["global_decisions"][0]["text"], "decision 0")
+        self.assertEqual(parsed["global_decisions"][-1]["text"], "decision 29")
+
+    def test_validate_final_summary_payload_truncates_topic_lists_to_30(self):
+        payload = {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": [],
+            "executive_summary": "Resumo final.",
+            "topics": [
+                {
+                    "name": "Cronograma",
+                    "summary": "Resumo do cronograma.",
+                    "decisions": [f"decision {i}" for i in range(31)],
+                    "pending_items": [f"pending {i}" for i in range(31)],
+                    "next_steps": [f"next {i}" for i in range(31)],
+                    "tags": [],
+                }
+            ],
+            "global_decisions": [],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [],
+        }
+
+        parsed = STT_APP.validate_final_summary_payload(payload)
+        topic = parsed["topics"][0]
+
+        self.assertEqual(len(topic["decisions"]), 30)
+        self.assertEqual(len(topic["pending_items"]), 30)
+        self.assertEqual(len(topic["next_steps"]), 30)
+        self.assertEqual(topic["decisions"][0], "decision 0")
+        self.assertEqual(topic["decisions"][-1], "decision 29")
+
     def test_parse_and_validate_summary_output_rejects_legacy_final_fields(self):
         raw = json.dumps(
             {
@@ -726,6 +789,91 @@ class SummarySchemaValidationTests(unittest.TestCase):
         normalized = STT_APP.validate_minute_summary_payload(payload)
         self.assertEqual(len(normalized["topics"]), 2)
 
+    def test_validate_minute_summary_payload_truncates_sections_to_20(self):
+        topic_name = "Escopo do projeto"
+        payload = {
+            "chunk_type": "mista",
+            "topics": [
+                {
+                    "name": topic_name,
+                    "summary": "Tema principal.",
+                    "status": "new",
+                    "tags": ["escopo"],
+                }
+            ],
+            "facts": [
+                {
+                    "text": f"fact {i}",
+                    "confidence": "high",
+                    "status": "confirmed",
+                    "tags": ["escopo"],
+                    "topic": topic_name,
+                }
+                for i in range(21)
+            ],
+            "hypotheses": [
+                {
+                    "text": f"hypothesis {i}",
+                    "confidence": "low",
+                    "status": "uncertain",
+                    "tags": ["escopo"],
+                    "topic": topic_name,
+                }
+                for i in range(21)
+            ],
+            "decisions": [
+                {
+                    "text": f"decision {i}",
+                    "confidence": "high",
+                    "status": "confirmed",
+                    "tags": ["escopo"],
+                    "topic": topic_name,
+                }
+                for i in range(21)
+            ],
+            "open_items": [
+                {
+                    "text": f"open {i}",
+                    "confidence": "medium",
+                    "status": "open",
+                    "tags": ["escopo"],
+                    "topic": topic_name,
+                }
+                for i in range(21)
+            ],
+            "next_steps": [
+                {
+                    "text": f"next {i}",
+                    "confidence": "medium",
+                    "status": "planned",
+                    "tags": ["escopo"],
+                    "topic": topic_name,
+                }
+                for i in range(21)
+            ],
+            "notes": [
+                {
+                    "text": f"note {i}",
+                    "confidence": "low",
+                    "status": "info",
+                    "tags": ["escopo"],
+                    "topic": topic_name,
+                }
+                for i in range(21)
+            ],
+        }
+
+        normalized = STT_APP.validate_minute_summary_payload(payload)
+
+        self.assertEqual(len(normalized["facts"]), 20)
+        self.assertEqual(len(normalized["hypotheses"]), 20)
+        self.assertEqual(len(normalized["decisions"]), 20)
+        self.assertEqual(len(normalized["open_items"]), 20)
+        self.assertEqual(len(normalized["next_steps"]), 20)
+        self.assertEqual(len(normalized["notes"]), 20)
+        self.assertEqual(normalized["facts"][0]["text"], "fact 0")
+        self.assertEqual(normalized["facts"][-1]["text"], "fact 19")
+
     def test_validate_accumulated_summary_payload_accepts_topics_with_item_reference(self):
         payload = {
             "conversation_types": ["mista"],
@@ -884,17 +1032,21 @@ class AccumulatedSummaryLimitsTests(unittest.TestCase):
             normalized = STT_APP.validate_accumulated_summary_payload(payload)
         self.assertEqual(len(normalized["notes"]), 40)
 
-    def test_validate_accumulated_summary_rejects_41_notes(self):
+    def test_validate_accumulated_summary_truncates_41_notes_to_40(self):
         with patch.object(STT_APP, "OPENAI_ACCUMULATED_MAX_ITEMS", 40):
             payload = self._payload(notes_count=41)
-            with self.assertRaises(RuntimeError):
-                STT_APP.validate_accumulated_summary_payload(payload)
+            normalized = STT_APP.validate_accumulated_summary_payload(payload)
+        self.assertEqual(len(normalized["notes"]), 40)
+        self.assertEqual(normalized["notes"][0]["text"], "note 0")
+        self.assertEqual(normalized["notes"][-1]["text"], "note 39")
 
-    def test_validate_accumulated_summary_rejects_41_facts(self):
+    def test_validate_accumulated_summary_truncates_41_facts_to_40(self):
         with patch.object(STT_APP, "OPENAI_ACCUMULATED_MAX_ITEMS", 40):
             payload = self._payload(facts_count=41)
-            with self.assertRaises(RuntimeError):
-                STT_APP.validate_accumulated_summary_payload(payload)
+            normalized = STT_APP.validate_accumulated_summary_payload(payload)
+        self.assertEqual(len(normalized["facts"]), 40)
+        self.assertEqual(normalized["facts"][0]["text"], "fact 0")
+        self.assertEqual(normalized["facts"][-1]["text"], "fact 39")
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -1502,6 +1654,65 @@ class SummaryFinalResilienceTests(unittest.TestCase):
         self.assertIn("Documento parcial", updated["executive_summary"])
         self.assertEqual(len(updated["additional_notes"]), 1)
         self.assertIn("Ata parcial", updated["additional_notes"][0]["text"])
+
+    def test_inject_degradation_disclosure_truncates_additional_notes_to_30(self):
+        final_payload = {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": ["executiva"],
+            "executive_summary": "Resumo principal da chamada.",
+            "topics": [],
+            "global_decisions": [],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [
+                {"text": f"nota {i}", "confidence": "low", "tags": []}
+                for i in range(35)
+            ],
+        }
+        updated = STT_APP.inject_degradation_disclosure(
+            final_payload,
+            [3],
+            ["minutos ausentes"],
+        )
+        self.assertEqual(len(updated["additional_notes"]), 30)
+        self.assertEqual(updated["additional_notes"][0]["text"], "nota 0")
+        self.assertEqual(updated["additional_notes"][-1]["text"], "nota 29")
+
+    def test_build_deterministic_final_summary_truncates_notes_to_30(self):
+        accumulated = {
+            "conversation_types": ["executiva"],
+            "topics": [
+                {
+                    "name": "Cronograma",
+                    "summary": "Discussao do cronograma.",
+                    "status": "active",
+                    "tags": ["prazo"],
+                }
+            ],
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [
+                {
+                    "text": f"note {i}",
+                    "confidence": "low",
+                    "status": "info",
+                    "tags": [],
+                    "name": "Cronograma",
+                }
+                for i in range(40)
+            ],
+        }
+        final_payload = STT_APP.build_deterministic_final_summary(
+            accumulated,
+            [2],
+            ["acumulado reconstruido"],
+        )
+        self.assertEqual(len(final_payload["additional_notes"]), 30)
+        self.assertEqual(final_payload["additional_notes"][0]["text"], "note 0")
+        self.assertEqual(final_payload["additional_notes"][-1]["text"], "note 29")
 
     def test_db_schedule_final_summary_task_force_requeues_done(self):
         with tempfile.TemporaryDirectory() as tmpdir:

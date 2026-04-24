@@ -164,7 +164,7 @@ Regras obrigatorias:
 - Nao criar assunto para ruido social isolado, como agradecimentos, despedidas, confirmacoes vazias ou fillers.
 - Se o trecho for inutil/ruidoso, retornar arrays vazios e registrar 1 note curta.
 - Tags curtas e especificas.
-- Limites: text max 240 caracteres; tags entre 0 e 4 itens (preferencialmente curtas); maximo 8 itens por categoria.
+- Limites: text max 240 caracteres; tags entre 0 e 4 itens (preferencialmente curtas); maximo 20 itens por categoria.
 """
 
 DEFAULT_MERGE_SUMMARIES_PROMPT = """Voce e um assistente responsavel por atualizar o estado acumulado de uma chamada corporativa em portugues do Brasil.
@@ -244,7 +244,7 @@ Regras obrigatorias:
   "Nenhuma decisao explicita foi registrada."
 - title deve ser um titulo curto, especifico da chamada e alinhado ao principal assunto discutido.
 - conversation_types deve refletir o estado acumulado.
-- Limites: text max 280 caracteres; tags entre 0 e 4 itens; maximo 12 itens por categoria.
+- Limites: text max 280 caracteres; tags entre 0 e 4 itens; maximo 30 itens por categoria.
 - Retornar arrays vazios quando categoria nao tiver itens (exceto regra de global_decisions acima).
 """
 
@@ -267,6 +267,8 @@ SUMMARY_CONVERSATION_TYPE_ENUM = ["tecnica", "executiva", "operacional", "comerc
 SUMMARY_FINAL_TITLE_MIN_CHARS = 8
 SUMMARY_FINAL_TITLE_MAX_CHARS = 120
 SUMMARY_FINAL_TITLE_FALLBACK = "Ata da reunião"
+SUMMARY_MINUTE_MAX_ITEMS = 20
+SUMMARY_FINAL_MAX_ITEMS = 30
 
 
 def _topic_schema(topic_status: list[str]) -> dict:
@@ -659,11 +661,20 @@ def validate_summary_list(
     key: str,
     max_items: int,
     item_validator: Callable[[Any, str], dict],
+    truncate_excess: bool = False,
 ) -> list[dict]:
     if not isinstance(value, list):
         raise RuntimeError(f"{key} deve ser array")
     if len(value) > max_items:
-        raise RuntimeError(f"{key} excede maximo de {max_items} itens")
+        if not truncate_excess:
+            raise RuntimeError(f"{key} excede maximo de {max_items} itens")
+        logger.warning(
+            "summary list truncated field=%s raw_len=%s kept=%s",
+            key,
+            len(value),
+            max_items,
+        )
+        value = value[:max_items]
     return [item_validator(item, f"{key}[{index}]") for index, item in enumerate(value)]
 
 
@@ -672,11 +683,20 @@ def validate_text_list(
     key: str,
     max_items: int,
     max_len: int,
+    truncate_excess: bool = False,
 ) -> list[str]:
     if not isinstance(value, list):
         raise RuntimeError(f"{key} deve ser array")
     if len(value) > max_items:
-        raise RuntimeError(f"{key} excede maximo de {max_items} itens")
+        if not truncate_excess:
+            raise RuntimeError(f"{key} excede maximo de {max_items} itens")
+        logger.warning(
+            "summary text list truncated field=%s raw_len=%s kept=%s",
+            key,
+            len(value),
+            max_items,
+        )
+        value = value[:max_items]
     normalized: list[str] = []
     for index, item in enumerate(value):
         if not isinstance(item, str):
@@ -866,9 +886,15 @@ def validate_final_topic_item(item: Any, label: str) -> dict:
     return {
         "name": name,
         "summary": summary,
-        "decisions": validate_text_list(item.get("decisions"), f"{label}.decisions", 12, 280),
-        "pending_items": validate_text_list(item.get("pending_items"), f"{label}.pending_items", 12, 280),
-        "next_steps": validate_text_list(item.get("next_steps"), f"{label}.next_steps", 12, 280),
+        "decisions": validate_text_list(
+            item.get("decisions"), f"{label}.decisions", SUMMARY_FINAL_MAX_ITEMS, 280, truncate_excess=True
+        ),
+        "pending_items": validate_text_list(
+            item.get("pending_items"), f"{label}.pending_items", SUMMARY_FINAL_MAX_ITEMS, 280, truncate_excess=True
+        ),
+        "next_steps": validate_text_list(
+            item.get("next_steps"), f"{label}.next_steps", SUMMARY_FINAL_MAX_ITEMS, 280, truncate_excess=True
+        ),
         "tags": validate_summary_tags(item.get("tags"), label),
     }
 
@@ -906,7 +932,7 @@ def validate_minute_summary_payload(payload: dict) -> dict:
     facts = validate_summary_list(
         payload.get("facts"),
         "facts",
-        8,
+        SUMMARY_MINUTE_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item,
             label,
@@ -916,46 +942,52 @@ def validate_minute_summary_payload(payload: dict) -> dict:
             True,
             True,
         ),
+        truncate_excess=True,
     )
     hypotheses = validate_summary_list(
         payload.get("hypotheses"),
         "hypotheses",
-        8,
+        SUMMARY_MINUTE_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, {"medium", "low"}, {"uncertain"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     decisions = validate_summary_list(
         payload.get("decisions"),
         "decisions",
-        8,
+        SUMMARY_MINUTE_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     open_items = validate_summary_list(
         payload.get("open_items"),
         "open_items",
-        8,
+        SUMMARY_MINUTE_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     next_steps = validate_summary_list(
         payload.get("next_steps"),
         "next_steps",
-        8,
+        SUMMARY_MINUTE_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     notes = validate_summary_list(
         payload.get("notes"),
         "notes",
-        8,
+        SUMMARY_MINUTE_MAX_ITEMS,
         lambda item, label: validate_summary_item(
             item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     validate_topic_reference(facts, "facts", topic_names, allow_unmapped_without_topics=True)
     validate_topic_reference(
@@ -1036,6 +1068,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed", "uncertain"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     hypotheses = validate_summary_list(
         payload.get("hypotheses"),
@@ -1044,6 +1077,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         lambda item, label: validate_summary_item(
             item, label, {"medium", "low"}, {"uncertain"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     decisions = validate_summary_list(
         payload.get("decisions"),
@@ -1052,6 +1086,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     open_items = validate_summary_list(
         payload.get("open_items"),
@@ -1060,6 +1095,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     next_steps = validate_summary_list(
         payload.get("next_steps"),
@@ -1068,6 +1104,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         lambda item, label: validate_summary_item(
             item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     notes = validate_summary_list(
         payload.get("notes"),
@@ -1076,6 +1113,7 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         lambda item, label: validate_summary_item(
             item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True, True
         ),
+        truncate_excess=True,
     )
     topics, section_map = reconcile_accumulated_topics_and_references(
         topics,
@@ -1188,22 +1226,31 @@ def validate_final_summary_payload(payload: dict) -> dict:
         "global_decisions": validate_summary_list(
             payload.get("global_decisions"),
             "global_decisions",
-            12,
+            SUMMARY_FINAL_MAX_ITEMS,
             _final_item,
+            truncate_excess=True,
         ),
         "global_pending_items": validate_summary_list(
             payload.get("global_pending_items"),
             "global_pending_items",
-            12,
+            SUMMARY_FINAL_MAX_ITEMS,
             _final_item,
+            truncate_excess=True,
         ),
         "global_next_steps": validate_summary_list(
             payload.get("global_next_steps"),
             "global_next_steps",
-            12,
+            SUMMARY_FINAL_MAX_ITEMS,
             _final_item,
+            truncate_excess=True,
         ),
-        "additional_notes": validate_summary_list(payload.get("additional_notes"), "additional_notes", 12, _final_item),
+        "additional_notes": validate_summary_list(
+            payload.get("additional_notes"),
+            "additional_notes",
+            SUMMARY_FINAL_MAX_ITEMS,
+            _final_item,
+            truncate_excess=True,
+        ),
     }
 
 
@@ -4037,8 +4084,8 @@ def inject_degradation_disclosure(
     note_item = _build_degradation_additional_note(missing_minutes, reasons)
     if note_item["text"] not in {str(item.get("text")) for item in notes if isinstance(item, dict)}:
         notes.append(note_item)
-    if len(notes) > 12:
-        notes = notes[-12:]
+    if len(notes) > SUMMARY_FINAL_MAX_ITEMS:
+        notes = notes[:SUMMARY_FINAL_MAX_ITEMS]
     summary["additional_notes"] = notes
     return validate_final_summary_payload(summary)
 
@@ -4151,7 +4198,11 @@ def build_deterministic_final_summary(
         else default_accumulated_summary_payload()
     )
 
-    def _collect_topic_texts(source_key: str, topic_name: str, limit: int = 12) -> list[str]:
+    def _collect_topic_texts(
+        source_key: str,
+        topic_name: str,
+        limit: int = SUMMARY_FINAL_MAX_ITEMS,
+    ) -> list[str]:
         texts: list[str] = []
         seen: set[str] = set()
         for item in normalized_acc.get(source_key, []):
@@ -4205,15 +4256,15 @@ def build_deterministic_final_summary(
                     "tags": validate_summary_tags(tags if isinstance(tags, list) else [], source_key),
                 }
             )
-            if len(items) >= 12:
+            if len(items) >= SUMMARY_FINAL_MAX_ITEMS:
                 break
         return items
 
     additional_notes = _global_items("notes")
     if missing_minutes:
         additional_notes.append(_build_degradation_additional_note(missing_minutes, reasons))
-        if len(additional_notes) > 12:
-            additional_notes = additional_notes[-12:]
+        if len(additional_notes) > SUMMARY_FINAL_MAX_ITEMS:
+            additional_notes = additional_notes[:SUMMARY_FINAL_MAX_ITEMS]
 
     global_decisions = _global_items("decisions")
     if not global_decisions:
