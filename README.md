@@ -16,6 +16,8 @@ Servico STT CPU-only para ingestao assíncrona de chunks enviados pelo agente Li
 - `POST /v1/sessions/start`
 - `POST /v1/sessions/chunk`
 - `POST /v1/sessions/end`
+- `POST /v1/admin/summary/reprocess`
+- `GET /v1/admin/summary/reprocess/status`
 
 ## Subir
 

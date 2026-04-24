@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1795,6 +1796,338 @@ class FinalTranscriptTests(unittest.TestCase):
         self.assertIn("chunk_started_at", lines[0])
         self.assertIn("chunk_ended_at", lines[0])
         self.assertEqual(transcript, "[Alice] Oi\n[Bruno] Bom dia\n[Bruno] Tudo certo")
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class AdminSummaryReprocessTests(unittest.IsolatedAsyncioTestCase):
+    def build_session_row(self, *, finalized_at: str | None = "2026-04-24T12:00:00+00:00") -> dict:
+        return {
+            "room_name": "talk__dev__roomA",
+            "session_id": "RM_session-1",
+            "call_session_id": "RM_session-1",
+            "transcript_session_id": "session-1",
+            "room_id": "roomA",
+            "vertical": "HEALTH",
+            "slug": "acme",
+            "firestore_doc_path": "VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
+            "storage_base_path": "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
+            "started_at": "2026-04-24T10:00:00+00:00",
+            "room_end_received": 1,
+            "finalized_at": finalized_at,
+        }
+
+    async def test_admin_reprocess_post_accepts_finalized_session(self):
+        payload = STT_APP.AdminSummaryReprocessTarget(
+            namespace="talk__dev",
+            vertical="HEALTH",
+            slug="acme",
+            room_id="roomA",
+            call_session_id="RM_session-1",
+        )
+        session_row = self.build_session_row()
+        runtime = SimpleNamespace(
+            summary_engine=SimpleNamespace(enabled=True),
+            firebase_router=SimpleNamespace(
+                upload_json=MagicMock(),
+                publish_call_index=MagicMock(),
+            ),
+        )
+        STT_APP.app.state.runtime = runtime
+
+        task_rows = [
+            {
+                "minute_index": 0,
+                "status": "pending",
+                "retries": 0,
+                "error_message": None,
+            },
+            {
+                "minute_index": -1,
+                "status": "pending",
+                "retries": 0,
+                "error_message": None,
+            },
+        ]
+        minute_exports = [{"minute_index": 0}]
+
+        with patch.object(STT_APP, "db_get_session_row", return_value=session_row):
+            with patch.object(STT_APP, "publish_session_minute_exports", return_value=0):
+                with patch.object(
+                    STT_APP, "db_reset_summary_reprocess_state", return_value={"minute_exports": 1}
+                ):
+                    with patch.object(
+                        STT_APP, "build_final_transcript_payload", return_value={"line_count": 1}
+                    ):
+                        with patch.object(
+                            STT_APP, "db_get_session_minute_exports", return_value=minute_exports
+                        ):
+                            with patch.object(STT_APP, "db_get_summary_task_rows", return_value=task_rows):
+                                with patch.object(
+                                    STT_APP, "db_force_finalize_session_for_reprocess"
+                                ) as force_finalize_mock:
+                                    response = await STT_APP.admin_summary_reprocess(payload)
+
+        self.assertEqual(response.status_code, 202)
+        data = json.loads(response.body)
+        self.assertEqual(data["overall_status"], "pending")
+        self.assertEqual(data["session"]["room_name"], "talk__dev__roomA")
+        force_finalize_mock.assert_not_called()
+
+    async def test_admin_reprocess_post_forces_finalize_when_session_active(self):
+        payload = STT_APP.AdminSummaryReprocessTarget(
+            namespace="talk__dev",
+            vertical="HEALTH",
+            slug="acme",
+            room_id="roomA",
+            call_session_id="RM_session-1",
+        )
+        session_row_active = self.build_session_row(finalized_at=None)
+        session_row_finalized = self.build_session_row()
+        runtime = SimpleNamespace(
+            summary_engine=SimpleNamespace(enabled=True),
+            firebase_router=SimpleNamespace(
+                upload_json=MagicMock(),
+                publish_call_index=MagicMock(),
+            ),
+        )
+        STT_APP.app.state.runtime = runtime
+
+        with patch.object(
+            STT_APP,
+            "db_get_session_row",
+            side_effect=[session_row_active, session_row_finalized],
+        ):
+            with patch.object(STT_APP, "publish_session_minute_exports", return_value=0):
+                with patch.object(
+                    STT_APP, "db_reset_summary_reprocess_state", return_value={"minute_exports": 0}
+                ):
+                    with patch.object(
+                        STT_APP, "build_final_transcript_payload", return_value={"line_count": 0}
+                    ):
+                        with patch.object(STT_APP, "db_get_session_minute_exports", return_value=[]):
+                            with patch.object(STT_APP, "db_get_summary_task_rows", return_value=[]):
+                                with patch.object(
+                                    STT_APP, "db_force_finalize_session_for_reprocess"
+                                ) as force_finalize_mock:
+                                    response = await STT_APP.admin_summary_reprocess(payload)
+
+        self.assertEqual(response.status_code, 202)
+        force_finalize_mock.assert_called_once()
+
+    async def test_admin_reprocess_post_rejects_target_mismatch(self):
+        payload = STT_APP.AdminSummaryReprocessTarget(
+            namespace="talk__dev",
+            vertical="HEALTH",
+            slug="acme",
+            room_id="roomA",
+            call_session_id="RM_session-1",
+        )
+        session_row = self.build_session_row()
+        session_row["slug"] = "other"
+        runtime = SimpleNamespace(summary_engine=SimpleNamespace(enabled=True), firebase_router=MagicMock())
+        STT_APP.app.state.runtime = runtime
+
+        with patch.object(STT_APP, "db_get_session_row", return_value=session_row):
+            with self.assertRaises(STT_APP.HTTPException) as ctx:
+                await STT_APP.admin_summary_reprocess(payload)
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    async def test_admin_reprocess_status_returns_final_summary_when_done(self):
+        runtime = SimpleNamespace(
+            firebase_router=SimpleNamespace(fetch_json=MagicMock(return_value={"summary": {"title": "ok"}}))
+        )
+        STT_APP.app.state.runtime = runtime
+        session_row = self.build_session_row()
+        task_rows = [
+            {
+                "minute_index": 0,
+                "status": "done",
+                "retries": 0,
+                "error_message": None,
+            },
+            {
+                "minute_index": -1,
+                "status": "done",
+                "retries": 0,
+                "error_message": None,
+            },
+        ]
+        minute_exports = [{"minute_index": 0}]
+
+        with patch.object(STT_APP, "db_get_session_row", return_value=session_row):
+            with patch.object(STT_APP, "db_get_summary_task_rows", return_value=task_rows):
+                with patch.object(STT_APP, "db_get_session_minute_exports", return_value=minute_exports):
+                    response = await STT_APP.admin_summary_reprocess_status(
+                        namespace="talk__dev",
+                        vertical="HEALTH",
+                        slug="acme",
+                        room_id="roomA",
+                        call_session_id="RM_session-1",
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.body)
+        self.assertEqual(data["overall_status"], "done")
+        self.assertEqual(data["final_summary"]["title"], "ok")
+
+    async def test_admin_reprocess_status_returns_final_error_details_when_exhausted(self):
+        temp_payload = {
+            "error": "falha de contrato",
+            "model": "gpt-4.1-mini",
+            "kind": STT_APP.SUMMARY_KIND_FINAL,
+            "updated_at": "2026-04-24T12:00:00+00:00",
+        }
+        runtime = SimpleNamespace(
+            firebase_router=SimpleNamespace(fetch_json=MagicMock(return_value=temp_payload))
+        )
+        STT_APP.app.state.runtime = runtime
+        session_row = self.build_session_row()
+        task_rows = [
+            {
+                "minute_index": -1,
+                "status": "error",
+                "retries": STT_APP.OPENAI_MAX_RETRIES,
+                "error_message": "exhausted",
+            }
+        ]
+
+        with patch.object(STT_APP, "db_get_session_row", return_value=session_row):
+            with patch.object(STT_APP, "db_get_summary_task_rows", return_value=task_rows):
+                with patch.object(STT_APP, "db_get_session_minute_exports", return_value=[]):
+                    response = await STT_APP.admin_summary_reprocess_status(
+                        namespace="talk__dev",
+                        vertical="HEALTH",
+                        slug="acme",
+                        room_id="roomA",
+                        call_session_id="RM_session-1",
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.body)
+        self.assertEqual(data["overall_status"], "error_exhausted")
+        self.assertEqual(data["final_error_details"]["error"], "falha de contrato")
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class SummaryReprocessDbTests(unittest.TestCase):
+    def test_db_reset_summary_reprocess_state_resets_flags_and_summary_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.db"
+            spool_dir = Path(tmpdir) / "spool"
+            with patch.object(STT_APP, "SQLITE_PATH", db_path):
+                with patch.object(STT_APP, "SPOOL_DIR", spool_dir):
+                    STT_APP.init_db()
+                    now = "2026-04-24T12:00:00+00:00"
+                    conn = STT_APP.read_db_connection()
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO minute_exports(
+                                room_name, session_id, minute_index,
+                                transcript_json_path, summary_json_path, content_hash,
+                                minute_started_at, minute_ended_at, finalized,
+                                exported_at, updated_at
+                            ) VALUES (?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?)
+                            """,
+                            (
+                                "talk__dev__roomA",
+                                "RM_session-1",
+                                "minutes/0000/transcript.json",
+                                "minutes/0000/summary.json",
+                                "h1",
+                                now,
+                                now,
+                                now,
+                                now,
+                            ),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO summary_tasks(
+                                room_name, session_id, minute_index,
+                                status, retries, next_attempt_at,
+                                error_message, created_at, updated_at
+                            ) VALUES (?, ?, 0, 'error', 2, ?, 'err', ?, ?)
+                            """,
+                            ("talk__dev__roomA", "RM_session-1", now, now, now),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO summary_tasks(
+                                room_name, session_id, minute_index,
+                                status, retries, next_attempt_at,
+                                error_message, created_at, updated_at
+                            ) VALUES (?, ?, -1, 'done', 1, ?, NULL, ?, ?)
+                            """,
+                            ("talk__dev__roomA", "RM_session-1", now, now, now),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    STT_APP.db_reset_summary_reprocess_state("talk__dev__roomA", "RM_session-1", now)
+                    rows = STT_APP.db_get_summary_task_rows("talk__dev__roomA", "RM_session-1")
+                    minute_row = next(row for row in rows if int(row["minute_index"]) == 0)
+                    final_row = next(row for row in rows if int(row["minute_index"]) < 0)
+                    self.assertEqual(minute_row["status"], "pending")
+                    self.assertEqual(int(minute_row["retries"]), 0)
+                    self.assertEqual(final_row["status"], "pending")
+                    self.assertEqual(int(final_row["retries"]), 0)
+
+                    export_row = STT_APP.db_get_minute_export("talk__dev__roomA", "RM_session-1", 0)
+                    self.assertIsNone(export_row["summary_json_path"])
+
+    def test_db_claim_summary_task_prioritizes_minutes_before_final(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "queue.db"
+            spool_dir = Path(tmpdir) / "spool"
+            with patch.object(STT_APP, "SQLITE_PATH", db_path):
+                with patch.object(STT_APP, "SPOOL_DIR", spool_dir):
+                    STT_APP.init_db()
+                    now = "2026-04-24T12:00:00+00:00"
+                    conn = STT_APP.read_db_connection()
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO summary_tasks(
+                                room_name, session_id, minute_index,
+                                status, retries, next_attempt_at,
+                                error_message, created_at, updated_at
+                            ) VALUES (?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
+                            """,
+                            ("talk__dev__roomA", "RM_session-1", 5, now, now, now),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO summary_tasks(
+                                room_name, session_id, minute_index,
+                                status, retries, next_attempt_at,
+                                error_message, created_at, updated_at
+                            ) VALUES (?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
+                            """,
+                            ("talk__dev__roomA", "RM_session-1", 1, now, now, now),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO summary_tasks(
+                                room_name, session_id, minute_index,
+                                status, retries, next_attempt_at,
+                                error_message, created_at, updated_at
+                            ) VALUES (?, ?, -1, 'pending', 0, ?, NULL, ?, ?)
+                            """,
+                            ("talk__dev__roomA", "RM_session-1", now, now, now),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+
+                    first = STT_APP.db_claim_summary_task(now)
+                    second = STT_APP.db_claim_summary_task(now)
+                    third = STT_APP.db_claim_summary_task(now)
+
+        self.assertEqual(int(first["minute_index"]), 1)
+        self.assertEqual(int(second["minute_index"]), 5)
+        self.assertEqual(int(third["minute_index"]), -1)
 
 
 if __name__ == "__main__":

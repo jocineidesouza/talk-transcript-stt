@@ -8,6 +8,8 @@ Servico de transcricao assincrona para ingestao de chunks de audio vindos do age
 - `POST /v1/sessions/start`
 - `POST /v1/sessions/chunk` (`multipart/form-data` com `meta` + `audio`)
 - `POST /v1/sessions/end`
+- `POST /v1/admin/summary/reprocess` (admin, sem HMAC)
+- `GET /v1/admin/summary/reprocess/status` (admin, sem HMAC)
 
 ## Fluxo
 
@@ -46,6 +48,9 @@ NONCE
 SHA256_HEX(body)
 ```
 
+Observacao:
+- Os endpoints administrativos de reprocessamento de summary (`/v1/admin/summary/reprocess*`) nao exigem HMAC.
+
 ## Banco e fila
 
 - SQLite em WAL mode
@@ -83,6 +88,61 @@ Storage:
 - secret esperado em `OPENAI_APIKEY_FILE` (padrao `/secrets/openai_apikey.json`)
 - formato do arquivo: `{"api_key":"..."}` (ver `stt/secrets/openai_apikey.example.json`)
 - se secret estiver ausente/invalido, STT continua; resumo fica desabilitado com warning
+
+## Reprocessamento administrativo de summary
+
+### POST `/v1/admin/summary/reprocess`
+
+Reprocessa do zero os resumos da sessao alvo:
+- valida `namespace + vertical + slug + room_id + call_session_id` contra SQLite
+- força finalizacao logica se a sessao ainda estiver ativa
+- reseta `summary_tasks` e `minute_exports.summary_json_path`
+- reseta `summary/accumulated.json`
+- reencadeia processamento assíncrono de minutos + final
+
+Body JSON:
+
+```json
+{
+  "namespace": "talk__dev",
+  "vertical": "HEALTH",
+  "slug": "acme",
+  "room_id": "roomA",
+  "call_session_id": "RM_session-1"
+}
+```
+
+Exemplo curl:
+
+```bash
+curl -X POST "http://localhost:8000/v1/admin/summary/reprocess" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "namespace":"talk__dev",
+    "vertical":"HEALTH",
+    "slug":"acme",
+    "room_id":"roomA",
+    "call_session_id":"RM_session-1"
+  }'
+```
+
+### GET `/v1/admin/summary/reprocess/status`
+
+Consulta o progresso e, quando pronto, retorna `final_summary`.
+
+Exemplo curl:
+
+```bash
+curl "http://localhost:8000/v1/admin/summary/reprocess/status?namespace=talk__dev&vertical=HEALTH&slug=acme&room_id=roomA&call_session_id=RM_session-1"
+```
+
+Campos principais no retorno:
+- `overall_status`: `pending | processing | error | error_exhausted | done`
+- `progress`: contagem de tarefas de minuto
+- `final_task`: estado da tarefa final (`minute_index=-1`)
+- `minute_tasks`: estado por minuto
+- `final_summary`: presente quando `final_task.status=done`
+- `final_error_details`: presente quando `final_task.exhausted=true`
 
 ## Principais variaveis de ambiente
 

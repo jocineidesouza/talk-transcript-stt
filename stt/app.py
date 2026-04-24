@@ -1226,6 +1226,42 @@ class EndRequest(BaseModel):
         return value
 
 
+class AdminSummaryReprocessTarget(BaseModel):
+    namespace: str = Field(min_length=1)
+    vertical: str = Field(min_length=1)
+    slug: str = Field(min_length=1)
+    room_id: str = Field(min_length=1)
+    call_session_id: str = Field(min_length=1)
+
+    @field_validator("namespace")
+    @classmethod
+    def validate_namespace(cls, value: str) -> str:
+        namespace = str(value).strip()
+        if namespace not in ALLOWED_LIVEKIT_NAMESPACES:
+            raise ValueError("namespace nao permitido")
+        return namespace
+
+    @field_validator("vertical", "slug", "room_id", mode="before")
+    @classmethod
+    def normalize_non_empty(cls, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("campo obrigatorio")
+        return text
+
+    @field_validator("call_session_id")
+    @classmethod
+    def validate_call_session_id(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text.startswith("RM_"):
+            raise ValueError("call_session_id deve iniciar com RM_")
+        return text
+
+    @property
+    def room_name(self) -> str:
+        return f"{self.namespace}__{self.room_id}"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -2644,6 +2680,31 @@ def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
         firestore_doc_path=firestore_doc_path,
         storage_base_path=storage_base_path,
     )
+
+
+def assert_admin_target_matches_session(
+    target: AdminSummaryReprocessTarget, row: sqlite3.Row
+) -> RoomRoutingContext:
+    routing = routing_context_from_session_row(row)
+    mismatches: list[str] = []
+    if routing.namespace != target.namespace:
+        mismatches.append("namespace")
+    if routing.vertical != target.vertical:
+        mismatches.append("vertical")
+    if routing.slug != target.slug:
+        mismatches.append("slug")
+    if routing.room_id != target.room_id:
+        mismatches.append("room_id")
+    if routing.call_session_id != target.call_session_id:
+        mismatches.append("call_session_id")
+    if mismatches:
+        raise HTTPException(
+            status_code=409,
+            detail=f"session_target_mismatch:{','.join(mismatches)}",
+        )
+    return routing
+
+
 def db_get_done_chunks_for_session(room_name: str, call_session_id: str) -> list[sqlite3.Row]:
     conn = read_db_connection()
     try:
@@ -2821,7 +2882,10 @@ def db_claim_summary_task(now_iso: str) -> sqlite3.Row | None:
             WHERE status IN ('pending', 'error')
               AND next_attempt_at <= ?
               AND retries < ?
-            ORDER BY updated_at ASC
+            ORDER BY
+              CASE WHEN minute_index < 0 THEN 1 ELSE 0 END ASC,
+              minute_index ASC,
+              updated_at ASC
             LIMIT 1
             """,
             (now_iso, OPENAI_MAX_RETRIES),
@@ -3099,6 +3163,152 @@ def db_update_minute_export_summary_path(
             """,
             (summary_json_path, now_iso, room_name, call_session_id, minute_index),
         )
+    finally:
+        conn.close()
+
+
+def db_force_finalize_session_for_reprocess(room_name: str, call_session_id: str, now_iso: str) -> None:
+    conn = read_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE sessions
+            SET room_end_received=1,
+                state='finalized',
+                ended_at=COALESCE(ended_at, ?),
+                finalized_at=COALESCE(finalized_at, ?),
+                updated_at=?
+            WHERE room_name=? AND (session_id=? OR call_session_id=?)
+            """,
+            (now_iso, now_iso, now_iso, room_name, call_session_id, call_session_id),
+        )
+        conn.execute(
+            """
+            UPDATE participants
+            SET state='ended',
+                ended_at=COALESCE(ended_at, ?),
+                finalized_at=COALESCE(finalized_at, ?),
+                updated_at=?
+            WHERE room_name=? AND session_id=?
+            """,
+            (now_iso, now_iso, now_iso, room_name, call_session_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def db_reset_summary_reprocess_state(room_name: str, call_session_id: str, now_iso: str) -> dict[str, int]:
+    conn = read_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        export_rows = conn.execute(
+            """
+            SELECT minute_index
+            FROM minute_exports
+            WHERE room_name=? AND session_id=? AND minute_index>=0
+            ORDER BY minute_index ASC
+            """,
+            (room_name, call_session_id),
+        ).fetchall()
+        minute_indexes = [int(row["minute_index"]) for row in export_rows]
+
+        conn.execute(
+            """
+            DELETE FROM summary_tasks
+            WHERE room_name=? AND session_id=? AND minute_index>=0
+              AND minute_index NOT IN (
+                SELECT minute_index
+                FROM minute_exports
+                WHERE room_name=? AND session_id=? AND minute_index>=0
+              )
+            """,
+            (room_name, call_session_id, room_name, call_session_id),
+        )
+        conn.execute(
+            """
+            UPDATE minute_exports
+            SET summary_json_path=NULL, updated_at=?
+            WHERE room_name=? AND session_id=? AND minute_index>=0
+            """,
+            (now_iso, room_name, call_session_id),
+        )
+        conn.execute(
+            """
+            UPDATE summary_tasks
+            SET status='pending',
+                retries=0,
+                next_attempt_at=?,
+                error_message=NULL,
+                updated_at=?
+            WHERE room_name=? AND session_id=?
+            """,
+            (now_iso, now_iso, room_name, call_session_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO summary_tasks(
+                room_name, session_id, minute_index,
+                status, retries, next_attempt_at,
+                error_message, created_at, updated_at
+            )
+            SELECT me.room_name, me.session_id, me.minute_index,
+                   'pending', 0, ?, NULL, ?, ?
+            FROM minute_exports me
+            LEFT JOIN summary_tasks st
+              ON st.room_name=me.room_name
+             AND st.session_id=me.session_id
+             AND st.minute_index=me.minute_index
+            WHERE me.room_name=? AND me.session_id=? AND me.minute_index>=0
+              AND st.minute_index IS NULL
+            """,
+            (now_iso, now_iso, now_iso, room_name, call_session_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO summary_tasks(
+                room_name, session_id, minute_index,
+                status, retries, next_attempt_at,
+                error_message, created_at, updated_at
+            )
+            SELECT ?, ?, -1, 'pending', 0, ?, NULL, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM summary_tasks
+                WHERE room_name=? AND session_id=? AND minute_index=-1
+            )
+            """,
+            (
+                room_name,
+                call_session_id,
+                now_iso,
+                now_iso,
+                now_iso,
+                room_name,
+                call_session_id,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE summary_tasks
+            SET status='pending',
+                retries=0,
+                next_attempt_at=?,
+                error_message=NULL,
+                updated_at=?
+            WHERE room_name=? AND session_id=? AND minute_index=-1
+            """,
+            (now_iso, now_iso, room_name, call_session_id),
+        )
+        conn.execute("COMMIT")
+        return {"minute_exports": len(minute_indexes)}
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
@@ -4849,6 +5059,257 @@ async def session_end(request: Request) -> JSONResponse:
 
     await finalize_entities(runtime.firebase_router, runtime.summary_engine)
     return JSONResponse({"status": "accepted"}, status_code=202)
+
+
+def build_summary_reprocess_status_payload(
+    task_rows: list[sqlite3.Row], minute_exports: list[sqlite3.Row]
+) -> dict:
+    minute_indexes = [
+        int(row["minute_index"]) for row in minute_exports if int(row["minute_index"]) >= 0
+    ]
+    minute_status_rows = {
+        int(row["minute_index"]): row for row in task_rows if int(row["minute_index"]) >= 0
+    }
+    progress = {
+        "total": len(minute_indexes),
+        "done": 0,
+        "pending": 0,
+        "processing": 0,
+        "error": 0,
+    }
+    minute_tasks: list[dict] = []
+    for minute_index in minute_indexes:
+        row = minute_status_rows.get(minute_index)
+        status = str(row["status"] if row is not None else "pending")
+        retries = int(row["retries"]) if row is not None and row["retries"] is not None else 0
+        error_message = str(row["error_message"] or "") if row is not None else ""
+        minute_tasks.append(
+            {
+                "minute_index": minute_index,
+                "status": status,
+                "retries": retries,
+                "error_message": error_message or None,
+            }
+        )
+        if status in progress:
+            progress[status] += 1
+        elif status == "done":
+            progress["done"] += 1
+        else:
+            progress["pending"] += 1
+
+    final_row = next((row for row in task_rows if int(row["minute_index"]) < 0), None)
+    final_status = str(final_row["status"] if final_row is not None else "pending")
+    final_retries = int(final_row["retries"]) if final_row is not None and final_row["retries"] is not None else 0
+    final_error = str(final_row["error_message"] or "") if final_row is not None else ""
+    final_exhausted = final_status == "error" and final_retries >= OPENAI_MAX_RETRIES
+    final_task = {
+        "status": final_status,
+        "retries": final_retries,
+        "max_retries": OPENAI_MAX_RETRIES,
+        "error_message": final_error or None,
+        "exhausted": final_exhausted,
+    }
+    if final_status == "done":
+        overall = "done"
+    elif final_exhausted:
+        overall = "error_exhausted"
+    elif final_status == "processing" or progress["processing"] > 0:
+        overall = "processing"
+    elif final_status == "error" or progress["error"] > 0:
+        overall = "error"
+    else:
+        overall = "pending"
+
+    return {
+        "overall_status": overall,
+        "progress": progress,
+        "final_task": final_task,
+        "minute_tasks": minute_tasks,
+    }
+
+
+@app.post("/v1/admin/summary/reprocess")
+async def admin_summary_reprocess(payload: AdminSummaryReprocessTarget) -> JSONResponse:
+    runtime: AppState = app.state.runtime
+    if not runtime.summary_engine.enabled:
+        raise HTTPException(status_code=409, detail="summary_engine_disabled")
+
+    session_row = await asyncio.to_thread(
+        db_get_session_row, payload.room_name, payload.call_session_id
+    )
+    if session_row is None:
+        raise HTTPException(status_code=404, detail="session_not_found")
+    routing = assert_admin_target_matches_session(payload, session_row)
+
+    now_iso = utc_now_iso()
+    if not str(session_row["finalized_at"] or "").strip():
+        await asyncio.to_thread(
+            db_force_finalize_session_for_reprocess,
+            payload.room_name,
+            payload.call_session_id,
+            now_iso,
+        )
+        session_row = await asyncio.to_thread(
+            db_get_session_row, payload.room_name, payload.call_session_id
+        )
+        if session_row is None:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        routing = assert_admin_target_matches_session(payload, session_row)
+
+    await asyncio.to_thread(
+        publish_session_minute_exports,
+        runtime.firebase_router,
+        payload.room_name,
+        payload.call_session_id,
+        now_iso,
+        True,
+        True,
+    )
+    reset_info = await asyncio.to_thread(
+        db_reset_summary_reprocess_state,
+        payload.room_name,
+        payload.call_session_id,
+        now_iso,
+    )
+    accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
+    await asyncio.to_thread(
+        runtime.firebase_router.upload_json,
+        routing,
+        accumulated_path,
+        {
+            "room_name": routing.room_name,
+            "transcript_session_id": routing.transcript_session_id,
+            "call_session_id": routing.call_session_id,
+            "last_minute_index": -1,
+            "summary": default_accumulated_summary_payload(),
+            "updated_at": now_iso,
+        },
+    )
+    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+    final_transcript_payload = await asyncio.to_thread(
+        build_final_transcript_payload,
+        payload.room_name,
+        payload.call_session_id,
+        routing.transcript_session_id,
+        now_iso,
+    )
+    await asyncio.to_thread(
+        runtime.firebase_router.upload_json,
+        routing,
+        final_transcript_path,
+        final_transcript_payload,
+    )
+    minute_exports = await asyncio.to_thread(
+        db_get_session_minute_exports, payload.room_name, payload.call_session_id
+    )
+    last_minute_index = (
+        max(
+            (int(row["minute_index"]) for row in minute_exports if int(row["minute_index"]) >= 0),
+            default=-1,
+        )
+        if minute_exports
+        else -1
+    )
+    await asyncio.to_thread(
+        runtime.firebase_router.publish_call_index,
+        routing=routing,
+        status="finalized",
+        last_minute_index=last_minute_index,
+        finalized=True,
+        final_summary_path=session_final_summary_path(routing.storage_base_path),
+        summary_accumulated_path=accumulated_path,
+        final_summary_ready=False,
+        final_transcript_path=final_transcript_path,
+        final_transcript_ready=True,
+    )
+    task_rows = await asyncio.to_thread(
+        db_get_summary_task_rows, payload.room_name, payload.call_session_id
+    )
+    snapshot = build_summary_reprocess_status_payload(task_rows, minute_exports)
+    snapshot["reset"] = reset_info
+    snapshot["queued_at"] = now_iso
+    snapshot["session"] = {
+        "namespace": payload.namespace,
+        "vertical": payload.vertical,
+        "slug": payload.slug,
+        "room_id": payload.room_id,
+        "call_session_id": payload.call_session_id,
+        "room_name": payload.room_name,
+    }
+    return JSONResponse(snapshot, status_code=202)
+
+
+@app.get("/v1/admin/summary/reprocess/status")
+async def admin_summary_reprocess_status(
+    namespace: str,
+    vertical: str,
+    slug: str,
+    room_id: str,
+    call_session_id: str,
+) -> JSONResponse:
+    runtime: AppState = app.state.runtime
+    try:
+        target = AdminSummaryReprocessTarget.model_validate(
+            {
+                "namespace": namespace,
+                "vertical": vertical,
+                "slug": slug,
+                "room_id": room_id,
+                "call_session_id": call_session_id,
+            }
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.errors()) from exc
+
+    session_row = await asyncio.to_thread(
+        db_get_session_row, target.room_name, target.call_session_id
+    )
+    if session_row is None:
+        raise HTTPException(status_code=404, detail="session_not_found")
+    routing = assert_admin_target_matches_session(target, session_row)
+
+    task_rows = await asyncio.to_thread(
+        db_get_summary_task_rows, target.room_name, target.call_session_id
+    )
+    minute_exports = await asyncio.to_thread(
+        db_get_session_minute_exports, target.room_name, target.call_session_id
+    )
+    payload = build_summary_reprocess_status_payload(task_rows, minute_exports)
+    payload["session"] = {
+        "namespace": target.namespace,
+        "vertical": target.vertical,
+        "slug": target.slug,
+        "room_id": target.room_id,
+        "call_session_id": target.call_session_id,
+        "room_name": target.room_name,
+    }
+
+    final_task = payload["final_task"]
+    if final_task["status"] == "done":
+        final_payload = await asyncio.to_thread(
+            runtime.firebase_router.fetch_json,
+            routing,
+            session_final_summary_path(routing.storage_base_path),
+        )
+        if isinstance(final_payload, dict):
+            payload["final_summary"] = final_payload.get("summary")
+
+    if final_task["exhausted"]:
+        temp_payload = await asyncio.to_thread(
+            runtime.firebase_router.fetch_json,
+            routing,
+            session_final_summary_temp_path(routing.storage_base_path),
+        )
+        if isinstance(temp_payload, dict):
+            payload["final_error_details"] = {
+                "error": temp_payload.get("error"),
+                "model": temp_payload.get("model"),
+                "kind": temp_payload.get("kind"),
+                "updated_at": temp_payload.get("updated_at"),
+            }
+
+    return JSONResponse(payload, status_code=200)
 
 
 
