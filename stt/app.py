@@ -400,7 +400,7 @@ SUMMARY_SCHEMA_FINAL = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "title": {"type": "string"},
+        "title": {"type": "string", "enum": ["Resumo Final Executivo da Chamada"]},
         "conversation_types": {
             "type": "array",
             "items": {"type": "string", "enum": SUMMARY_CONVERSATION_TYPE_ENUM},

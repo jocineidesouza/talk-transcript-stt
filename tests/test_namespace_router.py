@@ -1002,6 +1002,10 @@ class SummaryEngineRetryTests(unittest.TestCase):
         body_final = json.loads(req_final.data.decode("utf-8"))
         self.assertEqual(body_final["text"]["format"]["name"], "summary_final_v1")
         self.assertIn("executive_summary", body_final["text"]["format"]["schema"]["required"])
+        self.assertEqual(
+            body_final["text"]["format"]["schema"]["properties"]["title"]["enum"],
+            ["Resumo Final Executivo da Chamada"],
+        )
 
     def test_request_text_raises_on_model_refusal(self):
         engine = self.build_engine()
@@ -1062,6 +1066,16 @@ class SummaryEngineRetryTests(unittest.TestCase):
         ):
             with self.assertRaises(STT_APP.SummaryContractValidationError):
                 engine._request_json(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
+
+    def test_request_text_fail_closed_when_model_returns_empty_output(self):
+        engine = self.build_engine()
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output": []}),
+        ):
+            with self.assertRaises(RuntimeError):
+                engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "minute-model", "system", "user")
 
     def test_request_json_raises_typed_contract_error_with_raw_output(self):
         engine = self.build_engine()
