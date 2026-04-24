@@ -755,6 +755,39 @@ class SummarySchemaValidationTests(unittest.TestCase):
         normalized = STT_APP.validate_accumulated_summary_payload(payload)
         self.assertEqual(normalized["topics"][0]["status"], "active")
 
+    def test_validate_accumulated_summary_payload_infers_missing_topic_from_item_reference(self):
+        payload = {
+            "conversation_types": ["mista"],
+            "topics": [
+                {
+                    "name": "Escopo do projeto",
+                    "summary": "Escopo consolidado da fase inicial.",
+                    "status": "active",
+                    "tags": ["escopo"],
+                }
+            ],
+            "facts": [
+                {
+                    "text": "Aprovado seguir com homologacao.",
+                    "confidence": "high",
+                    "status": "confirmed",
+                    "tags": ["homologacao"],
+                    "topic": "Homologacao",
+                }
+            ],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        normalized = STT_APP.validate_accumulated_summary_payload(payload)
+        self.assertEqual(normalized["facts"][0]["name"], "Homologacao")
+        self.assertIn(
+            "Homologacao",
+            {topic["name"] for topic in normalized["topics"]},
+        )
+
     def test_validate_minute_summary_payload_rejects_invalid_topic_status(self):
         payload = {
             "chunk_type": "mista",

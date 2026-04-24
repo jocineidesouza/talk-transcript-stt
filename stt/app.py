@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -761,6 +762,79 @@ def validate_topic_reference(
         raise RuntimeError(f"{key}[{index}].name deve corresponder a um topics[].name")
 
 
+def _canonical_topic_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    no_accents = "".join(char for char in normalized if not unicodedata.combining(char))
+    simplified = re.sub(r"[^\w\s]", " ", no_accents.casefold())
+    return re.sub(r"\s+", " ", simplified).strip()
+
+
+def reconcile_accumulated_topics_and_references(
+    topics: list[dict],
+    sections: dict[str, list[dict]],
+) -> tuple[list[dict], dict[str, list[dict]]]:
+    canonical_to_topic: dict[str, str] = {}
+    ambiguous_keys: set[str] = set()
+    for topic in topics:
+        name = str(topic.get("name", "")).strip()
+        if not name:
+            continue
+        canonical = _canonical_topic_key(name)
+        if not canonical:
+            continue
+        existing = canonical_to_topic.get(canonical)
+        if existing is None:
+            canonical_to_topic[canonical] = name
+            continue
+        if existing != name:
+            ambiguous_keys.add(canonical)
+    for key in ambiguous_keys:
+        canonical_to_topic.pop(key, None)
+
+    topic_names = {str(topic.get("name", "")).strip() for topic in topics if isinstance(topic, dict)}
+    inferred_topics: list[str] = []
+    for section_key, items in sections.items():
+        for item in items:
+            raw_name = item.get("name")
+            if not isinstance(raw_name, str):
+                continue
+            resolved_name = raw_name.strip()
+            if resolved_name in topic_names:
+                item["name"] = resolved_name
+                continue
+            canonical = _canonical_topic_key(resolved_name)
+            mapped_name = canonical_to_topic.get(canonical) if canonical else None
+            if mapped_name:
+                item["name"] = mapped_name
+                logger.warning(
+                    "summary topic reference normalized section=%s from=%s to=%s",
+                    section_key,
+                    resolved_name,
+                    mapped_name,
+                )
+                continue
+            if resolved_name in inferred_topics:
+                continue
+            inferred_topics.append(resolved_name)
+
+    if inferred_topics:
+        for inferred_name in inferred_topics:
+            topics.append(
+                {
+                    "name": inferred_name,
+                    "summary": "Topico inferido automaticamente para manter consistencia referencial.",
+                    "status": "uncertain",
+                    "tags": ["auto_topic"],
+                }
+            )
+        logger.warning(
+            "summary inferred missing topics count=%s names=%s",
+            len(inferred_topics),
+            inferred_topics,
+        )
+    return topics, sections
+
+
 def validate_final_topic_item(item: Any, label: str) -> dict:
     if not isinstance(item, dict):
         raise RuntimeError(f"{label} deve ser objeto")
@@ -948,7 +1022,6 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
         SUMMARY_ALLOWED_TOPIC_STATUS_ACCUMULATED,
         240,
     )
-    topic_names = {topic["name"] for topic in topics}
     facts = validate_summary_list(
         payload.get("facts"),
         "facts",
@@ -997,6 +1070,24 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
             item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True, True
         ),
     )
+    topics, section_map = reconcile_accumulated_topics_and_references(
+        topics,
+        {
+            "facts": facts,
+            "hypotheses": hypotheses,
+            "decisions": decisions,
+            "open_items": open_items,
+            "next_steps": next_steps,
+            "notes": notes,
+        },
+    )
+    facts = section_map["facts"]
+    hypotheses = section_map["hypotheses"]
+    decisions = section_map["decisions"]
+    open_items = section_map["open_items"]
+    next_steps = section_map["next_steps"]
+    notes = section_map["notes"]
+    topic_names = {topic["name"] for topic in topics}
     validate_topic_reference(facts, "facts", topic_names)
     validate_topic_reference(hypotheses, "hypotheses", topic_names)
     validate_topic_reference(decisions, "decisions", topic_names)
