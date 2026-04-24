@@ -431,7 +431,7 @@ class SummarySchemaValidationTests(unittest.TestCase):
     def test_parse_and_validate_summary_output_accepts_final_payload(self):
         raw = json.dumps(
             {
-                "title": "Resumo Final Executivo da Chamada",
+                "title": "Resumo Executivo: Cronograma de entrega",
                 "conversation_types": ["executiva"],
                 "executive_summary": "Resumo objetivo da reuniao.",
                 "topics": [
@@ -459,7 +459,7 @@ class SummarySchemaValidationTests(unittest.TestCase):
             }
         )
         parsed = STT_APP.parse_and_validate_summary_output(STT_APP.SUMMARY_KIND_FINAL, raw)
-        self.assertEqual(parsed["title"], "Resumo Final Executivo da Chamada")
+        self.assertEqual(parsed["title"], "Resumo Executivo: Cronograma de entrega")
         self.assertEqual(parsed["topics"][0]["name"], "Cronograma de entrega")
 
     def test_validate_minute_summary_payload_allows_more_than_six_topics(self):
@@ -1035,10 +1035,11 @@ class SummaryEngineRetryTests(unittest.TestCase):
         body_final = json.loads(req_final.data.decode("utf-8"))
         self.assertEqual(body_final["text"]["format"]["name"], "summary_final_v1")
         self.assertIn("executive_summary", body_final["text"]["format"]["schema"]["required"])
-        self.assertEqual(
-            body_final["text"]["format"]["schema"]["properties"]["title"]["enum"],
-            ["Resumo Final Executivo da Chamada"],
-        )
+        title_schema = body_final["text"]["format"]["schema"]["properties"]["title"]
+        self.assertEqual(title_schema["type"], "string")
+        self.assertEqual(title_schema["minLength"], STT_APP.SUMMARY_FINAL_TITLE_MIN_CHARS)
+        self.assertEqual(title_schema["maxLength"], STT_APP.SUMMARY_FINAL_TITLE_MAX_CHARS)
+        self.assertNotIn("enum", title_schema)
 
     def test_request_text_raises_on_model_refusal(self):
         engine = self.build_engine()
@@ -1464,6 +1465,8 @@ class SummaryFinalResilienceTests(unittest.TestCase):
             [2, 5],
             ["acumulado reconstruido"],
         )
+        self.assertTrue(final_payload["title"].startswith("Documento Parcial:"))
+        self.assertIn("Cronograma", final_payload["title"])
         self.assertIn("Documento parcial", final_payload["executive_summary"])
         self.assertTrue(
             any("Ata parcial" in note["text"] for note in final_payload["additional_notes"])

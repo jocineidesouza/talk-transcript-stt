@@ -242,7 +242,7 @@ Regras obrigatorias:
 - Para cada assunto, incluir decisoes, pending_items e next_steps quando existirem.
 - Se nao houver decisao explicita global, inserir exatamente:
   "Nenhuma decisao explicita foi registrada."
-- title deve ser exatamente: "Resumo Final Executivo da Chamada".
+- title deve ser um titulo curto, especifico da chamada e alinhado ao principal assunto discutido.
 - conversation_types deve refletir o estado acumulado.
 - Limites: text max 280 caracteres; tags entre 0 e 4 itens; maximo 12 itens por categoria.
 - Retornar arrays vazios quando categoria nao tiver itens (exceto regra de global_decisions acima).
@@ -264,6 +264,9 @@ SUMMARY_RESPONSE_FORMAT_NAME_BY_KIND = {
 
 SUMMARY_STRING_ARRAY_SCHEMA = {"type": "array", "items": {"type": "string"}}
 SUMMARY_CONVERSATION_TYPE_ENUM = ["tecnica", "executiva", "operacional", "comercial", "mista"]
+SUMMARY_FINAL_TITLE_MIN_CHARS = 8
+SUMMARY_FINAL_TITLE_MAX_CHARS = 120
+SUMMARY_FINAL_TITLE_FALLBACK = "Ata da reunião"
 
 
 def _topic_schema(topic_status: list[str]) -> dict:
@@ -401,7 +404,11 @@ SUMMARY_SCHEMA_FINAL = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "title": {"type": "string", "enum": ["Resumo Final Executivo da Chamada"]},
+        "title": {
+            "type": "string",
+            "minLength": SUMMARY_FINAL_TITLE_MIN_CHARS,
+            "maxLength": SUMMARY_FINAL_TITLE_MAX_CHARS,
+        },
         "conversation_types": {
             "type": "array",
             "items": {"type": "string", "enum": SUMMARY_CONVERSATION_TYPE_ENUM},
@@ -1122,8 +1129,15 @@ def validate_final_summary_payload(payload: dict) -> dict:
         if key not in payload:
             raise RuntimeError(f"{SUMMARY_KIND_FINAL}: campo obrigatorio ausente: {key}")
     title = payload.get("title")
-    if title != "Resumo Final Executivo da Chamada":
-        raise RuntimeError("final.title invalido")
+    if not isinstance(title, str):
+        raise RuntimeError("final.title deve ser string")
+    title = title.strip()
+    if not title:
+        raise RuntimeError("final.title nao pode ser vazio")
+    if len(title) < SUMMARY_FINAL_TITLE_MIN_CHARS:
+        raise RuntimeError(f"final.title deve ter ao menos {SUMMARY_FINAL_TITLE_MIN_CHARS} caracteres")
+    if len(title) > SUMMARY_FINAL_TITLE_MAX_CHARS:
+        raise RuntimeError(f"final.title excede {SUMMARY_FINAL_TITLE_MAX_CHARS} caracteres")
     conversation_types_raw = payload.get("conversation_types")
     if not isinstance(conversation_types_raw, list):
         raise RuntimeError("final.conversation_types deve ser array")
@@ -3938,6 +3952,56 @@ def _minutes_label(minutes: list[int]) -> str:
     return ", ".join(str(minute) for minute in unique)
 
 
+def _truncate_final_title(title: str) -> str:
+    clean = title.strip()
+    if len(clean) <= SUMMARY_FINAL_TITLE_MAX_CHARS:
+        return clean
+    return clean[: SUMMARY_FINAL_TITLE_MAX_CHARS - 3].rstrip() + "..."
+
+
+def _build_deterministic_final_title(accumulated_summary: dict, missing_minutes: list[int]) -> str:
+    topic_names: list[str] = []
+    seen: set[str] = set()
+    for topic in accumulated_summary.get("topics", []):
+        if not isinstance(topic, dict):
+            continue
+        name = str(topic.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        topic_names.append(name)
+        if len(topic_names) >= 2:
+            break
+
+    if len(topic_names) >= 2:
+        base_title = f"Resumo Executivo: {topic_names[0]} e {topic_names[1]}"
+    elif topic_names:
+        base_title = f"Resumo Executivo: {topic_names[0]}"
+    else:
+        conversation_types_raw = accumulated_summary.get("conversation_types")
+        conversation_type = ""
+        if isinstance(conversation_types_raw, list):
+            for item in conversation_types_raw:
+                if isinstance(item, str) and item in SUMMARY_ALLOWED_TYPES:
+                    conversation_type = item
+                    break
+        type_label_map = {
+            "tecnica": "Tecnico",
+            "executiva": "Executivo",
+            "operacional": "Operacional",
+            "comercial": "Comercial",
+            "mista": "Misto",
+        }
+        type_label = type_label_map.get(conversation_type)
+        base_title = (
+            f"Resumo {type_label} da Chamada" if type_label else SUMMARY_FINAL_TITLE_FALLBACK
+        )
+
+    if missing_minutes:
+        base_title = f"Documento Parcial: {base_title}"
+    return _truncate_final_title(base_title)
+
+
 def _build_degradation_additional_note(missing_minutes: list[int], reasons: list[str]) -> dict:
     minute_label = _minutes_label(missing_minutes)
     reason = reasons[0] if reasons else "houve falha na consolidacao total da chamada"
@@ -4171,7 +4235,7 @@ def build_deterministic_final_summary(
         )
 
     payload = {
-        "title": "Resumo Final Executivo da Chamada",
+        "title": _build_deterministic_final_title(normalized_acc, missing_minutes),
         "conversation_types": normalized_acc.get("conversation_types", []),
         "executive_summary": executive_summary,
         "topics": final_topics,
