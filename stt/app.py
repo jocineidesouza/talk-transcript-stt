@@ -94,7 +94,7 @@ SUMMARY_MODEL_FINAL = os.environ.get(
     "SUMMARY_MODEL_FINAL", "gpt-4.1-mini"
 ).strip()
 SUMMARY_MODEL_FINAL_TEXT = os.environ.get(
-    "SUMMARY_MODEL_FINAL_TEXT", "deepseek/deepseek-v4-flash"
+    "SUMMARY_MODEL_FINAL_TEXT", "gpt-4.1-mini"
 ).strip()
 SUMMARY_FINAL_TEXT_FORMAT = os.environ.get("SUMMARY_FINAL_TEXT_FORMAT", "markdown").strip().lower()
 if SUMMARY_FINAL_TEXT_FORMAT not in {"markdown", "html", "text"}:
@@ -4808,6 +4808,9 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
 
 async def run_summary_reconciliation_once() -> None:
     now_iso = utc_now_iso()
+    queued_count = 0
+    reopened_count = 0
+    late_requeued_count = 0
     recovered = await asyncio.to_thread(
         db_recover_stale_summary_tasks,
         now_iso,
@@ -4837,6 +4840,7 @@ async def run_summary_reconciliation_once() -> None:
                 False,
             )
             if queued:
+                queued_count += 1
                 logger.info(
                     "summary reconcile queued missing final task room=%s session=%s minute=-1",
                     room_name,
@@ -4846,10 +4850,12 @@ async def run_summary_reconciliation_once() -> None:
 
         final_status = str(final_row["status"] or "")
         final_retries = int(final_row["retries"] or 0)
+        final_error_message = str(final_row["error_message"] or "")
         if (
             final_status == "error"
             and final_retries >= SUMMARY_MAX_RETRIES
             and SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK
+            and "ata final markdown" not in final_error_message.lower()
         ):
             reopened = await asyncio.to_thread(
                 db_schedule_final_summary_task,
@@ -4859,6 +4865,7 @@ async def run_summary_reconciliation_once() -> None:
                 True,
             )
             if reopened:
+                reopened_count += 1
                 logger.warning(
                     "summary reconcile reopened exhausted final task room=%s session=%s",
                     room_name,
@@ -4887,11 +4894,20 @@ async def run_summary_reconciliation_once() -> None:
             True,
         )
         if reopened:
+            late_requeued_count += 1
             logger.info(
                 "summary reconcile requeued final task after late minute room=%s session=%s",
                 room_name,
                 call_session_id,
             )
+    logger.info(
+        "Reconciliando summaries: recovered=%s sessions=%s queued=%s reopened=%s late_requeued=%s",
+        recovered,
+        len(finalized_sessions),
+        queued_count,
+        reopened_count,
+        late_requeued_count,
+    )
 
 
 async def summary_worker_loop(
@@ -4903,6 +4919,14 @@ async def summary_worker_loop(
         "summary worker started enabled=%s provider=%s",
         summary_engine.enabled,
         summary_engine.provider,
+    )
+    logger.info("iniciando geração do sumario")
+    logger.info(
+        "modelos: { minuto: %s, acumulado: %s, final: %s, final_text: %s }",
+        summary_engine.minute_model,
+        summary_engine.accumulated_model,
+        summary_engine.final_model,
+        summary_engine.final_text_model,
     )
     next_reconcile_at = 0.0
     while not stop_event.is_set():
@@ -4953,11 +4977,33 @@ async def summary_worker_loop(
                 minute_system_prompt = await asyncio.to_thread(
                     firebase_router.fetch_agent_prompt, routing, "stt_summarize_minute"
                 )
+                logger.info(
+                    "Gerando o sumario do %04d room=%s session=%s model=%s",
+                    minute_index,
+                    room_name,
+                    call_session_id,
+                    summary_engine.minute_model,
+                )
+                summary_started_at = time.monotonic()
                 minute_summary = await asyncio.to_thread(
                     summary_engine.summarize_minute, lines, minute_system_prompt
                 )
+                logger.info(
+                    "Gerando o sumario do %04d duration_seconds=%.3f room=%s session=%s",
+                    minute_index,
+                    time.monotonic() - summary_started_at,
+                    room_name,
+                    call_session_id,
+                )
                 summary_path = export_row["summary_json_path"] or (
                     join_storage_path(routing.storage_base_path, f"minutes/{minute_index:04d}/summary.json")
+                )
+                logger.info(
+                    "enviando sumario do %04d para o storage room=%s session=%s path=%s",
+                    minute_index,
+                    room_name,
+                    call_session_id,
+                    summary_path,
                 )
                 await asyncio.to_thread(
                     firebase_router.upload_json,
@@ -4972,6 +5018,12 @@ async def summary_worker_loop(
                         "updated_at": now_iso,
                     },
                 )
+                logger.info(
+                    "registrando metadata sumario do %04d room=%s session=%s",
+                    minute_index,
+                    room_name,
+                    call_session_id,
+                )
                 await asyncio.to_thread(
                     db_update_minute_export_summary_path,
                     room_name,
@@ -4979,6 +5031,12 @@ async def summary_worker_loop(
                     minute_index,
                     summary_path,
                     now_iso,
+                )
+                logger.info(
+                    "metadata sumario do %04d registrada room=%s session=%s",
+                    minute_index,
+                    room_name,
+                    call_session_id,
                 )
 
                 accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
@@ -4993,11 +5051,33 @@ async def summary_worker_loop(
                 merge_system_prompt = await asyncio.to_thread(
                     firebase_router.fetch_agent_prompt, routing, "stt_merge_summaries"
                 )
+                logger.info(
+                    "Gerando acumulado até minuto %04d room=%s session=%s model=%s",
+                    minute_index,
+                    room_name,
+                    call_session_id,
+                    summary_engine.accumulated_model,
+                )
+                accumulated_started_at = time.monotonic()
                 merged_summary = await asyncio.to_thread(
                     summary_engine.merge_summaries,
                     previous_summary,
                     minute_summary,
                     merge_system_prompt,
+                )
+                logger.info(
+                    "Gerando acumulado até minuto %04d duration_seconds=%.3f room=%s session=%s",
+                    minute_index,
+                    time.monotonic() - accumulated_started_at,
+                    room_name,
+                    call_session_id,
+                )
+                logger.info(
+                    "enviando sumario acumulado até %04d para o storage room=%s session=%s path=%s",
+                    minute_index,
+                    room_name,
+                    call_session_id,
+                    accumulated_path,
                 )
                 await asyncio.to_thread(
                     firebase_router.upload_json,
@@ -5012,6 +5092,12 @@ async def summary_worker_loop(
                         "updated_at": now_iso,
                     },
                 )
+                logger.info(
+                    "registrando metadata sumario acumulado até %04d no firestore room=%s session=%s",
+                    minute_index,
+                    room_name,
+                    call_session_id,
+                )
                 await asyncio.to_thread(
                     firebase_router.publish_call_index,
                     routing=routing,
@@ -5024,6 +5110,12 @@ async def summary_worker_loop(
                     final_transcript_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
                     final_summary_text_path=None if not session_is_finalized else CALL_INDEX_UNSET,
                     final_summary_text_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
+                )
+                logger.info(
+                    "metadata sumario acumulado até %04d registrada no firestore room=%s session=%s",
+                    minute_index,
+                    room_name,
+                    call_session_id,
                 )
                 if session_is_finalized and SUMMARY_FINAL_REEMIT_ON_LATE_MINUTES:
                     await asyncio.to_thread(
@@ -5175,22 +5267,56 @@ async def summary_worker_loop(
                 final_temp_path = session_final_summary_temp_path(routing.storage_base_path)
                 final_summary_text_path = session_final_summary_text_path(routing.storage_base_path)
                 final_summary: dict | None = None
+                final_payload = await asyncio.to_thread(
+                    firebase_router.fetch_json, routing, final_path
+                )
+                if isinstance(final_payload, dict) and isinstance(final_payload.get("summary"), dict):
+                    try:
+                        final_summary = validate_final_summary_payload(final_payload["summary"])
+                        logger.info(
+                            "Ata final existente reutilizada room=%s session=%s path=%s",
+                            room_name,
+                            call_session_id,
+                            final_path,
+                        )
+                    except RuntimeError as exc:
+                        logger.warning(
+                            "final_summary.json existente invalido; gerando novamente room=%s session=%s path=%s error=%s",
+                            room_name,
+                            call_session_id,
+                            final_path,
+                            exc,
+                        )
                 try:
-                    final_system_prompt = await asyncio.to_thread(
-                        firebase_router.fetch_agent_prompt,
-                        routing,
-                        "stt_finalize_summary",
-                    )
-                    final_summary = await asyncio.to_thread(
-                        summary_engine.finalize_summary,
-                        merged_summary,
-                        final_system_prompt,
-                    )
-                    final_summary = inject_degradation_disclosure(
-                        final_summary,
-                        missing_minutes,
-                        recovery_reasons,
-                    )
+                    if final_summary is None:
+                        logger.info(
+                            "Gerando Ata final room=%s session=%s model=%s",
+                            room_name,
+                            call_session_id,
+                            summary_engine.final_model,
+                        )
+                        final_system_prompt = await asyncio.to_thread(
+                            firebase_router.fetch_agent_prompt,
+                            routing,
+                            "stt_finalize_summary",
+                        )
+                        final_started_at = time.monotonic()
+                        final_summary = await asyncio.to_thread(
+                            summary_engine.finalize_summary,
+                            merged_summary,
+                            final_system_prompt,
+                        )
+                        logger.info(
+                            "gerando final_summary.json duration_seconds=%.3f room=%s session=%s",
+                            time.monotonic() - final_started_at,
+                            room_name,
+                            call_session_id,
+                        )
+                        final_summary = inject_degradation_disclosure(
+                            final_summary,
+                            missing_minutes,
+                            recovery_reasons,
+                        )
                 except SummaryContractValidationError as exc:
                     logger.warning(
                         "final summary contract invalid room=%s session=%s model=%s kind=%s error=%s",
@@ -5209,6 +5335,12 @@ async def summary_worker_loop(
                         error=str(exc),
                         raw_output=exc.raw_output,
                         updated_at=now_iso,
+                    )
+                    logger.warning(
+                        "enviando ata final temp json para o storage room=%s session=%s path=%s",
+                        room_name,
+                        call_session_id,
+                        final_temp_path,
                     )
                     await asyncio.to_thread(
                         firebase_router.upload_json,
@@ -5237,6 +5369,7 @@ async def summary_worker_loop(
                         call_session_id,
                         final_temp_path,
                     )
+                    raise RuntimeError(f"falha de contrato na ata final: {exc}") from exc
                 except Exception as exc:  # pylint: disable=broad-except
                     if not SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK:
                         raise
@@ -5255,6 +5388,12 @@ async def summary_worker_loop(
                     )
 
                 if final_summary is not None:
+                    logger.info(
+                        "enviando ata final json para o storage room=%s session=%s path=%s",
+                        room_name,
+                        call_session_id,
+                        final_path,
+                    )
                     await asyncio.to_thread(
                         firebase_router.upload_json,
                         routing,
@@ -5267,13 +5406,28 @@ async def summary_worker_loop(
                             "updated_at": now_iso,
                         },
                     )
+                    logger.info(
+                        "ata final json enviada para o storage room=%s session=%s path=%s",
+                        room_name,
+                        call_session_id,
+                        final_path,
+                    )
                     final_summary_text_ready = False
+                    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
                     try:
                         final_text_system_prompt = await asyncio.to_thread(
                             firebase_router.fetch_agent_prompt,
                             routing,
                             "stt_finalize_summary_text",
                         )
+                        logger.info(
+                            "gerando final_summary_text.txt room=%s session=%s model=%s format=%s",
+                            room_name,
+                            call_session_id,
+                            summary_engine.final_text_model,
+                            SUMMARY_FINAL_TEXT_FORMAT,
+                        )
+                        final_text_started_at = time.monotonic()
                         final_summary_text = await asyncio.to_thread(
                             summary_engine.finalize_summary_text,
                             {
@@ -5285,6 +5439,18 @@ async def summary_worker_loop(
                             },
                             SUMMARY_FINAL_TEXT_FORMAT,
                             final_text_system_prompt,
+                        )
+                        logger.info(
+                            "gerando final_summary_text.txt duration_seconds=%.3f room=%s session=%s",
+                            time.monotonic() - final_text_started_at,
+                            room_name,
+                            call_session_id,
+                        )
+                        logger.info(
+                            "enviando ata final markdown para o storage room=%s session=%s path=%s",
+                            room_name,
+                            call_session_id,
+                            final_summary_text_path,
                         )
                         await asyncio.to_thread(
                             firebase_router.upload_text,
@@ -5310,7 +5476,37 @@ async def summary_worker_loop(
                             SUMMARY_FINAL_TEXT_FORMAT,
                             exc,
                         )
-                    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+                        await asyncio.to_thread(
+                            firebase_router.publish_call_index,
+                            routing=routing,
+                            status="finalized",
+                            last_minute_index=exports[-1]["minute_index"] if exports else -1,
+                            finalized=True,
+                            final_summary_path=final_path,
+                            summary_accumulated_path=accumulated_path,
+                            final_summary_ready=True,
+                            final_transcript_path=final_transcript_path,
+                            final_transcript_ready=True,
+                            final_summary_text_path=final_summary_text_path,
+                            final_summary_text_ready=False,
+                        )
+                        logger.info(
+                            "registrando metadata ata final markdown no firestore room=%s session=%s ready=false",
+                            room_name,
+                            call_session_id,
+                        )
+                        raise RuntimeError(f"falha ao gerar/enviar ata final markdown: {exc}") from exc
+                    logger.info(
+                        "registrando metadata ata final json no firestore room=%s session=%s",
+                        room_name,
+                        call_session_id,
+                    )
+                    logger.info(
+                        "registrando metadata ata final markdown no firestore room=%s session=%s ready=%s",
+                        room_name,
+                        call_session_id,
+                        final_summary_text_ready,
+                    )
                     await asyncio.to_thread(
                         firebase_router.publish_call_index,
                         routing=routing,
@@ -5326,6 +5522,13 @@ async def summary_worker_loop(
                         final_summary_text_ready=final_summary_text_ready,
                     )
                     logger.info(
+                        "metadata ata final registrada no firestore room=%s session=%s final_summary_ready=%s final_summary_text_ready=%s",
+                        room_name,
+                        call_session_id,
+                        True,
+                        final_summary_text_ready,
+                    )
+                    logger.info(
                         "final summary uploaded room=%s session=%s path=%s partial=%s",
                         room_name,
                         call_session_id,
@@ -5337,11 +5540,19 @@ async def summary_worker_loop(
                 db_mark_summary_task_done, room_name, call_session_id, minute_index, utc_now_iso()
             )
         except Exception as exc:  # pylint: disable=broad-except
+            retry_count = retries + 1
+            error_now_iso = utc_now_iso()
+            next_attempt_iso = (
+                parse_iso_datetime(error_now_iso) + timedelta(seconds=15 * retry_count)
+            ).isoformat()
             logger.exception(
-                "summary task failed room=%s session=%s minute=%s error=%s",
+                "summary task failed room=%s session=%s minute=%s attempt=%s/%s next_attempt_at=%s error=%s",
                 room_name,
                 call_session_id,
                 minute_index,
+                retry_count,
+                SUMMARY_MAX_RETRIES,
+                next_attempt_iso,
                 exc,
             )
             await asyncio.to_thread(
@@ -5349,10 +5560,19 @@ async def summary_worker_loop(
                 room_name,
                 call_session_id,
                 minute_index,
-                retries + 1,
+                retry_count,
                 str(exc),
-                utc_now_iso(),
+                error_now_iso,
             )
+            if retry_count >= SUMMARY_MAX_RETRIES:
+                logger.error(
+                    "summary task retries exhausted room=%s session=%s minute=%s retries=%s error=%s",
+                    room_name,
+                    call_session_id,
+                    minute_index,
+                    retry_count,
+                    exc,
+                )
     logger.info("summary worker stopped")
 
 

@@ -2003,9 +2003,21 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         done_calls: list[tuple[str, str, int]] = []
+        error_calls: list[tuple[str, str, int, int, str]] = []
 
         def fake_mark_done(room_name: str, call_session_id: str, minute_index: int, _now_iso: str):
             done_calls.append((room_name, call_session_id, minute_index))
+            stop_event.set()
+
+        def fake_mark_error(
+            room_name: str,
+            call_session_id: str,
+            minute_index: int,
+            retries: int,
+            error_message: str,
+            _now_iso: str,
+        ):
+            error_calls.append((room_name, call_session_id, minute_index, retries, error_message))
             stop_event.set()
 
         with patch.object(STT_APP, "run_summary_reconciliation_once", new=AsyncMock()):
@@ -2015,14 +2027,20 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
                         with patch.object(STT_APP, "db_get_summary_task_rows", return_value=final_task_rows):
                             with patch.object(STT_APP, "db_get_session_minute_exports", return_value=[]):
                                 with patch.object(STT_APP, "db_mark_summary_task_done", side_effect=fake_mark_done):
-                                    with patch.object(STT_APP, "db_mark_summary_task_error") as mark_error_mock:
+                                    with patch.object(
+                                        STT_APP,
+                                        "db_mark_summary_task_error",
+                                        side_effect=fake_mark_error,
+                                    ):
                                         await asyncio.wait_for(
                                             STT_APP.summary_worker_loop(stop_event, router, summary_engine),
                                             timeout=2,
                                         )
 
-        self.assertEqual(done_calls, [("talk__dev__roomA", "RM_session-1", -1)])
-        mark_error_mock.assert_not_called()
+        self.assertEqual(done_calls, [])
+        self.assertEqual(len(error_calls), 1)
+        self.assertEqual(error_calls[0][:4], ("talk__dev__roomA", "RM_session-1", -1, 1))
+        self.assertIn("falha de contrato", error_calls[0][4])
 
         upload_paths = [call.args[1] for call in router.upload_json.call_args_list]
         self.assertIn(
@@ -2158,7 +2176,7 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
             STT_APP.session_final_summary_text_path(routing.storage_base_path),
         )
 
-    async def test_final_summary_text_failure_marks_text_not_ready_without_failing_task(self):
+    async def test_final_summary_text_failure_marks_task_error_for_retry(self):
         stop_event = asyncio.Event()
         routing = STT_APP.RoomRoutingContext(
             namespace="talk__dev",
@@ -2222,6 +2240,115 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         done_calls: list[tuple[str, str, int]] = []
+        error_calls: list[tuple[str, str, int, int, str]] = []
+
+        def fake_mark_done(room_name: str, call_session_id: str, minute_index: int, _now_iso: str):
+            done_calls.append((room_name, call_session_id, minute_index))
+            stop_event.set()
+
+        def fake_mark_error(
+            room_name: str,
+            call_session_id: str,
+            minute_index: int,
+            retries: int,
+            error_message: str,
+            _now_iso: str,
+        ):
+            error_calls.append((room_name, call_session_id, minute_index, retries, error_message))
+            stop_event.set()
+
+        with patch.object(STT_APP, "run_summary_reconciliation_once", new=AsyncMock()):
+            with patch.object(STT_APP, "db_claim_summary_task", side_effect=fake_claim_summary_task):
+                with patch.object(STT_APP, "db_get_session_row", return_value=session_row):
+                    with patch.object(STT_APP, "routing_context_from_session_row", return_value=routing):
+                        with patch.object(STT_APP, "db_get_summary_task_rows", return_value=final_task_rows):
+                            with patch.object(STT_APP, "db_get_session_minute_exports", return_value=[]):
+                                with patch.object(STT_APP, "db_mark_summary_task_done", side_effect=fake_mark_done):
+                                    with patch.object(
+                                        STT_APP,
+                                        "db_mark_summary_task_error",
+                                        side_effect=fake_mark_error,
+                                    ):
+                                        await asyncio.wait_for(
+                                            STT_APP.summary_worker_loop(stop_event, router, summary_engine),
+                                            timeout=2,
+                                        )
+
+        self.assertEqual(done_calls, [])
+        self.assertEqual(len(error_calls), 1)
+        self.assertEqual(error_calls[0][:4], ("talk__dev__roomA", "RM_session-1", -1, 1))
+        self.assertIn("falha ao gerar/enviar ata final markdown", error_calls[0][4])
+        router.upload_text.assert_not_called()
+        publish_kwargs = router.publish_call_index.call_args.kwargs
+        self.assertTrue(publish_kwargs["final_summary_ready"])
+        self.assertFalse(publish_kwargs["final_summary_text_ready"])
+
+    async def test_final_summary_text_retry_reuses_existing_final_summary_json(self):
+        stop_event = asyncio.Event()
+        routing = STT_APP.RoomRoutingContext(
+            namespace="talk__dev",
+            room_name="talk__dev__roomA",
+            room_id="roomA",
+            call_session_id="RM_session-1",
+            transcript_session_id="session-1",
+            vertical="HEALTH",
+            slug="acme",
+            firestore_doc_path="VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
+            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
+        )
+        final_payload = {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": [],
+            "executive_summary": "Resumo executivo objetivo.",
+            "topics": [],
+            "global_decisions": [],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [],
+        }
+
+        router = MagicMock()
+        router.fetch_json.side_effect = [{"summary": STT_APP.default_accumulated_summary_payload()}, {"summary": final_payload}]
+        router.fetch_agent_prompt.return_value = None
+        router.upload_json = MagicMock()
+        router.upload_text = MagicMock()
+        router.publish_call_index = MagicMock()
+
+        summary_engine = MagicMock()
+        summary_engine.enabled = True
+        summary_engine.minute_model = "minute-model"
+        summary_engine.accumulated_model = "accumulated-model"
+        summary_engine.final_model = "final-model"
+        summary_engine.final_text_model = "final-text-model"
+        summary_engine.finalize_summary.return_value = {"unexpected": True}
+        summary_engine.finalize_summary_text.return_value = "# Ata Final"
+
+        task = {
+            "room_name": "talk__dev__roomA",
+            "call_session_id": "RM_session-1",
+            "minute_index": -1,
+            "retries": 1,
+        }
+        session_row = {"finalized_at": "2026-04-24T12:00:00+00:00"}
+        final_task_rows = [
+            {
+                "minute_index": -1,
+                "status": "processing",
+                "retries": 1,
+                "updated_at": "2026-04-24T12:00:00+00:00",
+            }
+        ]
+
+        claim_calls = {"count": 0}
+
+        def fake_claim_summary_task(_now_iso: str):
+            if claim_calls["count"] == 0:
+                claim_calls["count"] += 1
+                return task
+            stop_event.set()
+            return None
+
+        done_calls: list[tuple[str, str, int]] = []
 
         def fake_mark_done(room_name: str, call_session_id: str, minute_index: int, _now_iso: str):
             done_calls.append((room_name, call_session_id, minute_index))
@@ -2242,10 +2369,45 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(done_calls, [("talk__dev__roomA", "RM_session-1", -1)])
         mark_error_mock.assert_not_called()
-        router.upload_text.assert_not_called()
+        summary_engine.finalize_summary.assert_not_called()
+        summary_engine.finalize_summary_text.assert_called_once()
+        router.upload_text.assert_called_once()
         publish_kwargs = router.publish_call_index.call_args.kwargs
         self.assertTrue(publish_kwargs["final_summary_ready"])
-        self.assertFalse(publish_kwargs["final_summary_text_ready"])
+        self.assertTrue(publish_kwargs["final_summary_text_ready"])
+
+    async def test_summary_worker_logs_main_summary_steps(self):
+        stop_event = asyncio.Event()
+        summary_engine = MagicMock()
+        summary_engine.enabled = True
+        summary_engine.provider = "openrouter"
+        summary_engine.minute_model = "minute-model"
+        summary_engine.accumulated_model = "accumulated-model"
+        summary_engine.final_model = "final-model"
+        summary_engine.final_text_model = "final-text-model"
+
+        with patch.object(STT_APP, "run_summary_reconciliation_once", new=AsyncMock()):
+            with patch.object(STT_APP, "db_claim_summary_task", side_effect=lambda _now_iso: (stop_event.set() or None)):
+                with self.assertLogs("stt", level="INFO") as logs:
+                    await asyncio.wait_for(
+                        STT_APP.summary_worker_loop(stop_event, MagicMock(), summary_engine),
+                        timeout=2,
+                    )
+
+        log_text = "\n".join(logs.output)
+        self.assertIn("iniciando geração do sumario", log_text)
+        self.assertIn("modelos: { minuto: minute-model, acumulado: accumulated-model, final: final-model, final_text: final-text-model }", log_text)
+
+    async def test_summary_reconciliation_logs_zero_counts(self):
+        with patch.object(STT_APP, "db_recover_stale_summary_tasks", return_value=0):
+            with patch.object(STT_APP, "db_get_finalized_sessions_for_summary_reconcile", return_value=[]):
+                with self.assertLogs("stt", level="INFO") as logs:
+                    await STT_APP.run_summary_reconciliation_once()
+
+        self.assertIn(
+            "Reconciliando summaries: recovered=0 sessions=0 queued=0 reopened=0 late_requeued=0",
+            "\n".join(logs.output),
+        )
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")

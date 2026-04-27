@@ -35,7 +35,7 @@ services:
       SUMMARY_MODEL_MINUTE: "gpt-4.1-mini"
       SUMMARY_MODEL_ACCUMULATED: "gpt-4.1-mini"
       SUMMARY_MODEL_FINAL: "gpt-4.1-mini"
-      SUMMARY_MODEL_FINAL_TEXT: "deepseek/deepseek-v4-flash"
+      SUMMARY_MODEL_FINAL_TEXT: "gpt-4.1-mini"
       SUMMARY_FINAL_TEXT_FORMAT: "markdown"
       SUMMARY_REQUEST_TIMEOUT_SECONDS: "300"
       SUMMARY_REQUEST_RETRIES: "2"
