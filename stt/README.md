@@ -166,7 +166,7 @@ Campos principais no retorno:
 - `SUMMARY_MODEL_MINUTE` (padrao `gpt-4.1-mini`)
 - `SUMMARY_MODEL_ACCUMULATED` (padrao `gpt-4.1-mini`)
 - `SUMMARY_MODEL_FINAL` (padrao `gpt-4.1-mini`)
-- `SUMMARY_MODEL_FINAL_TEXT` (padrao `deepseek/deepseek-v4-pro`)
+- `SUMMARY_MODEL_FINAL_TEXT` (padrao `deepseek/deepseek-v4-flash`)
 - `SUMMARY_FINAL_TEXT_FORMAT` (`markdown|html|text`, padrao `markdown`)
 - `SUMMARY_REQUEST_TIMEOUT_SECONDS` (padrao `300`)
 - `SUMMARY_REQUEST_RETRIES` (padrao `2`, total de 3 tentativas por request)

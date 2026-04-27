@@ -94,7 +94,7 @@ SUMMARY_MODEL_FINAL = os.environ.get(
     "SUMMARY_MODEL_FINAL", "gpt-4.1-mini"
 ).strip()
 SUMMARY_MODEL_FINAL_TEXT = os.environ.get(
-    "SUMMARY_MODEL_FINAL_TEXT", "deepseek/deepseek-v4-pro"
+    "SUMMARY_MODEL_FINAL_TEXT", "deepseek/deepseek-v4-flash"
 ).strip()
 SUMMARY_FINAL_TEXT_FORMAT = os.environ.get("SUMMARY_FINAL_TEXT_FORMAT", "markdown").strip().lower()
 if SUMMARY_FINAL_TEXT_FORMAT not in {"markdown", "html", "text"}:
@@ -287,10 +287,16 @@ Regras obrigatórias:
 10. Retorne somente o conteúdo final da ata em Markdown.
 11. Não use bloco de código.
 12. Não inclua explicações antes ou depois da ata.
+13. A primeira linha da resposta deve ser exatamente: # Ata de Reunião
+14. É proibido iniciar com análise, justificativa, plano, comentário ou raciocínio.
+15. Não escreva nenhum texto antes ou depois da ata.
 
 Campos esperados no JSON:
 - title
 - updated_at
+- room_name
+- transcript_session_id
+- call_session_id
 - conversation_types
 - executive_summary
 - topics
@@ -318,6 +324,7 @@ Instruções de interpretação:
 - facts devem ser identificados como fatos registrados.
 - tags podem ser usadas apenas como apoio organizacional, sem virar conteúdo novo.
 - confidence pode ser omitido, salvo quando for importante indicar incerteza.
+- room_name, transcript_session_id e call_session_id podem aparecer apenas na identificação se forem úteis; não use esses campos para inferir participantes, contexto ou conteúdo.
 
 Estrutura obrigatória:
 
@@ -327,7 +334,7 @@ Estrutura obrigatória:
 
 - **Título:** [usar title]
 - **Tipo de reunião:** [usar conversation_types, se existir]
-- **Data:** user o campo "updated_at" do json para Montar a data. Formato:  "{dia} de {nome do mês} de {ano} ({dia da semana})"
+- **Data:** usar o campo "updated_at" do JSON para montar a data. Formato: "{dia} de {nome do mês} de {ano} ({dia da semana})". Se updated_at estiver ausente, usar "Não informado".
 
 ## 2. Objetivo da reunião
 [usar executive_summary]
@@ -374,8 +381,6 @@ Listar additional_notes, notes, facts, hypotheses, open_items, quando existirem 
 
 Se não houver observações adicionais, escrever:
 Nenhuma observação adicional foi registrada.
-
-segue o json:
 """
 
 SUMMARY_KIND_MINUTE = "minute"
@@ -645,6 +650,20 @@ CONTRACT_SUFFIX_FINAL = (
     "- topics deve conter os principais assuntos da chamada, ja consolidados.\n"
     "- O formato final e controlado por schema estrito da API; siga as regras sem adicionar texto fora do JSON.\n"
 )
+
+
+FINAL_SUMMARY_TEXT_REQUIRED_PREFIX = "# Ata de Reunião"
+
+
+def validate_final_summary_text_output(raw_output: str) -> str:
+    text = raw_output.strip() if isinstance(raw_output, str) else ""
+    if not text.startswith(FINAL_SUMMARY_TEXT_REQUIRED_PREFIX):
+        raise RuntimeError(
+            "ata textual final invalida: resposta deve iniciar exatamente com "
+            f"{FINAL_SUMMARY_TEXT_REQUIRED_PREFIX!r}"
+        )
+    return text
+
 
 def build_effective_system_prompt(
     system_prompt_override: str | None,
@@ -4197,12 +4216,33 @@ class SummaryEngine:
             "JSON do resumo final:\n"
             f"{json.dumps(summary_payload, ensure_ascii=True, indent=2)}"
         )
-        return self._request_text(
+        raw_output = self._request_text(
             kind=None,
             model=self.final_text_model,
             system_prompt=effective_prompt,
             user_prompt=user_prompt,
         )
+        try:
+            return validate_final_summary_text_output(raw_output)
+        except RuntimeError as first_error:
+            retry_prompt = (
+                "A resposta anterior foi inválida porque incluiu texto fora da ata ou não começou "
+                f"com {FINAL_SUMMARY_TEXT_REQUIRED_PREFIX!r}.\n"
+                "Gere novamente. A primeira linha deve ser exatamente "
+                f"{FINAL_SUMMARY_TEXT_REQUIRED_PREFIX}.\n"
+                "Não inclua análise, justificativa, plano, raciocínio, comentários ou blocos de código.\n\n"
+                f"{user_prompt}"
+            )
+            retry_output = self._request_text(
+                kind=None,
+                model=self.final_text_model,
+                system_prompt=effective_prompt,
+                user_prompt=retry_prompt,
+            )
+            try:
+                return validate_final_summary_text_output(retry_output)
+            except RuntimeError as retry_error:
+                raise RuntimeError(str(retry_error)) from first_error
 
 def session_summary_accumulated_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "summary/accumulated.json")
@@ -5236,7 +5276,13 @@ async def summary_worker_loop(
                         )
                         final_summary_text = await asyncio.to_thread(
                             summary_engine.finalize_summary_text,
-                            final_summary,
+                            {
+                                **final_summary,
+                                "updated_at": now_iso,
+                                "room_name": room_name,
+                                "transcript_session_id": routing.transcript_session_id,
+                                "call_session_id": routing.call_session_id,
+                            },
                             SUMMARY_FINAL_TEXT_FORMAT,
                             final_text_system_prompt,
                         )

@@ -418,7 +418,11 @@ class SummaryEnginePromptTests(unittest.TestCase):
             "global_next_steps": [],
             "additional_notes": [],
         }
-        with patch.object(engine, "_request_text", return_value="ATA FINAL") as request_mock:
+        with patch.object(
+            engine,
+            "_request_text",
+            return_value="# Ata de Reunião\n\nConteúdo final.",
+        ) as request_mock:
             engine.finalize_summary_text(final_summary, "markdown", "PROMPT_ATA")
             engine.finalize_summary_text(final_summary, "markdown")
 
@@ -430,6 +434,58 @@ class SummaryEnginePromptTests(unittest.TestCase):
             request_mock.call_args_list[1].kwargs["system_prompt"],
             STT_APP.DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT.strip(),
         )
+
+    def test_finalize_summary_text_accepts_valid_output_without_retry(self):
+        engine = self.build_engine()
+        final_summary = {"title": "Ata de Alinhamento"}
+
+        with patch.object(
+            engine,
+            "_request_text",
+            return_value="# Ata de Reunião\n\nConteúdo final.",
+        ) as request_mock:
+            result = engine.finalize_summary_text(final_summary, "markdown")
+
+        self.assertEqual(result, "# Ata de Reunião\n\nConteúdo final.")
+        self.assertEqual(request_mock.call_count, 1)
+
+    def test_finalize_summary_text_retries_invalid_output_once(self):
+        engine = self.build_engine()
+        final_summary = {"title": "Ata de Alinhamento"}
+
+        with patch.object(
+            engine,
+            "_request_text",
+            side_effect=[
+                "We need to generate the ata first.\n# Ata de Reunião\n\nConteúdo.",
+                "# Ata de Reunião\n\nConteúdo final.",
+            ],
+        ) as request_mock:
+            result = engine.finalize_summary_text(final_summary, "markdown")
+
+        self.assertEqual(result, "# Ata de Reunião\n\nConteúdo final.")
+        self.assertEqual(request_mock.call_count, 2)
+        self.assertIn(
+            "A resposta anterior foi inválida",
+            request_mock.call_args_list[1].kwargs["user_prompt"],
+        )
+
+    def test_finalize_summary_text_raises_after_two_invalid_outputs(self):
+        engine = self.build_engine()
+        final_summary = {"title": "Ata de Alinhamento"}
+
+        with patch.object(
+            engine,
+            "_request_text",
+            side_effect=[
+                "We need to generate the ata first.",
+                "The JSON contains a title.",
+            ],
+        ) as request_mock:
+            with self.assertRaisesRegex(RuntimeError, "ata textual final invalida"):
+                engine.finalize_summary_text(final_summary, "markdown")
+
+        self.assertEqual(request_mock.call_count, 2)
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -2083,6 +2139,16 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
             STT_APP.session_final_summary_text_path(routing.storage_base_path),
         )
         self.assertEqual(upload_text_args[2], "# Ata Final")
+        text_payload = summary_engine.finalize_summary_text.call_args.args[0]
+        self.assertEqual(text_payload["title"], final_payload["title"])
+        self.assertEqual(text_payload["room_name"], "talk__dev__roomA")
+        self.assertEqual(text_payload["transcript_session_id"], "session-1")
+        self.assertEqual(text_payload["call_session_id"], "RM_session-1")
+        self.assertIsInstance(text_payload["updated_at"], str)
+        self.assertTrue(text_payload["updated_at"])
+        final_upload_payload = router.upload_json.call_args.args[2]
+        self.assertEqual(final_upload_payload["summary"], final_payload)
+        self.assertNotIn("summary", text_payload)
 
         publish_kwargs = router.publish_call_index.call_args.kwargs
         self.assertTrue(publish_kwargs["final_summary_ready"])
