@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -93,6 +93,12 @@ SUMMARY_MODEL_ACCUMULATED = os.environ.get(
 SUMMARY_MODEL_FINAL = os.environ.get(
     "SUMMARY_MODEL_FINAL", "gpt-4.1-mini"
 ).strip()
+SUMMARY_MODEL_FINAL_TEXT = os.environ.get(
+    "SUMMARY_MODEL_FINAL_TEXT", "deepseek/deepseek-v4-pro"
+).strip()
+SUMMARY_FINAL_TEXT_FORMAT = os.environ.get("SUMMARY_FINAL_TEXT_FORMAT", "markdown").strip().lower()
+if SUMMARY_FINAL_TEXT_FORMAT not in {"markdown", "html", "text"}:
+    SUMMARY_FINAL_TEXT_FORMAT = "markdown"
 SUMMARY_REQUEST_TIMEOUT_SECONDS = max(
     5, int(os.environ.get("SUMMARY_REQUEST_TIMEOUT_SECONDS", "300"))
 )
@@ -260,6 +266,116 @@ Regras obrigatorias:
 - conversation_types deve refletir o estado acumulado.
 - Limites: text max 280 caracteres; tags entre 0 e 4 itens; maximo 30 itens por categoria.
 - Retornar arrays vazios quando categoria nao tiver itens (exceto regra de global_decisions acima).
+"""
+
+DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT = """Você é responsável por transformar um resumo estruturado de reunião em uma ata profissional.
+
+Você receberá um JSON consolidado de uma reunião finalizada.
+
+Gere uma ata de reunião em Markdown, clara, profissional e fiel aos dados fornecidos.
+
+Regras obrigatórias:
+1. Use exclusivamente as informações presentes no JSON.
+2. Não invente nenhuma informação.
+3. Não adicione participantes, datas, horários, responsáveis, decisões, próximos passos ou pendências que não estejam no JSON.
+4. Não transforme expectativas, hipóteses, comentários ou observações em decisões.
+5. Não transforme tópicos mencionados em deliberações formais se isso não estiver explícito.
+6. Se uma informação estiver ausente, use “Não informado” ou omita a seção quando a omissão deixar o documento mais limpo.
+7. Preserve o sentido original de cada campo.
+8. Use linguagem profissional, objetiva e adequada para registro corporativo.
+9. Não mencione o JSON, o modelo, a IA ou o processo de geração.
+10. Retorne somente o conteúdo final da ata em Markdown.
+11. Não use bloco de código.
+12. Não inclua explicações antes ou depois da ata.
+
+Campos esperados no JSON:
+- title
+- updated_at
+- conversation_types
+- executive_summary
+- topics
+- global_decisions
+- global_pending_items
+- global_next_steps
+- additional_notes
+- facts
+- hypotheses
+- decisions
+- open_items
+- next_steps
+- notes
+
+Instruções de interpretação:
+- title deve ser usado como título da reunião.
+- conversation_types deve ser exibido como tipo de reunião, se existir.
+- executive_summary deve compor o resumo executivo.
+- topics devem ser listados como temas discutidos.
+- decisions e global_decisions devem ser tratados como decisões somente se estiverem explicitamente registrados como decisões.
+- pending_items, global_pending_items e open_items devem ser tratados como pendências.
+- next_steps e global_next_steps devem ser tratados como próximos passos.
+- additional_notes e notes devem ser tratados como observações adicionais.
+- hypotheses devem ser identificadas como hipóteses, não como fatos.
+- facts devem ser identificados como fatos registrados.
+- tags podem ser usadas apenas como apoio organizacional, sem virar conteúdo novo.
+- confidence pode ser omitido, salvo quando for importante indicar incerteza.
+
+Estrutura obrigatória:
+
+# Ata de Reunião
+
+## 1. Identificação
+
+- **Título:** [usar title]
+- **Tipo de reunião:** [usar conversation_types, se existir]
+- **Data:** user o campo "updated_at" do json para Montar a data. Formato:  "{dia} de {nome do mês} de {ano} ({dia da semana})"
+
+## 2. Objetivo da reunião
+[usar executive_summary]
+
+## 3. Principais assuntos discutidos
+Para cada item em topics:
+### 3.x [name]
+
+[summary]
+
+Só inserir Se existirem decisões do tópico:
+**Decisões:**  
+- [decisão]
+
+Só inserir Se existirem pendências do tópico:
+**Pendências:**  
+- [pendência]
+
+Só inserir Se existirem próximos passos do tópico:
+**Próximos passos:**  
+- [próximo passo]
+
+Se existirem tags relevantes:
+**Tags:** [tags]
+
+## 4. Decisões registradas
+Listar global_decisions.
+Se não houver decisões explícitas, escrever:
+Nenhuma decisão explícita foi registrada.
+
+## 5. Pendências
+Listar global_pending_items.
+Se não houver pendências gerais, escrever:
+Nenhuma pendência geral foi registrada.
+
+
+## 6. Próximos passos
+Listar global_next_steps.
+Se não houver próximos passos gerais, escrever:
+Nenhum próximo passo geral foi registrado.
+
+## 7. Observações adicionais
+Listar additional_notes, notes, facts, hypotheses, open_items, quando existirem e forem relevantes.
+
+Se não houver observações adicionais, escrever:
+Nenhuma observação adicional foi registrada.
+
+segue o json:
 """
 
 SUMMARY_KIND_MINUTE = "minute"
@@ -1947,6 +2063,8 @@ class FirebaseSink:
         final_summary_ready: bool | object = CALL_INDEX_UNSET,
         final_transcript_path: str | None | object = CALL_INDEX_UNSET,
         final_transcript_ready: bool | object = CALL_INDEX_UNSET,
+        final_summary_text_path: str | None | object = CALL_INDEX_UNSET,
+        final_summary_text_ready: bool | object = CALL_INDEX_UNSET,
     ) -> None:
         if not self.enabled or self.firestore_client is None:
             return
@@ -1978,6 +2096,10 @@ class FirebaseSink:
             payload["final_transcript_path"] = final_transcript_path
         if final_transcript_ready is not CALL_INDEX_UNSET:
             payload["final_transcript_ready"] = final_transcript_ready
+        if final_summary_text_path is not CALL_INDEX_UNSET:
+            payload["final_summary_text_path"] = final_summary_text_path
+        if final_summary_text_ready is not CALL_INDEX_UNSET:
+            payload["final_summary_text_ready"] = final_summary_text_ready
 
         call_ref.set(payload, merge=True)
 
@@ -2010,6 +2132,12 @@ class FirebaseSink:
             json.dumps(body, ensure_ascii=False),
             content_type="application/json",
         )
+
+    def upload_text(self, object_path: str, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
+        if not self.enabled or self.storage_bucket is None:
+            return
+        text_blob = self.storage_bucket.blob(object_path)
+        text_blob.upload_from_string(body, content_type=content_type)
 
     def fetch_json(self, object_path: str) -> dict | None:
         if not self.enabled or self.storage_bucket is None:
@@ -2204,6 +2332,8 @@ class FirebaseRouter:
         final_summary_ready: bool | object = CALL_INDEX_UNSET,
         final_transcript_path: str | None | object = CALL_INDEX_UNSET,
         final_transcript_ready: bool | object = CALL_INDEX_UNSET,
+        final_summary_text_path: str | None | object = CALL_INDEX_UNSET,
+        final_summary_text_ready: bool | object = CALL_INDEX_UNSET,
     ) -> None:
         self.sink_for_namespace(routing.namespace).publish_call_index(
             routing,
@@ -2217,6 +2347,8 @@ class FirebaseRouter:
             final_summary_ready=final_summary_ready,
             final_transcript_path=final_transcript_path,
             final_transcript_ready=final_transcript_ready,
+            final_summary_text_path=final_summary_text_path,
+            final_summary_text_ready=final_summary_text_ready,
         )
 
     def upsert_room_session_links_on_start(self, routing: RoomRoutingContext) -> None:
@@ -2229,6 +2361,19 @@ class FirebaseRouter:
 
     def upload_json(self, routing: RoomRoutingContext, object_path: str, body: dict) -> None:
         self.sink_for_namespace(routing.namespace).upload_json(object_path, body)
+
+    def upload_text(
+        self,
+        routing: RoomRoutingContext,
+        object_path: str,
+        body: str,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
+        self.sink_for_namespace(routing.namespace).upload_text(
+            object_path,
+            body,
+            content_type=content_type,
+        )
 
     def fetch_json(self, routing: RoomRoutingContext, object_path: str) -> dict | None:
         return self.sink_for_namespace(routing.namespace).fetch_json(object_path)
@@ -3818,6 +3963,7 @@ class SummaryEngine:
     minute_model: str
     accumulated_model: str
     final_model: str
+    final_text_model: str
     timeout_seconds: int
     request_retries: int
     retry_base_seconds: float
@@ -3838,6 +3984,7 @@ class SummaryEngine:
                 SUMMARY_MODEL_MINUTE,
                 SUMMARY_MODEL_ACCUMULATED,
                 SUMMARY_MODEL_FINAL,
+                SUMMARY_MODEL_FINAL_TEXT,
                 SUMMARY_REQUEST_TIMEOUT_SECONDS,
                 SUMMARY_REQUEST_RETRIES,
                 SUMMARY_REQUEST_RETRY_BASE_SECONDS,
@@ -3851,6 +3998,7 @@ class SummaryEngine:
             SUMMARY_MODEL_MINUTE,
             SUMMARY_MODEL_ACCUMULATED,
             SUMMARY_MODEL_FINAL,
+            SUMMARY_MODEL_FINAL_TEXT,
             SUMMARY_REQUEST_TIMEOUT_SECONDS,
             SUMMARY_REQUEST_RETRIES,
             SUMMARY_REQUEST_RETRY_BASE_SECONDS,
@@ -3859,7 +4007,13 @@ class SummaryEngine:
     def _retry_delay_seconds(self, attempt: int) -> float:
         return min(8.0, self.retry_base_seconds * (2**attempt))
 
-    def _request_text(self, kind: str, model: str, system_prompt: str, user_prompt: str) -> str:
+    def _request_text(
+        self,
+        kind: str | None,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
         if not self.enabled:
             raise RuntimeError("summary engine disabled")
         request_body = {
@@ -3874,10 +4028,11 @@ class SummaryEngine:
                     "content": [{"type": "input_text", "text": user_prompt}],
                 },
             ],
-            "text": {
-                "format": build_openai_response_format(kind),
-            },
         }
+        if kind:
+            request_body["text"] = {
+                "format": build_openai_response_format(kind),
+            }
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -4023,6 +4178,32 @@ class SummaryEngine:
             f"{json.dumps(merged_payload, ensure_ascii=True, indent=2)}",
         )
 
+    def finalize_summary_text(
+        self,
+        final_summary: dict,
+        output_format: str,
+        system_prompt: str | None = None,
+    ) -> str:
+        effective_prompt = (
+            system_prompt.strip()
+            if isinstance(system_prompt, str) and system_prompt.strip()
+            else DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT.strip()
+        )
+        summary_payload = final_summary if isinstance(final_summary, dict) else {}
+        user_prompt = (
+            "Gere a ata textual final a partir do JSON abaixo.\n"
+            f"Formato de saida esperado: {output_format}.\n"
+            "Retorne apenas o documento final em texto, sem blocos de codigo.\n\n"
+            "JSON do resumo final:\n"
+            f"{json.dumps(summary_payload, ensure_ascii=True, indent=2)}"
+        )
+        return self._request_text(
+            kind=None,
+            model=self.final_text_model,
+            system_prompt=effective_prompt,
+            user_prompt=user_prompt,
+        )
+
 def session_summary_accumulated_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "summary/accumulated.json")
 
@@ -4037,6 +4218,10 @@ def session_final_summary_temp_path(storage_base_path: str) -> str:
 
 def session_final_transcript_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "final/final_transcript.json")
+
+
+def session_final_summary_text_path(storage_base_path: str) -> str:
+    return join_storage_path(storage_base_path, "final/final_summary_text.txt")
 
 
 def build_final_summary_temp_payload(
@@ -4436,6 +4621,8 @@ def publish_session_minute_exports(
         final_summary_ready=False,
         final_transcript_path=None,
         final_transcript_ready=False,
+        final_summary_text_path=None,
+        final_summary_text_ready=False,
     )
     return last_minute_index
 
@@ -4509,6 +4696,7 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
             )
             routing = routing_context_from_session_row(room)
             final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+            final_summary_text_path = session_final_summary_text_path(routing.storage_base_path)
             final_transcript_payload = await asyncio.to_thread(
                 build_final_transcript_payload,
                 room_name,
@@ -4544,6 +4732,10 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
                 final_summary_ready=False,
                 final_transcript_path=final_transcript_path,
                 final_transcript_ready=True,
+                final_summary_text_path=(
+                    final_summary_text_path if summary_engine.enabled else None
+                ),
+                final_summary_text_ready=False,
             )
 
             if summary_engine.enabled:
@@ -4790,6 +4982,8 @@ async def summary_worker_loop(
                     final_summary_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
                     final_transcript_path=None if not session_is_finalized else CALL_INDEX_UNSET,
                     final_transcript_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
+                    final_summary_text_path=None if not session_is_finalized else CALL_INDEX_UNSET,
+                    final_summary_text_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
                 )
                 if session_is_finalized and SUMMARY_FINAL_REEMIT_ON_LATE_MINUTES:
                     await asyncio.to_thread(
@@ -4939,6 +5133,7 @@ async def summary_worker_loop(
 
                 final_path = session_final_summary_path(routing.storage_base_path)
                 final_temp_path = session_final_summary_temp_path(routing.storage_base_path)
+                final_summary_text_path = session_final_summary_text_path(routing.storage_base_path)
                 final_summary: dict | None = None
                 try:
                     final_system_prompt = await asyncio.to_thread(
@@ -4993,6 +5188,8 @@ async def summary_worker_loop(
                         final_summary_ready=False,
                         final_transcript_path=final_transcript_path,
                         final_transcript_ready=True,
+                        final_summary_text_path=final_summary_text_path,
+                        final_summary_text_ready=False,
                     )
                     logger.warning(
                         "final summary temp uploaded room=%s session=%s path=%s",
@@ -5030,6 +5227,43 @@ async def summary_worker_loop(
                             "updated_at": now_iso,
                         },
                     )
+                    final_summary_text_ready = False
+                    try:
+                        final_text_system_prompt = await asyncio.to_thread(
+                            firebase_router.fetch_agent_prompt,
+                            routing,
+                            "stt_finalize_summary_text",
+                        )
+                        final_summary_text = await asyncio.to_thread(
+                            summary_engine.finalize_summary_text,
+                            final_summary,
+                            SUMMARY_FINAL_TEXT_FORMAT,
+                            final_text_system_prompt,
+                        )
+                        await asyncio.to_thread(
+                            firebase_router.upload_text,
+                            routing,
+                            final_summary_text_path,
+                            final_summary_text,
+                            "text/plain; charset=utf-8",
+                        )
+                        final_summary_text_ready = True
+                        logger.info(
+                            "final summary text uploaded room=%s session=%s path=%s format=%s",
+                            room_name,
+                            call_session_id,
+                            final_summary_text_path,
+                            SUMMARY_FINAL_TEXT_FORMAT,
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.warning(
+                            "final summary text generation failed room=%s session=%s model=%s format=%s error=%s",
+                            room_name,
+                            call_session_id,
+                            summary_engine.final_text_model,
+                            SUMMARY_FINAL_TEXT_FORMAT,
+                            exc,
+                        )
                     final_transcript_path = session_final_transcript_path(routing.storage_base_path)
                     await asyncio.to_thread(
                         firebase_router.publish_call_index,
@@ -5042,6 +5276,8 @@ async def summary_worker_loop(
                         final_summary_ready=True,
                         final_transcript_path=final_transcript_path,
                         final_transcript_ready=True,
+                        final_summary_text_path=final_summary_text_path,
+                        final_summary_text_ready=final_summary_text_ready,
                     )
                     logger.info(
                         "final summary uploaded room=%s session=%s path=%s partial=%s",
@@ -5205,6 +5441,8 @@ async def health() -> dict:
         "summary_model_minute": runtime.summary_engine.minute_model,
         "summary_model_accumulated": runtime.summary_engine.accumulated_model,
         "summary_model_final": runtime.summary_engine.final_model,
+        "summary_model_final_text": runtime.summary_engine.final_text_model,
+        "summary_final_text_format": SUMMARY_FINAL_TEXT_FORMAT,
         "summary_reconcile_interval_seconds": SUMMARY_RECONCILE_INTERVAL_SECONDS,
         "summary_processing_stale_seconds": SUMMARY_PROCESSING_STALE_SECONDS,
         "summary_finalization_grace_seconds": SUMMARY_FINALIZATION_GRACE_SECONDS,
@@ -5500,6 +5738,8 @@ async def admin_summary_reprocess(payload: AdminSummaryReprocessTarget) -> JSONR
         final_summary_ready=False,
         final_transcript_path=final_transcript_path,
         final_transcript_ready=True,
+        final_summary_text_path=session_final_summary_text_path(routing.storage_base_path),
+        final_summary_text_ready=False,
     )
     task_rows = await asyncio.to_thread(
         db_get_summary_task_rows, payload.room_name, payload.call_session_id

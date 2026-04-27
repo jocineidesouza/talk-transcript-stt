@@ -72,7 +72,7 @@ Quando `FIREBASE_ENABLED=true`:
 
 Firestore:
 
-- `VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/SESSIONS/{call_session_id}`: metadados, status, heartbeat, ponteiros de resumo/transcricao final
+- `VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/SESSIONS/{call_session_id}`: metadados, status, heartbeat, ponteiros de resumo/transcricao final e ata textual final
 
 Storage:
 
@@ -80,6 +80,7 @@ Storage:
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/minutes/{minute_index}/summary.json`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/summary/accumulated.json`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary_text.txt`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary_temp.json` (quando houver erro de contrato no final)
 
 ## Summary LLM (OpenRouter/OpenAI, opcional)
@@ -165,6 +166,8 @@ Campos principais no retorno:
 - `SUMMARY_MODEL_MINUTE` (padrao `gpt-4.1-mini`)
 - `SUMMARY_MODEL_ACCUMULATED` (padrao `gpt-4.1-mini`)
 - `SUMMARY_MODEL_FINAL` (padrao `gpt-4.1-mini`)
+- `SUMMARY_MODEL_FINAL_TEXT` (padrao `deepseek/deepseek-v4-pro`)
+- `SUMMARY_FINAL_TEXT_FORMAT` (`markdown|html|text`, padrao `markdown`)
 - `SUMMARY_REQUEST_TIMEOUT_SECONDS` (padrao `300`)
 - `SUMMARY_REQUEST_RETRIES` (padrao `2`, total de 3 tentativas por request)
 - `SUMMARY_REQUEST_RETRY_BASE_SECONDS` (padrao `1.5`)

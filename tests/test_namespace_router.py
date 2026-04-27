@@ -331,6 +331,7 @@ class SummaryEnginePromptTests(unittest.TestCase):
             minute_model="minute-model",
             accumulated_model="accumulated-model",
             final_model="final-model",
+            final_text_model="final-text-model",
             timeout_seconds=20,
             request_retries=2,
             retry_base_seconds=1.5,
@@ -403,6 +404,31 @@ class SummaryEnginePromptTests(unittest.TestCase):
         self.assertEqual(
             request_mock.call_args_list[1].args[2],
             STT_APP.DEFAULT_FINALIZE_SUMMARY_PROMPT.strip() + "\n\n" + STT_APP.CONTRACT_SUFFIX_FINAL,
+        )
+
+    def test_finalize_summary_text_uses_external_and_fallback_prompts(self):
+        engine = self.build_engine()
+        final_summary = {
+            "title": "Ata de Alinhamento",
+            "conversation_types": [],
+            "executive_summary": "Resumo.",
+            "topics": [],
+            "global_decisions": [],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [],
+        }
+        with patch.object(engine, "_request_text", return_value="ATA FINAL") as request_mock:
+            engine.finalize_summary_text(final_summary, "markdown", "PROMPT_ATA")
+            engine.finalize_summary_text(final_summary, "markdown")
+
+        self.assertEqual(request_mock.call_args_list[0].kwargs["kind"], None)
+        self.assertEqual(request_mock.call_args_list[0].kwargs["model"], "final-text-model")
+        self.assertEqual(request_mock.call_args_list[0].kwargs["system_prompt"], "PROMPT_ATA")
+        self.assertIn("Formato de saida esperado: markdown.", request_mock.call_args_list[0].kwargs["user_prompt"])
+        self.assertEqual(
+            request_mock.call_args_list[1].kwargs["system_prompt"],
+            STT_APP.DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT.strip(),
         )
 
 
@@ -1064,6 +1090,7 @@ class SummaryEngineRetryTests(unittest.TestCase):
             minute_model="minute-model",
             accumulated_model="accumulated-model",
             final_model="final-model",
+            final_text_model="final-text-model",
             timeout_seconds=45,
             request_retries=2,
             retry_base_seconds=1.5,
@@ -1200,6 +1227,20 @@ class SummaryEngineRetryTests(unittest.TestCase):
         self.assertEqual(title_schema["maxLength"], STT_APP.SUMMARY_FINAL_TITLE_MAX_CHARS)
         self.assertNotIn("enum", title_schema)
 
+    def test_request_text_without_kind_does_not_send_json_schema(self):
+        engine = self.build_engine()
+        with patch.object(
+            STT_APP.urllib.request,
+            "urlopen",
+            return_value=self._response({"output_text": "ata final"}),
+        ) as urlopen_mock:
+            raw = engine._request_text(None, "final-text-model", "system", "user")
+
+        self.assertEqual(raw, "ata final")
+        req = urlopen_mock.call_args.args[0]
+        body = json.loads(req.data.decode("utf-8"))
+        self.assertNotIn("text", body)
+
     def test_request_text_includes_openrouter_optional_headers(self):
         engine = STT_APP.SummaryEngine(
             enabled=True,
@@ -1210,6 +1251,7 @@ class SummaryEngineRetryTests(unittest.TestCase):
             minute_model="minute-model",
             accumulated_model="accumulated-model",
             final_model="final-model",
+            final_text_model="final-text-model",
             timeout_seconds=45,
             request_retries=2,
             retry_base_seconds=1.5,
@@ -1428,6 +1470,8 @@ class CallIndexContractTests(unittest.TestCase):
             final_summary_ready=True,
             final_transcript_path="path/final_transcript.json",
             final_transcript_ready=True,
+            final_summary_text_path="path/final_summary_text.txt",
+            final_summary_text_ready=True,
         )
 
         payload = fake_doc.set.call_args.args[0]
@@ -1437,6 +1481,8 @@ class CallIndexContractTests(unittest.TestCase):
         self.assertTrue(payload["final_summary_ready"])
         self.assertEqual(payload["final_transcript_path"], "path/final_transcript.json")
         self.assertTrue(payload["final_transcript_ready"])
+        self.assertEqual(payload["final_summary_text_path"], "path/final_summary_text.txt")
+        self.assertTrue(payload["final_summary_text_ready"])
 
     def test_publish_call_index_skips_optional_fields_when_unset(self):
         fake_doc = MagicMock()
@@ -1463,6 +1509,8 @@ class CallIndexContractTests(unittest.TestCase):
         self.assertNotIn("final_summary_ready", payload)
         self.assertNotIn("final_transcript_path", payload)
         self.assertNotIn("final_transcript_ready", payload)
+        self.assertNotIn("final_summary_text_path", payload)
+        self.assertNotIn("final_summary_text_ready", payload)
 
     def test_upsert_room_session_links_on_start_writes_only_session_doc(self):
         session_ref = MagicMock()
@@ -1942,6 +1990,196 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
 
         publish_kwargs = router.publish_call_index.call_args.kwargs
         self.assertFalse(publish_kwargs["final_summary_ready"])
+        self.assertFalse(publish_kwargs["final_summary_text_ready"])
+
+    async def test_final_summary_generates_text_and_marks_ready(self):
+        stop_event = asyncio.Event()
+        routing = STT_APP.RoomRoutingContext(
+            namespace="talk__dev",
+            room_name="talk__dev__roomA",
+            room_id="roomA",
+            call_session_id="RM_session-1",
+            transcript_session_id="session-1",
+            vertical="HEALTH",
+            slug="acme",
+            firestore_doc_path="VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
+            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
+        )
+        final_payload = {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": [],
+            "executive_summary": "Resumo executivo objetivo.",
+            "topics": [],
+            "global_decisions": [],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [],
+        }
+
+        router = MagicMock()
+        router.fetch_json.return_value = {"summary": STT_APP.default_accumulated_summary_payload()}
+        router.fetch_agent_prompt.return_value = None
+        router.upload_json = MagicMock()
+        router.upload_text = MagicMock()
+        router.publish_call_index = MagicMock()
+
+        summary_engine = MagicMock()
+        summary_engine.enabled = True
+        summary_engine.final_model = "final-model"
+        summary_engine.final_text_model = "final-text-model"
+        summary_engine.finalize_summary.return_value = final_payload
+        summary_engine.finalize_summary_text.return_value = "# Ata Final"
+
+        task = {
+            "room_name": "talk__dev__roomA",
+            "call_session_id": "RM_session-1",
+            "minute_index": -1,
+            "retries": 0,
+        }
+        session_row = {"finalized_at": "2026-04-24T12:00:00+00:00"}
+        final_task_rows = [
+            {
+                "minute_index": -1,
+                "status": "processing",
+                "retries": 0,
+                "updated_at": "2026-04-24T12:00:00+00:00",
+            }
+        ]
+
+        claim_calls = {"count": 0}
+
+        def fake_claim_summary_task(_now_iso: str):
+            if claim_calls["count"] == 0:
+                claim_calls["count"] += 1
+                return task
+            stop_event.set()
+            return None
+
+        done_calls: list[tuple[str, str, int]] = []
+
+        def fake_mark_done(room_name: str, call_session_id: str, minute_index: int, _now_iso: str):
+            done_calls.append((room_name, call_session_id, minute_index))
+            stop_event.set()
+
+        with patch.object(STT_APP, "run_summary_reconciliation_once", new=AsyncMock()):
+            with patch.object(STT_APP, "db_claim_summary_task", side_effect=fake_claim_summary_task):
+                with patch.object(STT_APP, "db_get_session_row", return_value=session_row):
+                    with patch.object(STT_APP, "routing_context_from_session_row", return_value=routing):
+                        with patch.object(STT_APP, "db_get_summary_task_rows", return_value=final_task_rows):
+                            with patch.object(STT_APP, "db_get_session_minute_exports", return_value=[]):
+                                with patch.object(STT_APP, "db_mark_summary_task_done", side_effect=fake_mark_done):
+                                    with patch.object(STT_APP, "db_mark_summary_task_error") as mark_error_mock:
+                                        await asyncio.wait_for(
+                                            STT_APP.summary_worker_loop(stop_event, router, summary_engine),
+                                            timeout=2,
+                                        )
+
+        self.assertEqual(done_calls, [("talk__dev__roomA", "RM_session-1", -1)])
+        mark_error_mock.assert_not_called()
+        router.upload_text.assert_called_once()
+        upload_text_args = router.upload_text.call_args.args
+        self.assertEqual(
+            upload_text_args[1],
+            STT_APP.session_final_summary_text_path(routing.storage_base_path),
+        )
+        self.assertEqual(upload_text_args[2], "# Ata Final")
+
+        publish_kwargs = router.publish_call_index.call_args.kwargs
+        self.assertTrue(publish_kwargs["final_summary_ready"])
+        self.assertTrue(publish_kwargs["final_summary_text_ready"])
+        self.assertEqual(
+            publish_kwargs["final_summary_text_path"],
+            STT_APP.session_final_summary_text_path(routing.storage_base_path),
+        )
+
+    async def test_final_summary_text_failure_marks_text_not_ready_without_failing_task(self):
+        stop_event = asyncio.Event()
+        routing = STT_APP.RoomRoutingContext(
+            namespace="talk__dev",
+            room_name="talk__dev__roomA",
+            room_id="roomA",
+            call_session_id="RM_session-1",
+            transcript_session_id="session-1",
+            vertical="HEALTH",
+            slug="acme",
+            firestore_doc_path="VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
+            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
+        )
+        final_payload = {
+            "title": "Resumo Final Executivo da Chamada",
+            "conversation_types": [],
+            "executive_summary": "Resumo executivo objetivo.",
+            "topics": [],
+            "global_decisions": [],
+            "global_pending_items": [],
+            "global_next_steps": [],
+            "additional_notes": [],
+        }
+
+        router = MagicMock()
+        router.fetch_json.return_value = {"summary": STT_APP.default_accumulated_summary_payload()}
+        router.fetch_agent_prompt.return_value = None
+        router.upload_json = MagicMock()
+        router.upload_text = MagicMock()
+        router.publish_call_index = MagicMock()
+
+        summary_engine = MagicMock()
+        summary_engine.enabled = True
+        summary_engine.final_model = "final-model"
+        summary_engine.final_text_model = "final-text-model"
+        summary_engine.finalize_summary.return_value = final_payload
+        summary_engine.finalize_summary_text.side_effect = RuntimeError("falha ata")
+
+        task = {
+            "room_name": "talk__dev__roomA",
+            "call_session_id": "RM_session-1",
+            "minute_index": -1,
+            "retries": 0,
+        }
+        session_row = {"finalized_at": "2026-04-24T12:00:00+00:00"}
+        final_task_rows = [
+            {
+                "minute_index": -1,
+                "status": "processing",
+                "retries": 0,
+                "updated_at": "2026-04-24T12:00:00+00:00",
+            }
+        ]
+
+        claim_calls = {"count": 0}
+
+        def fake_claim_summary_task(_now_iso: str):
+            if claim_calls["count"] == 0:
+                claim_calls["count"] += 1
+                return task
+            stop_event.set()
+            return None
+
+        done_calls: list[tuple[str, str, int]] = []
+
+        def fake_mark_done(room_name: str, call_session_id: str, minute_index: int, _now_iso: str):
+            done_calls.append((room_name, call_session_id, minute_index))
+            stop_event.set()
+
+        with patch.object(STT_APP, "run_summary_reconciliation_once", new=AsyncMock()):
+            with patch.object(STT_APP, "db_claim_summary_task", side_effect=fake_claim_summary_task):
+                with patch.object(STT_APP, "db_get_session_row", return_value=session_row):
+                    with patch.object(STT_APP, "routing_context_from_session_row", return_value=routing):
+                        with patch.object(STT_APP, "db_get_summary_task_rows", return_value=final_task_rows):
+                            with patch.object(STT_APP, "db_get_session_minute_exports", return_value=[]):
+                                with patch.object(STT_APP, "db_mark_summary_task_done", side_effect=fake_mark_done):
+                                    with patch.object(STT_APP, "db_mark_summary_task_error") as mark_error_mock:
+                                        await asyncio.wait_for(
+                                            STT_APP.summary_worker_loop(stop_event, router, summary_engine),
+                                            timeout=2,
+                                        )
+
+        self.assertEqual(done_calls, [("talk__dev__roomA", "RM_session-1", -1)])
+        mark_error_mock.assert_not_called()
+        router.upload_text.assert_not_called()
+        publish_kwargs = router.publish_call_index.call_args.kwargs
+        self.assertTrue(publish_kwargs["final_summary_ready"])
+        self.assertFalse(publish_kwargs["final_summary_text_ready"])
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -1951,6 +2189,13 @@ class FinalTranscriptTests(unittest.TestCase):
         self.assertEqual(
             STT_APP.session_final_transcript_path(base),
             "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1/final/final_transcript.json",
+        )
+
+    def test_session_final_summary_text_path_matches_expected_structure(self):
+        base = "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1"
+        self.assertEqual(
+            STT_APP.session_final_summary_text_path(base),
+            "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1/final/final_summary_text.txt",
         )
 
     def test_build_final_transcript_payload_uses_room_aggregate(self):
