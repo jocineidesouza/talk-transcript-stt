@@ -167,7 +167,7 @@ Campos principais no retorno:
 - `SUMMARY_MODEL_ACCUMULATED` (padrao `gpt-4.1-mini`)
 - `SUMMARY_MODEL_FINAL` (padrao `gpt-4.1-mini`)
 - `SUMMARY_MODEL_FINAL_TEXT` (padrao `gpt-4.1-mini`)
-- `SUMMARY_FINAL_TEXT_FORMAT` (`markdown|html|text`, padrao `markdown`)
+- `SUMMARY_FINAL_TEXT_FORMAT` (`markdown|html|text`, padrao `html`)
 - `SUMMARY_REQUEST_TIMEOUT_SECONDS` (padrao `300`)
 - `SUMMARY_REQUEST_RETRIES` (padrao `2`, total de 3 tentativas por request)
 - `SUMMARY_REQUEST_RETRY_BASE_SECONDS` (padrao `1.5`)

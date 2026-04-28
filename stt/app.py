@@ -96,9 +96,9 @@ SUMMARY_MODEL_FINAL = os.environ.get(
 SUMMARY_MODEL_FINAL_TEXT = os.environ.get(
     "SUMMARY_MODEL_FINAL_TEXT", "gpt-4.1-mini"
 ).strip()
-SUMMARY_FINAL_TEXT_FORMAT = os.environ.get("SUMMARY_FINAL_TEXT_FORMAT", "markdown").strip().lower()
+SUMMARY_FINAL_TEXT_FORMAT = os.environ.get("SUMMARY_FINAL_TEXT_FORMAT", "html").strip().lower()
 if SUMMARY_FINAL_TEXT_FORMAT not in {"markdown", "html", "text"}:
-    SUMMARY_FINAL_TEXT_FORMAT = "markdown"
+    SUMMARY_FINAL_TEXT_FORMAT = "html"
 SUMMARY_REQUEST_TIMEOUT_SECONDS = max(
     5, int(os.environ.get("SUMMARY_REQUEST_TIMEOUT_SECONDS", "300"))
 )
@@ -272,7 +272,7 @@ DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT = """Você é responsável por transformar 
 
 Você receberá um JSON consolidado de uma reunião finalizada.
 
-Gere uma ata de reunião em Markdown, clara, profissional e fiel aos dados fornecidos.
+Gere uma ata de reunião clara, profissional e fiel aos dados fornecidos.
 
 Regras obrigatórias:
 1. Use exclusivamente as informações presentes no JSON.
@@ -284,12 +284,11 @@ Regras obrigatórias:
 7. Preserve o sentido original de cada campo.
 8. Use linguagem profissional, objetiva e adequada para registro corporativo.
 9. Não mencione o JSON, o modelo, a IA ou o processo de geração.
-10. Retorne somente o conteúdo final da ata em Markdown.
+10. Retorne somente o conteúdo final da ata no formato solicitado.
 11. Não use bloco de código.
 12. Não inclua explicações antes ou depois da ata.
-13. A primeira linha da resposta deve ser exatamente: # Ata de Reunião
-14. É proibido iniciar com análise, justificativa, plano, comentário ou raciocínio.
-15. Não escreva nenhum texto antes ou depois da ata.
+13. É proibido iniciar com análise, justificativa, plano, comentário ou raciocínio.
+14. Não escreva nenhum texto antes ou depois da ata.
 
 Campos esperados no JSON:
 - title
@@ -326,57 +325,57 @@ Instruções de interpretação:
 - confidence pode ser omitido, salvo quando for importante indicar incerteza.
 - room_name, transcript_session_id e call_session_id podem aparecer apenas na identificação se forem úteis; não use esses campos para inferir participantes, contexto ou conteúdo.
 
-Estrutura obrigatória:
+Estrutura obrigatória de conteúdo:
 
-# Ata de Reunião
+Ata de Reunião
 
-## 1. Identificação
+1. Identificação
 
-- **Título:** [usar title]
-- **Tipo de reunião:** [usar conversation_types, se existir]
-- **Data:** usar o campo "updated_at" do JSON para montar a data. Formato: "{dia} de {nome do mês} de {ano} ({dia da semana})". Se updated_at estiver ausente, usar "Não informado".
+- Título: [usar title]
+- Tipo de reunião: [usar conversation_types, se existir]
+- Data: usar o campo "updated_at" do JSON para montar a data. Formato: "{dia} de {nome do mês} de {ano} ({dia da semana})". Se updated_at estiver ausente, usar "Não informado".
 
-## 2. Objetivo da reunião
+2. Objetivo da reunião
 [usar executive_summary]
 
-## 3. Principais assuntos discutidos
+3. Principais assuntos discutidos
 Para cada item em topics:
-### 3.x [name]
+3.x [name]
 
 [summary]
 
 Só inserir Se existirem decisões do tópico:
-**Decisões:**  
-- [decisão]
+Decisões:
+[decisão]
 
 Só inserir Se existirem pendências do tópico:
-**Pendências:**  
-- [pendência]
+Pendências:
+[pendência]
 
 Só inserir Se existirem próximos passos do tópico:
-**Próximos passos:**  
-- [próximo passo]
+Próximos passos:
+[próximo passo]
 
 Se existirem tags relevantes:
-**Tags:** [tags]
+Tags: [tags]
 
-## 4. Decisões registradas
+4. Decisões registradas
 Listar global_decisions.
 Se não houver decisões explícitas, escrever:
 Nenhuma decisão explícita foi registrada.
 
-## 5. Pendências
+5. Pendências
 Listar global_pending_items.
 Se não houver pendências gerais, escrever:
 Nenhuma pendência geral foi registrada.
 
 
-## 6. Próximos passos
+6. Próximos passos
 Listar global_next_steps.
 Se não houver próximos passos gerais, escrever:
 Nenhum próximo passo geral foi registrado.
 
-## 7. Observações adicionais
+7. Observações adicionais
 Listar additional_notes, notes, facts, hypotheses, open_items, quando existirem e forem relevantes.
 
 Se não houver observações adicionais, escrever:
@@ -653,10 +652,75 @@ CONTRACT_SUFFIX_FINAL = (
 
 
 FINAL_SUMMARY_TEXT_REQUIRED_PREFIX = "# Ata de Reunião"
+FINAL_SUMMARY_TEXT_HTML_REQUIRED_PREFIX = "<h1"
+FINAL_SUMMARY_TEXT_MAX_ATTEMPTS = 3
 
 
-def validate_final_summary_text_output(raw_output: str) -> str:
+def normalize_final_summary_text_format(output_format: str) -> str:
+    normalized = str(output_format or "").strip().lower()
+    if normalized not in {"markdown", "html", "text"}:
+        return "markdown"
+    return normalized
+
+
+def final_summary_text_format_instructions(output_format: str) -> str:
+    normalized = normalize_final_summary_text_format(output_format)
+    common = (
+        "Regras obrigatorias de formato:\n"
+        "- Retorne apenas o documento final da ata.\n"
+        "- Nao inclua explicacoes, analise, justificativa, plano, raciocinio ou comentarios.\n"
+        "- Nao use blocos de codigo.\n"
+    )
+    if normalized == "html":
+        return common + (
+            "- Formato de saida: HTML.\n"
+            "- Gere um fragmento HTML simples, nao um documento completo.\n"
+            "- A primeira linha deve comecar diretamente com <h1>Ata de Reuniao</h1> ou <h1>Ata de Reunião</h1>.\n"
+            "- Use tags semanticas simples como h1, h2, h3, p, ul, li e strong.\n"
+            "- Nao use Markdown; nao comece com #; nao use ```html.\n"
+        )
+    if normalized == "text":
+        return common + (
+            "- Formato de saida: texto simples.\n"
+            "- Nao use Markdown estrutural, HTML ou blocos de codigo.\n"
+            "- Comece diretamente pelo titulo Ata de Reuniao.\n"
+        )
+    return common + (
+        "- Formato de saida: Markdown.\n"
+        f"- A primeira linha da resposta deve ser exatamente: {FINAL_SUMMARY_TEXT_REQUIRED_PREFIX}\n"
+        "- Use cabecalhos Markdown e listas Markdown quando necessario.\n"
+    )
+
+
+def build_final_summary_text_system_prompt(
+    system_prompt: str | None,
+    output_format: str,
+) -> str:
+    base_prompt = (
+        system_prompt.strip()
+        if isinstance(system_prompt, str) and system_prompt.strip()
+        else DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT.strip()
+    )
+    return f"{base_prompt}\n\n{final_summary_text_format_instructions(output_format)}"
+
+
+def validate_final_summary_text_output(raw_output: str, output_format: str = "markdown") -> str:
+    normalized_format = normalize_final_summary_text_format(output_format)
     text = raw_output.strip() if isinstance(raw_output, str) else ""
+    if not text:
+        raise RuntimeError("ata textual final invalida: resposta vazia")
+    if text.startswith("```"):
+        raise RuntimeError("ata textual final invalida: resposta nao deve usar bloco de codigo")
+    if normalized_format == "html":
+        if text.startswith("#"):
+            raise RuntimeError("ata textual final invalida: HTML nao deve iniciar com Markdown")
+        if not text.lower().startswith(FINAL_SUMMARY_TEXT_HTML_REQUIRED_PREFIX):
+            raise RuntimeError(
+                "ata textual final invalida: resposta HTML deve iniciar diretamente com '<h1'"
+            )
+        return text
+    if normalized_format == "text":
+        return text
     if not text.startswith(FINAL_SUMMARY_TEXT_REQUIRED_PREFIX):
         raise RuntimeError(
             "ata textual final invalida: resposta deve iniciar exatamente com "
@@ -4203,46 +4267,42 @@ class SummaryEngine:
         output_format: str,
         system_prompt: str | None = None,
     ) -> str:
-        effective_prompt = (
-            system_prompt.strip()
-            if isinstance(system_prompt, str) and system_prompt.strip()
-            else DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT.strip()
-        )
+        normalized_format = normalize_final_summary_text_format(output_format)
+        effective_prompt = build_final_summary_text_system_prompt(system_prompt, normalized_format)
         summary_payload = final_summary if isinstance(final_summary, dict) else {}
         user_prompt = (
             "Gere a ata textual final a partir do JSON abaixo.\n"
-            f"Formato de saida esperado: {output_format}.\n"
+            f"Formato de saida esperado: {normalized_format}.\n"
             "Retorne apenas o documento final em texto, sem blocos de codigo.\n\n"
             "JSON do resumo final:\n"
             f"{json.dumps(summary_payload, ensure_ascii=True, indent=2)}"
         )
-        raw_output = self._request_text(
-            kind=None,
-            model=self.final_text_model,
-            system_prompt=effective_prompt,
-            user_prompt=user_prompt,
-        )
-        try:
-            return validate_final_summary_text_output(raw_output)
-        except RuntimeError as first_error:
-            retry_prompt = (
-                "A resposta anterior foi inválida porque incluiu texto fora da ata ou não começou "
-                f"com {FINAL_SUMMARY_TEXT_REQUIRED_PREFIX!r}.\n"
-                "Gere novamente. A primeira linha deve ser exatamente "
-                f"{FINAL_SUMMARY_TEXT_REQUIRED_PREFIX}.\n"
-                "Não inclua análise, justificativa, plano, raciocínio, comentários ou blocos de código.\n\n"
-                f"{user_prompt}"
-            )
-            retry_output = self._request_text(
+        request_prompt = user_prompt
+        first_error: RuntimeError | None = None
+        last_error: RuntimeError | None = None
+        for attempt in range(FINAL_SUMMARY_TEXT_MAX_ATTEMPTS):
+            raw_output = self._request_text(
                 kind=None,
                 model=self.final_text_model,
                 system_prompt=effective_prompt,
-                user_prompt=retry_prompt,
+                user_prompt=request_prompt,
             )
             try:
-                return validate_final_summary_text_output(retry_output)
-            except RuntimeError as retry_error:
-                raise RuntimeError(str(retry_error)) from first_error
+                return validate_final_summary_text_output(raw_output, normalized_format)
+            except RuntimeError as exc:
+                if first_error is None:
+                    first_error = exc
+                last_error = exc
+                if attempt >= FINAL_SUMMARY_TEXT_MAX_ATTEMPTS - 1:
+                    break
+                request_prompt = (
+                    f"A resposta anterior foi inválida: {exc}.\n"
+                    "Gere novamente obedecendo estritamente as regras obrigatorias de formato.\n"
+                    "Não inclua análise, justificativa, plano, raciocínio, comentários ou blocos de código.\n\n"
+                    f"{final_summary_text_format_instructions(normalized_format)}\n"
+                    f"{user_prompt}"
+                )
+        raise RuntimeError(str(last_error or first_error)) from first_error
 
 def session_summary_accumulated_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "summary/accumulated.json")
@@ -4856,6 +4916,7 @@ async def run_summary_reconciliation_once() -> None:
             and final_retries >= SUMMARY_MAX_RETRIES
             and SUMMARY_FINAL_ENABLE_DETERMINISTIC_FALLBACK
             and "ata final markdown" not in final_error_message.lower()
+            and "ata final textual" not in final_error_message.lower()
         ):
             reopened = await asyncio.to_thread(
                 db_schedule_final_summary_task,
@@ -5447,10 +5508,11 @@ async def summary_worker_loop(
                             call_session_id,
                         )
                         logger.info(
-                            "enviando ata final markdown para o storage room=%s session=%s path=%s",
+                            "enviando ata final textual para o storage room=%s session=%s path=%s format=%s",
                             room_name,
                             call_session_id,
                             final_summary_text_path,
+                            SUMMARY_FINAL_TEXT_FORMAT,
                         )
                         await asyncio.to_thread(
                             firebase_router.upload_text,
@@ -5491,21 +5553,23 @@ async def summary_worker_loop(
                             final_summary_text_ready=False,
                         )
                         logger.info(
-                            "registrando metadata ata final markdown no firestore room=%s session=%s ready=false",
+                            "registrando metadata ata final textual no firestore room=%s session=%s ready=false format=%s",
                             room_name,
                             call_session_id,
+                            SUMMARY_FINAL_TEXT_FORMAT,
                         )
-                        raise RuntimeError(f"falha ao gerar/enviar ata final markdown: {exc}") from exc
+                        raise RuntimeError(f"falha ao gerar/enviar ata final textual: {exc}") from exc
                     logger.info(
                         "registrando metadata ata final json no firestore room=%s session=%s",
                         room_name,
                         call_session_id,
                     )
                     logger.info(
-                        "registrando metadata ata final markdown no firestore room=%s session=%s ready=%s",
+                        "registrando metadata ata final textual no firestore room=%s session=%s ready=%s format=%s",
                         room_name,
                         call_session_id,
                         final_summary_text_ready,
+                        SUMMARY_FINAL_TEXT_FORMAT,
                     )
                     await asyncio.to_thread(
                         firebase_router.publish_call_index,

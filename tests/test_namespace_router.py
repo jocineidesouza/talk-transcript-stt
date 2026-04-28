@@ -428,12 +428,17 @@ class SummaryEnginePromptTests(unittest.TestCase):
 
         self.assertEqual(request_mock.call_args_list[0].kwargs["kind"], None)
         self.assertEqual(request_mock.call_args_list[0].kwargs["model"], "final-text-model")
-        self.assertEqual(request_mock.call_args_list[0].kwargs["system_prompt"], "PROMPT_ATA")
-        self.assertIn("Formato de saida esperado: markdown.", request_mock.call_args_list[0].kwargs["user_prompt"])
-        self.assertEqual(
-            request_mock.call_args_list[1].kwargs["system_prompt"],
-            STT_APP.DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT.strip(),
+        self.assertIn("PROMPT_ATA", request_mock.call_args_list[0].kwargs["system_prompt"])
+        self.assertIn(
+            "Formato de saida: Markdown.",
+            request_mock.call_args_list[0].kwargs["system_prompt"],
         )
+        self.assertIn("Formato de saida esperado: markdown.", request_mock.call_args_list[0].kwargs["user_prompt"])
+        self.assertIn(
+            STT_APP.DEFAULT_FINALIZE_SUMMARY_TEXT_PROMPT.strip(),
+            request_mock.call_args_list[1].kwargs["system_prompt"],
+        )
+        self.assertIn("Formato de saida: Markdown.", request_mock.call_args_list[1].kwargs["system_prompt"])
 
     def test_finalize_summary_text_accepts_valid_output_without_retry(self):
         engine = self.build_engine()
@@ -448,6 +453,21 @@ class SummaryEnginePromptTests(unittest.TestCase):
 
         self.assertEqual(result, "# Ata de Reunião\n\nConteúdo final.")
         self.assertEqual(request_mock.call_count, 1)
+
+    def test_finalize_summary_text_accepts_valid_html_without_retry(self):
+        engine = self.build_engine()
+        final_summary = {"title": "Ata de Alinhamento"}
+
+        with patch.object(
+            engine,
+            "_request_text",
+            return_value="<h1>Ata de Reunião</h1>\n<section><p>Conteúdo final.</p></section>",
+        ) as request_mock:
+            result = engine.finalize_summary_text(final_summary, "html")
+
+        self.assertTrue(result.startswith("<h1>Ata de Reunião</h1>"))
+        self.assertEqual(request_mock.call_count, 1)
+        self.assertIn("Formato de saida: HTML.", request_mock.call_args.kwargs["system_prompt"])
 
     def test_finalize_summary_text_retries_invalid_output_once(self):
         engine = self.build_engine()
@@ -470,7 +490,25 @@ class SummaryEnginePromptTests(unittest.TestCase):
             request_mock.call_args_list[1].kwargs["user_prompt"],
         )
 
-    def test_finalize_summary_text_raises_after_two_invalid_outputs(self):
+    def test_finalize_summary_text_retries_html_markdown_then_accepts_html(self):
+        engine = self.build_engine()
+        final_summary = {"title": "Ata de Alinhamento"}
+
+        with patch.object(
+            engine,
+            "_request_text",
+            side_effect=[
+                "# Ata de Reunião\n\nConteúdo em markdown.",
+                "<h1>Ata de Reunião</h1>\n<section><p>Conteúdo final.</p></section>",
+            ],
+        ) as request_mock:
+            result = engine.finalize_summary_text(final_summary, "html")
+
+        self.assertTrue(result.startswith("<h1>Ata de Reunião</h1>"))
+        self.assertEqual(request_mock.call_count, 2)
+        self.assertIn("HTML nao deve iniciar com Markdown", request_mock.call_args_list[1].kwargs["user_prompt"])
+
+    def test_finalize_summary_text_raises_after_three_invalid_outputs(self):
         engine = self.build_engine()
         final_summary = {"title": "Ata de Alinhamento"}
 
@@ -480,12 +518,31 @@ class SummaryEnginePromptTests(unittest.TestCase):
             side_effect=[
                 "We need to generate the ata first.",
                 "The JSON contains a title.",
+                "Still not an ata.",
             ],
         ) as request_mock:
             with self.assertRaisesRegex(RuntimeError, "ata textual final invalida"):
                 engine.finalize_summary_text(final_summary, "markdown")
 
-        self.assertEqual(request_mock.call_count, 2)
+        self.assertEqual(request_mock.call_count, 3)
+
+    def test_finalize_summary_text_raises_after_three_invalid_html_outputs(self):
+        engine = self.build_engine()
+        final_summary = {"title": "Ata de Alinhamento"}
+
+        with patch.object(
+            engine,
+            "_request_text",
+            side_effect=[
+                "Antes da ata\n<h1>Ata de Reunião</h1>",
+                "```html\n<h1>Ata de Reunião</h1>\n```",
+                "# Ata de Reunião",
+            ],
+        ) as request_mock:
+            with self.assertRaisesRegex(RuntimeError, "ata textual final invalida"):
+                engine.finalize_summary_text(final_summary, "html")
+
+        self.assertEqual(request_mock.call_count, 3)
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -2277,7 +2334,7 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done_calls, [])
         self.assertEqual(len(error_calls), 1)
         self.assertEqual(error_calls[0][:4], ("talk__dev__roomA", "RM_session-1", -1, 1))
-        self.assertIn("falha ao gerar/enviar ata final markdown", error_calls[0][4])
+        self.assertIn("falha ao gerar/enviar ata final textual", error_calls[0][4])
         router.upload_text.assert_not_called()
         publish_kwargs = router.publish_call_index.call_args.kwargs
         self.assertTrue(publish_kwargs["final_summary_ready"])
