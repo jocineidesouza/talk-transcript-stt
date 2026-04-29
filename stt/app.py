@@ -216,11 +216,11 @@ Regras obrigatorias:
 
 Regras especificas para assuntos:
 - Mesclar assuntos equivalentes mesmo com nomes levemente diferentes.
-- Preferir nomes curtos, claros e reutilizaveis para assuntos recorrentes.
+- Preferir nomes curtos, claros, amigaveis, com acentuacao normal e reutilizaveis para assuntos recorrentes.
 - Nao criar microassuntos desnecessarios.
-- Se um novo item pertencer claramente a um assunto ja existente, reutilizar esse assunto.
+- Se um novo item pertencer claramente a um assunto ja existente, inserir o item dentro desse assunto.
 - Atualizar o summary do assunto para refletir o estado mais atual e mais util do tema.
-- Cada item deve permanecer associado a exatamente um assunto principal.
+- Cada item de facts, hypotheses, decisions, open_items, next_steps e notes deve ficar dentro de exatamente um topico principal.
 - Um assunto pode ter status: active, open, resolved ou uncertain.
 - Nao remover assunto antigo so porque ele nao apareceu no trecho atual.
 - Se houver continuidade clara, manter o mesmo nome do assunto anterior.
@@ -235,7 +235,7 @@ Limites:
 DEFAULT_FINALIZE_SUMMARY_PROMPT = """Voce e um assistente especializado em produzir ata final estruturada de chamadas corporativas em portugues do Brasil.
 
 Entrada:
-- Estado acumulado em JSON.
+- Estado acumulado em JSON, com facts, hypotheses, decisions, open_items, next_steps e notes organizados dentro de cada topico.
 
 Tarefa:
 - Gerar uma ata final fiel, clara, conservadora e util para exibicao em frontend.
@@ -303,12 +303,6 @@ Campos esperados no JSON:
 - global_pending_items
 - global_next_steps
 - additional_notes
-- facts
-- hypotheses
-- decisions
-- open_items
-- next_steps
-- notes
 
 Instruções de interpretação:
 - title deve ser usado como título da reunião.
@@ -316,11 +310,9 @@ Instruções de interpretação:
 - executive_summary deve compor o resumo executivo.
 - topics devem ser listados como temas discutidos.
 - decisions e global_decisions devem ser tratados como decisões somente se estiverem explicitamente registrados como decisões.
-- pending_items, global_pending_items e open_items devem ser tratados como pendências.
+- pending_items e global_pending_items devem ser tratados como pendências.
 - next_steps e global_next_steps devem ser tratados como próximos passos.
-- additional_notes e notes devem ser tratados como observações adicionais.
-- hypotheses devem ser identificadas como hipóteses, não como fatos.
-- facts devem ser identificados como fatos registrados.
+- additional_notes deve ser tratado como observações adicionais.
 - tags podem ser usadas apenas como apoio organizacional, sem virar conteúdo novo.
 - confidence pode ser omitido, salvo quando for importante indicar incerteza.
 - room_name, transcript_session_id e call_session_id podem aparecer apenas na identificação se forem úteis; não use esses campos para inferir participantes, contexto ou conteúdo.
@@ -376,7 +368,7 @@ Se não houver próximos passos gerais, escrever:
 Nenhum próximo passo geral foi registrado.
 
 7. Observações adicionais
-Listar additional_notes, notes, facts, hypotheses, open_items, quando existirem e forem relevantes.
+Listar additional_notes, quando existirem e forem relevantes.
 
 Se não houver observações adicionais, escrever:
 Nenhuma observação adicional foi registrada.
@@ -403,6 +395,14 @@ SUMMARY_FINAL_TITLE_MAX_CHARS = 120
 SUMMARY_FINAL_TITLE_FALLBACK = "Ata da reunião"
 SUMMARY_MINUTE_MAX_ITEMS = 20
 SUMMARY_FINAL_MAX_ITEMS = 30
+SUMMARY_ACCUMULATED_SECTION_KEYS = (
+    "facts",
+    "hypotheses",
+    "decisions",
+    "open_items",
+    "next_steps",
+    "notes",
+)
 
 
 def _topic_schema(topic_status: list[str]) -> dict:
@@ -419,6 +419,20 @@ def _topic_schema(topic_status: list[str]) -> dict:
     }
 
 
+def _summary_item_without_topic_schema(status_values: list[str], confidence_values: list[str]) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "text": {"type": "string"},
+            "confidence": {"type": "string", "enum": confidence_values},
+            "status": {"type": "string", "enum": status_values},
+            "tags": SUMMARY_STRING_ARRAY_SCHEMA,
+        },
+        "required": ["text", "confidence", "status", "tags"],
+    }
+
+
 def _summary_item_schema(status_values: list[str], confidence_values: list[str]) -> dict:
     return {
         "type": "object",
@@ -431,6 +445,57 @@ def _summary_item_schema(status_values: list[str], confidence_values: list[str])
             "name": {"type": "string"},
         },
         "required": ["text", "confidence", "status", "tags", "name"],
+    }
+
+
+def _accumulated_topic_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"type": "string"},
+            "summary": {"type": "string"},
+            "status": {"type": "string", "enum": ["active", "open", "resolved", "uncertain"]},
+            "tags": SUMMARY_STRING_ARRAY_SCHEMA,
+            "facts": {
+                "type": "array",
+                "items": _summary_item_without_topic_schema(
+                    ["confirmed", "uncertain"], ["high", "medium", "low"]
+                ),
+            },
+            "hypotheses": {
+                "type": "array",
+                "items": _summary_item_without_topic_schema(["uncertain"], ["medium", "low"]),
+            },
+            "decisions": {
+                "type": "array",
+                "items": _summary_item_without_topic_schema(["confirmed"], ["high", "medium", "low"]),
+            },
+            "open_items": {
+                "type": "array",
+                "items": _summary_item_without_topic_schema(["open"], ["high", "medium", "low"]),
+            },
+            "next_steps": {
+                "type": "array",
+                "items": _summary_item_without_topic_schema(["planned"], ["high", "medium", "low"]),
+            },
+            "notes": {
+                "type": "array",
+                "items": _summary_item_without_topic_schema(["uncertain", "info"], ["medium", "low"]),
+            },
+        },
+        "required": [
+            "name",
+            "summary",
+            "status",
+            "tags",
+            "facts",
+            "hypotheses",
+            "decisions",
+            "open_items",
+            "next_steps",
+            "notes",
+        ],
     }
 
 
@@ -498,41 +563,11 @@ SUMMARY_SCHEMA_ACCUMULATED = {
             "type": "array",
             "items": {"type": "string", "enum": SUMMARY_CONVERSATION_TYPE_ENUM},
         },
-        "topics": {"type": "array", "items": _topic_schema(["active", "open", "resolved", "uncertain"])},
-        "facts": {
-            "type": "array",
-            "items": _summary_item_schema(["confirmed", "uncertain"], ["high", "medium", "low"]),
-        },
-        "hypotheses": {
-            "type": "array",
-            "items": _summary_item_schema(["uncertain"], ["medium", "low"]),
-        },
-        "decisions": {
-            "type": "array",
-            "items": _summary_item_schema(["confirmed"], ["high", "medium", "low"]),
-        },
-        "open_items": {
-            "type": "array",
-            "items": _summary_item_schema(["open"], ["high", "medium", "low"]),
-        },
-        "next_steps": {
-            "type": "array",
-            "items": _summary_item_schema(["planned"], ["high", "medium", "low"]),
-        },
-        "notes": {
-            "type": "array",
-            "items": _summary_item_schema(["uncertain", "info"], ["medium", "low"]),
-        },
+        "topics": {"type": "array", "items": _accumulated_topic_schema()},
     },
     "required": [
         "conversation_types",
         "topics",
-        "facts",
-        "hypotheses",
-        "decisions",
-        "open_items",
-        "next_steps",
-        "notes",
     ],
 }
 
@@ -635,9 +670,10 @@ CONTRACT_SUFFIX_ACCUMULATED = (
     "- Retorne APENAS JSON valido, sem markdown, sem explicacoes e sem texto adicional.\n"
     "- Nao adicionar campos fora do contrato.\n"
     "- Regra obrigatoria de topicos:\n"
-    "  * Cada item em facts, hypotheses, decisions, open_items, next_steps e notes deve ter um campo name.\n"
-    "  * Se vier campo topic, normalize para name.\n"
-    "  * name deve corresponder ao name de um item em topics.\n"
+    "  * facts, hypotheses, decisions, open_items, next_steps e notes ficam dentro de cada item de topics.\n"
+    "  * Itens internos nao devem ter campo name nem topic.\n"
+    "  * topics[].name deve ser curto, claro, amigavel, em portugues natural e pode usar acentos.\n"
+    "  * Se houver continuidade clara, mantenha o mesmo topics[].name usado antes.\n"
     "- O formato final e controlado por schema estrito da API; siga as regras sem adicionar texto fora do JSON.\n"
 )
 
@@ -803,6 +839,7 @@ def validate_summary_item(
     max_text: int,
     include_status: bool,
     include_topic: bool,
+    strict_confidence: bool = False,
 ) -> dict:
     if not isinstance(item, dict):
         raise RuntimeError(f"{label} deve ser objeto")
@@ -829,6 +866,8 @@ def validate_summary_item(
     if isinstance(normalized_confidence, str) and normalized_confidence in allowed_confidence:
         confidence = normalized_confidence
     else:
+        if strict_confidence:
+            raise RuntimeError(f"{label}.confidence invalido")
         confidence = "medium" if "medium" in allowed_confidence else "low"
         logger.warning(
             "summary confidence normalized field=%s raw=%s normalized=%s allowed=%s",
@@ -1116,12 +1155,6 @@ def default_accumulated_summary_payload() -> dict:
     return {
         "conversation_types": [],
         "topics": [],
-        "facts": [],
-        "hypotheses": [],
-        "decisions": [],
-        "open_items": [],
-        "next_steps": [],
-        "notes": [],
     }
 
 
@@ -1244,12 +1277,6 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
     required_keys = {
         "conversation_types",
         "topics",
-        "facts",
-        "hypotheses",
-        "decisions",
-        "open_items",
-        "next_steps",
-        "notes",
     }
     assert_no_extra_keys(payload, required_keys, SUMMARY_KIND_ACCUMULATED)
     for key in required_keys:
@@ -1267,100 +1294,111 @@ def validate_accumulated_summary_payload(payload: dict) -> dict:
             continue
         seen_types.add(item)
         conversation_types.append(item)
-    topics = validate_summary_topics(
-        payload.get("topics"),
-        "topics",
-        None,
-        SUMMARY_ALLOWED_TOPIC_STATUS_ACCUMULATED,
-        240,
-    )
-    facts = validate_summary_list(
-        payload.get("facts"),
-        "facts",
-        SUMMARY_ACCUMULATED_MAX_ITEMS,
-        lambda item, label: validate_summary_item(
-            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed", "uncertain"}, 240, True, True
-        ),
-        truncate_excess=True,
-    )
-    hypotheses = validate_summary_list(
-        payload.get("hypotheses"),
-        "hypotheses",
-        SUMMARY_ACCUMULATED_MAX_ITEMS,
-        lambda item, label: validate_summary_item(
-            item, label, {"medium", "low"}, {"uncertain"}, 240, True, True
-        ),
-        truncate_excess=True,
-    )
-    decisions = validate_summary_list(
-        payload.get("decisions"),
-        "decisions",
-        SUMMARY_ACCUMULATED_MAX_ITEMS,
-        lambda item, label: validate_summary_item(
-            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True, True
-        ),
-        truncate_excess=True,
-    )
-    open_items = validate_summary_list(
-        payload.get("open_items"),
-        "open_items",
-        SUMMARY_ACCUMULATED_MAX_ITEMS,
-        lambda item, label: validate_summary_item(
-            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True, True
-        ),
-        truncate_excess=True,
-    )
-    next_steps = validate_summary_list(
-        payload.get("next_steps"),
-        "next_steps",
-        SUMMARY_ACCUMULATED_MAX_ITEMS,
-        lambda item, label: validate_summary_item(
-            item, label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True, True
-        ),
-        truncate_excess=True,
-    )
-    notes = validate_summary_list(
-        payload.get("notes"),
-        "notes",
-        SUMMARY_ACCUMULATED_MAX_ITEMS,
-        lambda item, label: validate_summary_item(
-            item, label, {"medium", "low"}, {"uncertain", "info"}, 240, True, True
-        ),
-        truncate_excess=True,
-    )
-    topics, section_map = reconcile_accumulated_topics_and_references(
-        topics,
-        {
-            "facts": facts,
-            "hypotheses": hypotheses,
-            "decisions": decisions,
-            "open_items": open_items,
-            "next_steps": next_steps,
-            "notes": notes,
-        },
-    )
-    facts = section_map["facts"]
-    hypotheses = section_map["hypotheses"]
-    decisions = section_map["decisions"]
-    open_items = section_map["open_items"]
-    next_steps = section_map["next_steps"]
-    notes = section_map["notes"]
-    topic_names = {topic["name"] for topic in topics}
-    validate_topic_reference(facts, "facts", topic_names)
-    validate_topic_reference(hypotheses, "hypotheses", topic_names)
-    validate_topic_reference(decisions, "decisions", topic_names)
-    validate_topic_reference(open_items, "open_items", topic_names)
-    validate_topic_reference(next_steps, "next_steps", topic_names)
-    validate_topic_reference(notes, "notes", topic_names)
+
+    topics_raw = payload.get("topics")
+    if not isinstance(topics_raw, list):
+        raise RuntimeError("topics deve ser array")
+    topics: list[dict] = []
+    seen_topic_names: set[str] = set()
+    for index, item in enumerate(topics_raw):
+        label = f"topics[{index}]"
+        if not isinstance(item, dict):
+            raise RuntimeError(f"{label} deve ser objeto")
+        expected_keys = {"name", "summary", "status", "tags", *SUMMARY_ACCUMULATED_SECTION_KEYS}
+        assert_no_extra_keys(item, expected_keys, label)
+        topic = validate_summary_topic(
+            {
+                "name": item.get("name"),
+                "summary": item.get("summary"),
+                "status": item.get("status"),
+                "tags": item.get("tags"),
+            },
+            label,
+            SUMMARY_ALLOWED_TOPIC_STATUS_ACCUMULATED,
+            240,
+        )
+        if topic["name"] in seen_topic_names:
+            raise RuntimeError(f"{label}.name duplicado")
+        seen_topic_names.add(topic["name"])
+        topic["facts"] = validate_summary_list(
+            item.get("facts"),
+            f"{label}.facts",
+            SUMMARY_ACCUMULATED_MAX_ITEMS,
+            lambda raw_item, item_label: validate_summary_item(
+                raw_item,
+                item_label,
+                SUMMARY_ALLOWED_CONFIDENCE,
+                {"confirmed", "uncertain"},
+                240,
+                True,
+                False,
+            ),
+            truncate_excess=True,
+        )
+        topic["hypotheses"] = validate_summary_list(
+            item.get("hypotheses"),
+            f"{label}.hypotheses",
+            SUMMARY_ACCUMULATED_MAX_ITEMS,
+            lambda raw_item, item_label: validate_summary_item(
+                raw_item,
+                item_label,
+                {"medium", "low"},
+                {"uncertain"},
+                240,
+                True,
+                False,
+                True,
+            ),
+            truncate_excess=True,
+        )
+        topic["decisions"] = validate_summary_list(
+            item.get("decisions"),
+            f"{label}.decisions",
+            SUMMARY_ACCUMULATED_MAX_ITEMS,
+            lambda raw_item, item_label: validate_summary_item(
+                raw_item, item_label, SUMMARY_ALLOWED_CONFIDENCE, {"confirmed"}, 240, True, False
+            ),
+            truncate_excess=True,
+        )
+        topic["open_items"] = validate_summary_list(
+            item.get("open_items"),
+            f"{label}.open_items",
+            SUMMARY_ACCUMULATED_MAX_ITEMS,
+            lambda raw_item, item_label: validate_summary_item(
+                raw_item, item_label, SUMMARY_ALLOWED_CONFIDENCE, {"open"}, 240, True, False
+            ),
+            truncate_excess=True,
+        )
+        topic["next_steps"] = validate_summary_list(
+            item.get("next_steps"),
+            f"{label}.next_steps",
+            SUMMARY_ACCUMULATED_MAX_ITEMS,
+            lambda raw_item, item_label: validate_summary_item(
+                raw_item, item_label, SUMMARY_ALLOWED_CONFIDENCE, {"planned"}, 240, True, False
+            ),
+            truncate_excess=True,
+        )
+        topic["notes"] = validate_summary_list(
+            item.get("notes"),
+            f"{label}.notes",
+            SUMMARY_ACCUMULATED_MAX_ITEMS,
+            lambda raw_item, item_label: validate_summary_item(
+                raw_item,
+                item_label,
+                {"medium", "low"},
+                {"uncertain", "info"},
+                240,
+                True,
+                False,
+                True,
+            ),
+            truncate_excess=True,
+        )
+        topics.append(topic)
+
     return {
         "conversation_types": conversation_types,
         "topics": topics,
-        "facts": facts,
-        "hypotheses": hypotheses,
-        "decisions": decisions,
-        "open_items": open_items,
-        "next_steps": next_steps,
-        "notes": notes,
     }
 
 
@@ -4461,27 +4499,34 @@ def build_accumulated_from_minute_summaries(minute_summaries: list[dict]) -> dic
         "notes": set(),
     }
 
-    def ensure_topic(name: str, summary: str, status: str, tags: list[str]) -> None:
+    def ensure_topic(name: str, summary: str, status: str, tags: list[str]) -> dict | None:
         if name in topic_index:
             idx = topic_index[name]
             current = accumulated["topics"][idx]
             if summary:
                 current["summary"] = summary
-            current["status"] = status
+            if status != "uncertain" or current.get("status") == "uncertain":
+                current["status"] = status
             current["tags"] = validate_summary_tags(current.get("tags", []) + tags, f"topics[{idx}]")
-            return
+            return current
         if len(accumulated["topics"]) >= 20:
-            return
+            return None
         idx = len(accumulated["topics"])
         topic_index[name] = idx
-        accumulated["topics"].append(
-            {
-                "name": name,
-                "summary": summary or "Assunto consolidado a partir dos minutos recuperados.",
-                "status": status,
-                "tags": validate_summary_tags(tags, f"topics[{idx}]"),
-            }
-        )
+        topic = {
+            "name": name,
+            "summary": summary or "Assunto consolidado a partir dos minutos recuperados.",
+            "status": status,
+            "tags": validate_summary_tags(tags, f"topics[{idx}]"),
+            "facts": [],
+            "hypotheses": [],
+            "decisions": [],
+            "open_items": [],
+            "next_steps": [],
+            "notes": [],
+        }
+        accumulated["topics"].append(topic)
+        return topic
 
     for minute_summary in minute_summaries:
         chunk_type = str(minute_summary.get("chunk_type", "")).strip()
@@ -4508,12 +4553,14 @@ def build_accumulated_from_minute_summaries(minute_summaries: list[dict]) -> dic
                 name = str(item.get("name", "")).strip()
                 if not name:
                     continue
-                ensure_topic(
+                topic = ensure_topic(
                     name,
                     "Assunto consolidado a partir dos minutos recuperados.",
                     "uncertain",
                     [],
                 )
+                if topic is None:
+                    continue
                 text = str(item.get("text", "")).strip()
                 status = str(item.get("status", "")).strip()
                 if not text or not status:
@@ -4521,18 +4568,17 @@ def build_accumulated_from_minute_summaries(minute_summaries: list[dict]) -> dic
                 dedupe_key = (text, status, name)
                 if dedupe_key in seen_items[key]:
                     continue
-                if len(accumulated[key]) >= SUMMARY_ACCUMULATED_MAX_ITEMS:
+                if len(topic[key]) >= SUMMARY_ACCUMULATED_MAX_ITEMS:
                     continue
                 seen_items[key].add(dedupe_key)
                 item_tags = item.get("tags")
                 tags = item_tags if isinstance(item_tags, list) else []
-                accumulated[key].append(
+                topic[key].append(
                     {
                         "text": text,
                         "confidence": str(item.get("confidence", "medium")).strip().lower(),
                         "status": status,
-                        "tags": validate_summary_tags(tags, f"{key}[{len(accumulated[key])}]"),
-                        "name": name,
+                        "tags": validate_summary_tags(tags, f"{key}[{len(topic[key])}]"),
                     }
                 )
 
@@ -4550,17 +4596,11 @@ def build_deterministic_final_summary(
         else default_accumulated_summary_payload()
     )
 
-    def _collect_topic_texts(
-        source_key: str,
-        topic_name: str,
-        limit: int = SUMMARY_FINAL_MAX_ITEMS,
-    ) -> list[str]:
+    def _collect_topic_texts(topic: dict, source_key: str, limit: int = SUMMARY_FINAL_MAX_ITEMS) -> list[str]:
         texts: list[str] = []
         seen: set[str] = set()
-        for item in normalized_acc.get(source_key, []):
+        for item in topic.get(source_key, []):
             if not isinstance(item, dict):
-                continue
-            if str(item.get("name", "")).strip() != topic_name:
                 continue
             text = str(item.get("text", "")).strip()
             if not text or text in seen:
@@ -4583,9 +4623,9 @@ def build_deterministic_final_summary(
             {
                 "name": name,
                 "summary": summary,
-                "decisions": _collect_topic_texts("decisions", name),
-                "pending_items": _collect_topic_texts("open_items", name),
-                "next_steps": _collect_topic_texts("next_steps", name),
+                "decisions": _collect_topic_texts(topic, "decisions"),
+                "pending_items": _collect_topic_texts(topic, "open_items"),
+                "next_steps": _collect_topic_texts(topic, "next_steps"),
                 "tags": validate_summary_tags(topic.get("tags"), f"final.topics[{len(final_topics)}]"),
             }
         )
@@ -4593,23 +4633,26 @@ def build_deterministic_final_summary(
     def _global_items(source_key: str) -> list[dict]:
         items: list[dict] = []
         seen: set[str] = set()
-        for item in normalized_acc.get(source_key, []):
-            if not isinstance(item, dict):
+        for topic in normalized_acc.get("topics", []):
+            if not isinstance(topic, dict):
                 continue
-            text = str(item.get("text", "")).strip()
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            tags = item.get("tags")
-            items.append(
-                {
-                    "text": text,
-                    "confidence": str(item.get("confidence", "medium")).strip().lower(),
-                    "tags": validate_summary_tags(tags if isinstance(tags, list) else [], source_key),
-                }
-            )
-            if len(items) >= SUMMARY_FINAL_MAX_ITEMS:
-                break
+            for item in topic.get(source_key, []):
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", "")).strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                tags = item.get("tags")
+                items.append(
+                    {
+                        "text": text,
+                        "confidence": str(item.get("confidence", "medium")).strip().lower(),
+                        "tags": validate_summary_tags(tags if isinstance(tags, list) else [], source_key),
+                    }
+                )
+                if len(items) >= SUMMARY_FINAL_MAX_ITEMS:
+                    return items
         return items
 
     additional_notes = _global_items("notes")

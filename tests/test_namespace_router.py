@@ -635,15 +635,15 @@ class SummarySchemaValidationTests(unittest.TestCase):
                     "summary": f"Resumo {index}",
                     "status": "active",
                     "tags": [],
+                    "facts": [],
+                    "hypotheses": [],
+                    "decisions": [],
+                    "open_items": [],
+                    "next_steps": [],
+                    "notes": [],
                 }
                 for index in range(21)
             ],
-            "facts": [],
-            "hypotheses": [],
-            "decisions": [],
-            "open_items": [],
-            "next_steps": [],
-            "notes": [],
         }
         parsed = STT_APP.validate_accumulated_summary_payload(payload)
         self.assertEqual(len(parsed["topics"]), 21)
@@ -1016,7 +1016,7 @@ class SummarySchemaValidationTests(unittest.TestCase):
         self.assertEqual(normalized["facts"][0]["text"], "fact 0")
         self.assertEqual(normalized["facts"][-1]["text"], "fact 19")
 
-    def test_validate_accumulated_summary_payload_accepts_topics_with_item_reference(self):
+    def test_validate_accumulated_summary_payload_accepts_items_inside_topics(self):
         payload = {
             "conversation_types": ["mista"],
             "topics": [
@@ -1025,27 +1025,65 @@ class SummarySchemaValidationTests(unittest.TestCase):
                     "summary": "Escopo consolidado da fase inicial.",
                     "status": "active",
                     "tags": ["escopo"],
+                    "facts": [
+                        {
+                            "text": "Escopo da fase 1 foi confirmado.",
+                            "confidence": "high",
+                            "status": "confirmed",
+                            "tags": ["escopo"],
+                        }
+                    ],
+                    "hypotheses": [],
+                    "decisions": [],
+                    "open_items": [],
+                    "next_steps": [],
+                    "notes": [],
                 }
             ],
-            "facts": [
-                {
-                    "text": "Escopo da fase 1 foi confirmado.",
-                    "confidence": "high",
-                    "status": "confirmed",
-                    "tags": ["escopo"],
-                    "topic": "Escopo do projeto",
-                }
-            ],
-            "hypotheses": [],
-            "decisions": [],
-            "open_items": [],
-            "next_steps": [],
-            "notes": [],
         }
         normalized = STT_APP.validate_accumulated_summary_payload(payload)
         self.assertEqual(normalized["topics"][0]["status"], "active")
+        self.assertEqual(normalized["topics"][0]["facts"][0]["text"], "Escopo da fase 1 foi confirmado.")
 
-    def test_validate_accumulated_summary_payload_infers_missing_topic_from_item_reference(self):
+    def test_validate_accumulated_summary_payload_accepts_all_topic_sections(self):
+        payload = {
+            "conversation_types": ["mista"],
+            "topics": [
+                {
+                    "name": "Integração com LiveKit",
+                    "summary": "Resumo consolidado do assunto.",
+                    "status": "active",
+                    "tags": ["livekit"],
+                    "facts": [
+                        {"text": "Fato confirmado.", "confidence": "high", "status": "confirmed", "tags": []}
+                    ],
+                    "hypotheses": [
+                        {"text": "Hipotese em aberto.", "confidence": "medium", "status": "uncertain", "tags": []}
+                    ],
+                    "decisions": [
+                        {"text": "Decisao registrada.", "confidence": "high", "status": "confirmed", "tags": []}
+                    ],
+                    "open_items": [
+                        {"text": "Pendencia registrada.", "confidence": "medium", "status": "open", "tags": []}
+                    ],
+                    "next_steps": [
+                        {"text": "Proximo passo planejado.", "confidence": "medium", "status": "planned", "tags": []}
+                    ],
+                    "notes": [
+                        {"text": "Observacao adicional.", "confidence": "low", "status": "info", "tags": []}
+                    ],
+                }
+            ],
+        }
+
+        normalized = STT_APP.validate_accumulated_summary_payload(payload)
+        topic = normalized["topics"][0]
+
+        self.assertEqual(topic["name"], "Integração com LiveKit")
+        self.assertEqual(topic["decisions"][0]["text"], "Decisao registrada.")
+        self.assertEqual(topic["open_items"][0]["status"], "open")
+
+    def test_validate_accumulated_summary_payload_rejects_name_inside_topic_item(self):
         payload = {
             "conversation_types": ["mista"],
             "topics": [
@@ -1054,29 +1092,65 @@ class SummarySchemaValidationTests(unittest.TestCase):
                     "summary": "Escopo consolidado da fase inicial.",
                     "status": "active",
                     "tags": ["escopo"],
+                    "facts": [
+                        {
+                            "text": "Aprovado seguir com homologacao.",
+                            "confidence": "high",
+                            "status": "confirmed",
+                            "tags": ["homologacao"],
+                            "name": "Homologacao",
+                        }
+                    ],
+                    "hypotheses": [],
+                    "decisions": [],
+                    "open_items": [],
+                    "next_steps": [],
+                    "notes": [],
                 }
             ],
-            "facts": [
-                {
-                    "text": "Aprovado seguir com homologacao.",
-                    "confidence": "high",
-                    "status": "confirmed",
-                    "tags": ["homologacao"],
-                    "topic": "Homologacao",
-                }
-            ],
-            "hypotheses": [],
-            "decisions": [],
-            "open_items": [],
-            "next_steps": [],
-            "notes": [],
         }
-        normalized = STT_APP.validate_accumulated_summary_payload(payload)
-        self.assertEqual(normalized["facts"][0]["name"], "Homologacao")
-        self.assertIn(
-            "Homologacao",
-            {topic["name"] for topic in normalized["topics"]},
-        )
+        with self.assertRaises(RuntimeError):
+            STT_APP.validate_accumulated_summary_payload(payload)
+
+    def test_validate_accumulated_summary_payload_rejects_high_confidence_notes_and_hypotheses(self):
+        payload = {
+            "conversation_types": ["mista"],
+            "topics": [
+                {
+                    "name": "Escopo do projeto",
+                    "summary": "Escopo consolidado da fase inicial.",
+                    "status": "active",
+                    "tags": ["escopo"],
+                    "facts": [],
+                    "hypotheses": [],
+                    "decisions": [],
+                    "open_items": [],
+                    "next_steps": [],
+                    "notes": [
+                        {
+                            "text": "Nota nao deve ter confianca alta.",
+                            "confidence": "high",
+                            "status": "info",
+                            "tags": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        with self.assertRaises(RuntimeError):
+            STT_APP.validate_accumulated_summary_payload(payload)
+
+        payload["topics"][0]["notes"] = []
+        payload["topics"][0]["hypotheses"] = [
+            {
+                "text": "Hipotese nao deve ter confianca alta.",
+                "confidence": "high",
+                "status": "uncertain",
+                "tags": [],
+            }
+        ]
+        with self.assertRaises(RuntimeError):
+            STT_APP.validate_accumulated_summary_payload(payload)
 
     def test_validate_minute_summary_payload_rejects_invalid_topic_status(self):
         payload = {
@@ -1140,13 +1214,12 @@ class SummarySchemaValidationTests(unittest.TestCase):
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
 class AccumulatedSummaryLimitsTests(unittest.TestCase):
-    def _item(self, text: str, status: str, confidence: str = "medium", topic: str = "topico_1") -> dict:
+    def _item(self, text: str, status: str, confidence: str = "medium") -> dict:
         return {
             "text": text,
             "confidence": confidence,
             "status": status,
             "tags": ["tag"],
-            "topic": topic,
         }
 
     def _payload(self, notes_count: int = 0, facts_count: int = 0) -> dict:
@@ -1158,37 +1231,37 @@ class AccumulatedSummaryLimitsTests(unittest.TestCase):
                     "summary": "topico consolidado",
                     "status": "active",
                     "tags": ["tag"],
+                    "facts": [self._item(f"fact {i}", "confirmed", "high") for i in range(facts_count)],
+                    "hypotheses": [],
+                    "decisions": [],
+                    "open_items": [],
+                    "next_steps": [],
+                    "notes": [self._item(f"note {i}", "info") for i in range(notes_count)],
                 }
             ],
-            "facts": [self._item(f"fact {i}", "confirmed", "high") for i in range(facts_count)],
-            "hypotheses": [],
-            "decisions": [],
-            "open_items": [],
-            "next_steps": [],
-            "notes": [self._item(f"note {i}", "info") for i in range(notes_count)],
         }
 
     def test_validate_accumulated_summary_accepts_40_notes(self):
         with patch.object(STT_APP, "SUMMARY_ACCUMULATED_MAX_ITEMS", 40):
             payload = self._payload(notes_count=40)
             normalized = STT_APP.validate_accumulated_summary_payload(payload)
-        self.assertEqual(len(normalized["notes"]), 40)
+        self.assertEqual(len(normalized["topics"][0]["notes"]), 40)
 
     def test_validate_accumulated_summary_truncates_41_notes_to_40(self):
         with patch.object(STT_APP, "SUMMARY_ACCUMULATED_MAX_ITEMS", 40):
             payload = self._payload(notes_count=41)
             normalized = STT_APP.validate_accumulated_summary_payload(payload)
-        self.assertEqual(len(normalized["notes"]), 40)
-        self.assertEqual(normalized["notes"][0]["text"], "note 0")
-        self.assertEqual(normalized["notes"][-1]["text"], "note 39")
+        self.assertEqual(len(normalized["topics"][0]["notes"]), 40)
+        self.assertEqual(normalized["topics"][0]["notes"][0]["text"], "note 0")
+        self.assertEqual(normalized["topics"][0]["notes"][-1]["text"], "note 39")
 
     def test_validate_accumulated_summary_truncates_41_facts_to_40(self):
         with patch.object(STT_APP, "SUMMARY_ACCUMULATED_MAX_ITEMS", 40):
             payload = self._payload(facts_count=41)
             normalized = STT_APP.validate_accumulated_summary_payload(payload)
-        self.assertEqual(len(normalized["facts"]), 40)
-        self.assertEqual(normalized["facts"][0]["text"], "fact 0")
-        self.assertEqual(normalized["facts"][-1]["text"], "fact 39")
+        self.assertEqual(len(normalized["topics"][0]["facts"]), 40)
+        self.assertEqual(normalized["topics"][0]["facts"][0]["text"], "fact 0")
+        self.assertEqual(normalized["topics"][0]["facts"][-1]["text"], "fact 39")
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
@@ -1238,12 +1311,6 @@ class SummaryEngineRetryTests(unittest.TestCase):
         return {
             "conversation_types": [],
             "topics": [],
-            "facts": [],
-            "hypotheses": [],
-            "decisions": [],
-            "open_items": [],
-            "next_steps": [],
-            "notes": [],
         }
 
     def _final_payload(self) -> dict:
@@ -1789,7 +1856,8 @@ class SummaryFinalResilienceTests(unittest.TestCase):
         accumulated = STT_APP.build_accumulated_from_minute_summaries([minute])
         self.assertEqual(accumulated["conversation_types"], ["mista"])
         self.assertEqual(accumulated["topics"][0]["status"], "active")
-        self.assertEqual(accumulated["facts"][0]["name"], "Planejamento")
+        self.assertEqual(accumulated["topics"][0]["facts"][0]["text"], "Prazo preliminar definido para sexta.")
+        self.assertNotIn("name", accumulated["topics"][0]["facts"][0])
 
     def test_build_deterministic_final_summary_includes_partial_disclosure(self):
         accumulated = {
@@ -1800,22 +1868,21 @@ class SummaryFinalResilienceTests(unittest.TestCase):
                     "summary": "Discussao do cronograma.",
                     "status": "active",
                     "tags": ["prazo"],
+                    "facts": [],
+                    "hypotheses": [],
+                    "decisions": [
+                        {
+                            "text": "Follow-up marcado para sexta.",
+                            "confidence": "high",
+                            "status": "confirmed",
+                            "tags": ["followup"],
+                        }
+                    ],
+                    "open_items": [],
+                    "next_steps": [],
+                    "notes": [],
                 }
             ],
-            "facts": [],
-            "hypotheses": [],
-            "decisions": [
-                {
-                    "text": "Follow-up marcado para sexta.",
-                    "confidence": "high",
-                    "status": "confirmed",
-                    "tags": ["followup"],
-                    "name": "Cronograma",
-                }
-            ],
-            "open_items": [],
-            "next_steps": [],
-            "notes": [],
         }
         final_payload = STT_APP.build_deterministic_final_summary(
             accumulated,
@@ -1828,6 +1895,8 @@ class SummaryFinalResilienceTests(unittest.TestCase):
         self.assertTrue(
             any("Ata parcial" in note["text"] for note in final_payload["additional_notes"])
         )
+        self.assertEqual(final_payload["topics"][0]["decisions"], ["Follow-up marcado para sexta."])
+        self.assertEqual(final_payload["global_decisions"][0]["text"], "Follow-up marcado para sexta.")
 
     def test_inject_degradation_disclosure_adds_summary_and_note(self):
         final_payload = {
@@ -1892,22 +1961,21 @@ class SummaryFinalResilienceTests(unittest.TestCase):
                     "summary": "Discussao do cronograma.",
                     "status": "active",
                     "tags": ["prazo"],
+                    "facts": [],
+                    "hypotheses": [],
+                    "decisions": [],
+                    "open_items": [],
+                    "next_steps": [],
+                    "notes": [
+                        {
+                            "text": f"note {i}",
+                            "confidence": "low",
+                            "status": "info",
+                            "tags": [],
+                        }
+                        for i in range(40)
+                    ],
                 }
-            ],
-            "facts": [],
-            "hypotheses": [],
-            "decisions": [],
-            "open_items": [],
-            "next_steps": [],
-            "notes": [
-                {
-                    "text": f"note {i}",
-                    "confidence": "low",
-                    "status": "info",
-                    "tags": [],
-                    "name": "Cronograma",
-                }
-                for i in range(40)
             ],
         }
         final_payload = STT_APP.build_deterministic_final_summary(
