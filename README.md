@@ -26,6 +26,7 @@ docker compose up --build -d stt
 docker compose logs -f stt
 ```
 
+
 ## Notas operacionais
 
 - autenticacao HMAC obrigatoria para ingestao

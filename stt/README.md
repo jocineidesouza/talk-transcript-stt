@@ -78,7 +78,10 @@ Storage:
 
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/minutes/{minute_index}/transcript.json`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/minutes/{minute_index}/summary.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/minutes/{minute_index}/summary_text.txt` (quando `SUMMARY_MODE=ata_progressiva`)
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/summary/accumulated.json`
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/summary/accumulated.txt` (quando `SUMMARY_MODE=ata_progressiva`)
+- `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/summary/accumulated_meta.json` (quando `SUMMARY_MODE=ata_progressiva`)
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary.json`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary_text.txt`
 - `VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}/final/final_summary_temp.json` (quando houver erro de contrato no final)
@@ -86,6 +89,8 @@ Storage:
 ## Summary LLM (OpenRouter/OpenAI, opcional)
 
 - habilitado por `SUMMARY_ENABLED=true`
+- modo definido por `SUMMARY_MODE`: `rolling_json` (padrao atual) ou `ata_progressiva`
+- em `ata_progressiva`, a fonte final e definida por `SUMMARY_PROGRESSIVE_FINAL_SOURCE` (`auto`, `delta_only`, `full_transcript`) e limitada por `SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS` no modo `auto`
 - provedor definido por `SUMMARY_PROVIDER` (`openrouter` ou `openai`, padrao `openrouter`)
 - secrets esperados:
   - `OPENROUTER_APIKEY_FILE` (padrao `/secrets/openrouter_apikey.json`)
@@ -102,7 +107,7 @@ Reprocessa do zero os resumos da sessao alvo:
 - valida `namespace + vertical + slug + room_id + call_session_id` contra SQLite
 - força finalizacao logica se a sessao ainda estiver ativa
 - reseta `summary_tasks` e `minute_exports.summary_json_path`
-- reseta `summary/accumulated.json`
+- reseta `summary/accumulated.json` no modo `rolling_json`; no modo `ata_progressiva`, limpa `summary/accumulated.txt`, `summary/accumulated_meta.json` e snapshots textuais conhecidos
 - reencadeia processamento assíncrono de minutos + final
 
 Body JSON:
@@ -163,10 +168,10 @@ Campos principais no retorno:
 - `STORAGE_MINUTE_WINDOW_SECONDS` (padrao `60`)
 - `SUMMARY_ENABLED` (padrao `false`)
 - `SUMMARY_PROVIDER` (padrao `openrouter`)
-- `SUMMARY_MODEL_MINUTE` (padrao `gpt-4.1-mini`)
-- `SUMMARY_MODEL_ACCUMULATED` (padrao `gpt-4.1-mini`)
-- `SUMMARY_MODEL_FINAL` (padrao `gpt-4.1-mini`)
-- `SUMMARY_MODEL_FINAL_TEXT` (padrao `gpt-4.1-mini`)
+- `SUMMARY_MODEL_MINUTE` (padrao `openai/gpt-4.1-mini`)
+- `SUMMARY_MODEL_ACCUMULATED` (padrao `openai/gpt-4.1-mini`)
+- `SUMMARY_MODEL_FINAL` (padrao `openai/gpt-4.1-mini`)
+- `SUMMARY_MODEL_FINAL_TEXT` (padrao `openai/gpt-4.1-mini`)
 - `SUMMARY_FINAL_TEXT_FORMAT` (`markdown|html|text`, padrao `html`)
 - `SUMMARY_REQUEST_TIMEOUT_SECONDS` (padrao `300`)
 - `SUMMARY_REQUEST_RETRIES` (padrao `2`, total de 3 tentativas por request)

@@ -21,7 +21,7 @@ services:
       FEATURE_DIM: "80"
       MODEL_LANGUAGE: pt
       MODEL_TYPE: cohere_transcribe_offline_vad_streaming
-      APP_VERSION: "1.00.01"
+      APP_VERSION: "0.1.4"
       AUTO_DOWNLOAD_MODEL: "1"
       SQLITE_PATH: /data/queue.db
       SPOOL_DIR: /data/spool
@@ -36,11 +36,15 @@ services:
       FIREBASE_NAMESPACE_CONFIG_JSON: >-
         {"talk__dev":{"project_id":"dev-atendo","storage_bucket":"dev-atendo.appspot.com","credentials_file":"/secrets/talk-dev-firebaseadmin.json"},"talk__stg":{"project_id":"stage-atendo","storage_bucket":"stage-atendo.appspot.com","credentials_file":"/secrets/talk-stg-firebaseadmin.json"},"talk__prd":{"project_id":"dev-atendo","storage_bucket":"dev-atendo.appspot.com","credentials_file":"/secrets/talk-prd-firebaseadmin.json"},"ellevo-connect__dev":{"project_id":"ellevo-connect-dev","storage_bucket":"ellevo-connect-dev.firebasestorage.app","credentials_file":"/secrets/ellevo-connect-dev-firebaseadmin.json"},"ellevo-connect__stg":{"project_id":"ellevo-connect-stg","storage_bucket":"ellevo-connect-stg.firebasestorage.app","credentials_file":"/secrets/ellevo-connect-stg-firebaseadmin.json"},"ellevo-connect__prd":{"project_id":"ellevo-connect","storage_bucket":"ellevo-connect.firebasestorage.app","credentials_file":"/secrets/ellevo-connect-prd-firebaseadmin.json"}}
       SUMMARY_ENABLED: "true"
+      SUMMARY_MODE_OLD: "rolling_json"
+      SUMMARY_MODE: "ata_progressiva"
+      SUMMARY_PROGRESSIVE_FINAL_SOURCE: "auto"
+      SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS: "120000"
       SUMMARY_PROVIDER: "openrouter"
-      SUMMARY_MODEL_MINUTE: "gpt-4.1-mini"
-      SUMMARY_MODEL_ACCUMULATED: "gpt-4.1-mini"
-      SUMMARY_MODEL_FINAL: "gpt-4.1-mini"
-      SUMMARY_MODEL_FINAL_TEXT: "gpt-4.1-mini"
+      SUMMARY_MODEL_MINUTE: "openai/gpt-4.1-mini"
+      SUMMARY_MODEL_ACCUMULATED: "openai/gpt-4.1-mini"
+      SUMMARY_MODEL_FINAL: "openai/gpt-4.1-mini"
+      SUMMARY_MODEL_FINAL_TEXT: "openai/gpt-4.1-mini"
       SUMMARY_FINAL_TEXT_FORMAT: "html"
       SUMMARY_REQUEST_TIMEOUT_SECONDS: "300"
       SUMMARY_REQUEST_RETRIES: "2"

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -44,7 +44,7 @@ TAIL_PADDING_SECONDS = float(os.environ.get("TAIL_PADDING_SECONDS", "0.35"))
 MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
-APP_VERSION = os.environ.get("APP_VERSION", "1.00.01").strip() or "1.00.01"
+APP_VERSION = os.environ.get("APP_VERSION", "0.1.4").strip() or "0.1.4"
 
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "/data/queue.db"))
 SPOOL_DIR = Path(os.environ.get("SPOOL_DIR", "/data/spool"))
@@ -69,6 +69,21 @@ STORAGE_MINUTE_WINDOW_SECONDS = max(
 )
 
 SUMMARY_ENABLED = os.environ.get("SUMMARY_ENABLED", "false").lower() == "true"
+SUMMARY_MODE = os.environ.get("SUMMARY_MODE", "rolling_json").strip().lower()
+if SUMMARY_MODE not in {"rolling_json", "ata_progressiva"}:
+    SUMMARY_MODE = "rolling_json"
+
+SUMMARY_PROGRESSIVE_FINAL_SOURCE = (
+    os.environ.get("SUMMARY_PROGRESSIVE_FINAL_SOURCE", "auto").strip().lower()
+)
+if SUMMARY_PROGRESSIVE_FINAL_SOURCE not in {"auto", "delta_only", "full_transcript"}:
+    SUMMARY_PROGRESSIVE_FINAL_SOURCE = "auto"
+try:
+    SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS = max(
+        1000, int(os.environ.get("SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS", "120000"))
+    )
+except ValueError:
+    SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS = 120000
 SUMMARY_PROVIDER = os.environ.get("SUMMARY_PROVIDER", "openrouter").strip().lower()
 if SUMMARY_PROVIDER not in {"openrouter", "openai"}:
     SUMMARY_PROVIDER = "openrouter"
@@ -85,16 +100,16 @@ OPENROUTER_HTTP_REFERER = os.environ.get("OPENROUTER_HTTP_REFERER", "").strip()
 OPENROUTER_X_TITLE = os.environ.get("OPENROUTER_X_TITLE", "").strip()
 
 SUMMARY_MODEL_MINUTE = os.environ.get(
-    "SUMMARY_MODEL_MINUTE", "gpt-4.1-mini"
+    "SUMMARY_MODEL_MINUTE", "openai/gpt-4.1-mini"
 ).strip()
 SUMMARY_MODEL_ACCUMULATED = os.environ.get(
-    "SUMMARY_MODEL_ACCUMULATED", "gpt-4.1-mini"
+    "SUMMARY_MODEL_ACCUMULATED", "openai/gpt-4.1-mini"
 ).strip()
 SUMMARY_MODEL_FINAL = os.environ.get(
-    "SUMMARY_MODEL_FINAL", "gpt-4.1-mini"
+    "SUMMARY_MODEL_FINAL", "openai/gpt-4.1-mini"
 ).strip()
 SUMMARY_MODEL_FINAL_TEXT = os.environ.get(
-    "SUMMARY_MODEL_FINAL_TEXT", "gpt-4.1-mini"
+    "SUMMARY_MODEL_FINAL_TEXT", "openai/gpt-4.1-mini"
 ).strip()
 SUMMARY_FINAL_TEXT_FORMAT = os.environ.get("SUMMARY_FINAL_TEXT_FORMAT", "html").strip().lower()
 if SUMMARY_FINAL_TEXT_FORMAT not in {"markdown", "html", "text"}:
@@ -373,6 +388,89 @@ Listar additional_notes, quando existirem e forem relevantes.
 Se não houver observações adicionais, escrever:
 Nenhuma observação adicional foi registrada.
 """
+
+DEFAULT_PROGRESSIVE_ATA_PROMPT = """Você é um assistente responsável por manter uma ata progressiva de uma chamada corporativa em português do Brasil.
+
+Entrada:
+- Uma ATA ACUMULADA ANTERIOR em HTML fragment, que pode estar vazia.
+- Um NOVO TRECHO TRANSCRITO da chamada.
+- Metadados básicos da chamada.
+
+Tarefa:
+- Gerar uma nova versão completa da ata acumulada, incorporando somente informações sustentadas pelo novo trecho e preservando informações anteriores úteis.
+- A ata deve ser adequada para uma daily operacional sempre que o conteúdo parecer daily/status report.
+- Consolidar assuntos equivalentes e evitar duplicar itens quando o novo trecho continuar algo já registrado.
+
+Regras obrigatórias:
+- Use apenas a ata anterior e o novo trecho transcrito.
+- Não invente participantes, papéis, datas, horários, responsáveis, status, decisões, prazos ou impedimentos.
+- Não transforme intenção, hipótese, pergunta ou comentário ambíguo em decisão ou fato concluído.
+- Se um item novo for continuação de uma tarefa já listada, atualize a linha existente em vez de criar outra.
+- Se houver responsável claro, organize por responsável.
+- Se não houver responsável claro, use "Não informado".
+- Se não houver bloqueio explícito, informe que não há bloqueios críticos declarados.
+- Preserve comentários gerais relevantes, mas remova ruído social sem valor operacional.
+- Retorne somente o HTML fragment final, sem explicações e sem bloco de código.
+- A primeira linha deve começar com <h1>.
+
+Estrutura preferida:
+<h1>ATA - Resumo - [data/intervalo quando informado]</h1>
+<h2>Participantes</h2>
+<ul>...</ul>
+<h2>Resumo das Atividades</h2>
+<table>
+  <thead><tr><th>Responsável</th><th>Tarefa / Item</th><th>Status</th><th>Observação</th></tr></thead>
+  <tbody>...</tbody>
+</table>
+<h2>Bloqueios / Impedimentos</h2>
+<ul>...</ul>
+<h2>Próximos Passos</h2>
+<ul>...</ul>
+<h2>Comentários Gerais</h2>
+<ul>...</ul>
+"""
+
+DEFAULT_FINALIZE_PROGRESSIVE_ATA_PROMPT = """Você é um assistente responsável por produzir a versão final de uma ata progressiva em português do Brasil.
+
+Entrada:
+- A última ATA ACUMULADA em HTML fragment.
+- Uma fonte final de transcrição que pode ser a transcrição completa ou apenas trechos ainda não incorporados.
+- Metadados básicos da chamada.
+
+Tarefa:
+- Gerar a ata final em HTML fragment, limpa, consolidada e fiel ao conteúdo recebido.
+- Revisar duplicações, corrigir continuidade entre trechos e manter o formato operacional de daily quando aplicável.
+
+Regras obrigatórias:
+- Use apenas a ata acumulada e a fonte de transcrição recebida.
+- Não invente participantes, papéis, datas, horários, responsáveis, decisões, prazos ou impedimentos.
+- Não reclassifique comentário ambíguo como decisão.
+- Se a fonte final tiver apenas delta, não remova informação válida da ata acumulada só porque ela não aparece no delta.
+- Se a fonte final for a transcrição completa, use-a para corrigir lacunas e duplicações da ata acumulada.
+- Retorne somente o HTML fragment final, sem explicações e sem bloco de código.
+- A primeira linha deve começar com <h1>.
+
+Estrutura preferida:
+<h1>ATA - Daily - [data/intervalo quando informado]</h1>
+<h2>Participantes</h2>
+<ul>...</ul>
+<h2>Resumo das Atividades</h2>
+<table>
+  <thead><tr><th>Responsável</th><th>Tarefa / Item</th><th>Status</th><th>Observação</th></tr></thead>
+  <tbody>...</tbody>
+</table>
+<h2>Bloqueios / Impedimentos</h2>
+<ul>...</ul>
+<h2>Próximos Passos</h2>
+<ul>...</ul>
+<h2>Comentários Gerais</h2>
+<ul>...</ul>
+"""
+
+SUMMARY_PROGRESSIVE_ATA_PROMPT = os.environ.get("SUMMARY_PROGRESSIVE_ATA_PROMPT", "").strip()
+SUMMARY_FINALIZE_PROGRESSIVE_ATA_PROMPT = os.environ.get(
+    "SUMMARY_FINALIZE_PROGRESSIVE_ATA_PROMPT", ""
+).strip()
 
 SUMMARY_KIND_MINUTE = "minute"
 SUMMARY_KIND_ACCUMULATED = "accumulated"
@@ -763,6 +861,73 @@ def validate_final_summary_text_output(raw_output: str, output_format: str = "ma
             f"{FINAL_SUMMARY_TEXT_REQUIRED_PREFIX!r}"
         )
     return text
+
+
+def transcript_lines_to_text(lines: list[dict]) -> str:
+    rendered: list[str] = []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        speaker = str(line.get("speaker") or line.get("participant_identity") or "Não informado").strip()
+        text = str(line.get("text") or "").strip()
+        if text:
+            rendered.append(f"[{speaker}] {text}")
+    return "\n".join(rendered)
+
+
+def transcript_payload_to_text(payload: dict | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    lines = payload.get("lines")
+    if isinstance(lines, list):
+        return transcript_lines_to_text(lines)
+    transcript = payload.get("transcript")
+    return str(transcript or "").strip()
+
+
+def validate_progressive_ata_output(raw_output: str) -> str:
+    return validate_final_summary_text_output(raw_output, "html")
+
+
+def progressive_ata_prompt(default_prompt: str, override_prompt: str) -> str:
+    return override_prompt if override_prompt else default_prompt.strip()
+
+
+def build_summary_metadata(
+    routing: RoomRoutingContext,
+    room_name: str,
+    updated_at: str,
+) -> dict:
+    return {
+        "namespace": routing.namespace,
+        "vertical": routing.vertical,
+        "slug": routing.slug,
+        "room_id": routing.room_id,
+        "room_name": room_name,
+        "transcript_session_id": routing.transcript_session_id,
+        "call_session_id": routing.call_session_id,
+        "updated_at": updated_at,
+    }
+
+
+def build_progressive_delta_transcript_text(
+    exports: list[sqlite3.Row],
+    last_minute_index: int,
+    fetch_minute_payload: Callable[[sqlite3.Row], dict | None],
+) -> tuple[str, list[int]]:
+    parts: list[str] = []
+    included_minutes: list[int] = []
+    for export in exports:
+        minute_index = int(export["minute_index"])
+        if minute_index < 0 or minute_index <= last_minute_index:
+            continue
+        payload = fetch_minute_payload(export)
+        text = transcript_payload_to_text(payload)
+        if not text:
+            continue
+        included_minutes.append(minute_index)
+        parts.append(f"Trecho {minute_index:04d}:\n{text}")
+    return "\n\n".join(parts), included_minutes
 
 
 def build_effective_system_prompt(
@@ -2260,6 +2425,21 @@ class FirebaseSink:
         text_blob = self.storage_bucket.blob(object_path)
         text_blob.upload_from_string(body, content_type=content_type)
 
+    def fetch_text(self, object_path: str) -> str | None:
+        if not self.enabled or self.storage_bucket is None:
+            return None
+        blob = self.storage_bucket.blob(object_path)
+        if not blob.exists():
+            return None
+        return blob.download_as_text()
+
+    def delete_object(self, object_path: str) -> None:
+        if not self.enabled or self.storage_bucket is None:
+            return
+        blob = self.storage_bucket.blob(object_path)
+        if blob.exists():
+            blob.delete()
+
     def fetch_json(self, object_path: str) -> dict | None:
         if not self.enabled or self.storage_bucket is None:
             return None
@@ -2498,6 +2678,12 @@ class FirebaseRouter:
 
     def fetch_json(self, routing: RoomRoutingContext, object_path: str) -> dict | None:
         return self.sink_for_namespace(routing.namespace).fetch_json(object_path)
+
+    def fetch_text(self, routing: RoomRoutingContext, object_path: str) -> str | None:
+        return self.sink_for_namespace(routing.namespace).fetch_text(object_path)
+
+    def delete_object(self, routing: RoomRoutingContext, object_path: str) -> None:
+        self.sink_for_namespace(routing.namespace).delete_object(object_path)
 
     def fetch_agent_prompt(self, routing: RoomRoutingContext, agent_id: str) -> str | None:
         agent_key = str(agent_id or "").strip()
@@ -3203,7 +3389,11 @@ def build_minute_shards(
         minute_end_dt = minute_start_dt + timedelta(seconds=minute_window_seconds)
         call_base = join_storage_path(storage_base_path, f"minutes/{minute_index:04d}")
         transcript_path = f"{call_base}/transcript.json"
-        summary_path = f"{call_base}/summary.json"
+        summary_path = (
+            f"{call_base}/summary_text.txt"
+            if SUMMARY_MODE == "ata_progressiva"
+            else f"{call_base}/summary.json"
+        )
         minute_lines = grouped[minute_index]
         raw_hash = hashlib.sha256(
             json.dumps(minute_lines, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -4342,8 +4532,88 @@ class SummaryEngine:
                 )
         raise RuntimeError(str(last_error or first_error)) from first_error
 
+    def update_progressive_ata(
+        self,
+        previous_ata_text: str,
+        minute_lines: list[dict],
+        metadata: dict,
+        system_prompt: str | None = None,
+    ) -> str:
+        effective_prompt = (
+            system_prompt.strip()
+            if isinstance(system_prompt, str) and system_prompt.strip()
+            else progressive_ata_prompt(DEFAULT_PROGRESSIVE_ATA_PROMPT, SUMMARY_PROGRESSIVE_ATA_PROMPT)
+        )
+        minute_text = transcript_lines_to_text(minute_lines)
+        user_prompt = (
+            "Metadados da chamada:\n"
+            f"{json.dumps(metadata, ensure_ascii=False, indent=2)}\n\n"
+            "ATA ACUMULADA ANTERIOR:\n"
+            f"{previous_ata_text.strip() if previous_ata_text else '(vazia)'}\n\n"
+            "NOVO TRECHO TRANSCRITO:\n"
+            f"{minute_text if minute_text else '(sem falas úteis)'}\n\n"
+            "Retorne a nova ata acumulada completa em HTML fragment."
+        )
+        raw_output = self._request_text(
+            kind=None,
+            model=self.accumulated_model,
+            system_prompt=effective_prompt,
+            user_prompt=user_prompt,
+        )
+        return validate_progressive_ata_output(raw_output)
+
+    def finalize_progressive_ata(
+        self,
+        accumulated_ata_text: str,
+        final_source_text: str,
+        final_source_mode: str,
+        metadata: dict,
+        system_prompt: str | None = None,
+    ) -> str:
+        effective_prompt = (
+            system_prompt.strip()
+            if isinstance(system_prompt, str) and system_prompt.strip()
+            else progressive_ata_prompt(
+                DEFAULT_FINALIZE_PROGRESSIVE_ATA_PROMPT,
+                SUMMARY_FINALIZE_PROGRESSIVE_ATA_PROMPT,
+            )
+        )
+        source_label = (
+            "transcrição completa"
+            if final_source_mode == "full_transcript"
+            else "trechos ainda não incorporados"
+        )
+        user_prompt = (
+            "Metadados da chamada:\n"
+            f"{json.dumps(metadata, ensure_ascii=False, indent=2)}\n\n"
+            "ÚLTIMA ATA ACUMULADA:\n"
+            f"{accumulated_ata_text.strip() if accumulated_ata_text else '(vazia)'}\n\n"
+            f"FONTE FINAL ({source_label}):\n"
+            f"{final_source_text.strip() if final_source_text else '(sem trechos adicionais)'}\n\n"
+            "Retorne a ata final completa em HTML fragment."
+        )
+        raw_output = self._request_text(
+            kind=None,
+            model=self.final_text_model,
+            system_prompt=effective_prompt,
+            user_prompt=user_prompt,
+        )
+        return validate_progressive_ata_output(raw_output)
+
 def session_summary_accumulated_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "summary/accumulated.json")
+
+
+def session_progressive_ata_accumulated_path(storage_base_path: str) -> str:
+    return join_storage_path(storage_base_path, "summary/accumulated.txt")
+
+
+def session_progressive_ata_meta_path(storage_base_path: str) -> str:
+    return join_storage_path(storage_base_path, "summary/accumulated_meta.json")
+
+
+def minute_progressive_ata_summary_path(storage_base_path: str, minute_index: int) -> str:
+    return join_storage_path(storage_base_path, f"minutes/{minute_index:04d}/summary_text.txt")
 
 
 def session_final_summary_path(storage_base_path: str) -> str:
@@ -4711,6 +4981,299 @@ def build_final_transcript_payload(
     }
 
 
+async def process_progressive_ata_minute_task(
+    firebase_router: FirebaseRouter,
+    summary_engine: SummaryEngine,
+    routing: RoomRoutingContext,
+    session_is_finalized: bool,
+    room_name: str,
+    call_session_id: str,
+    minute_index: int,
+    export_row: sqlite3.Row,
+    now_iso: str,
+) -> None:
+    minute_payload = await asyncio.to_thread(
+        firebase_router.fetch_json, routing, export_row["transcript_json_path"]
+    )
+    lines = minute_payload.get("lines", []) if isinstance(minute_payload, dict) else []
+    accumulated_path = session_progressive_ata_accumulated_path(routing.storage_base_path)
+    accumulated_meta_path = session_progressive_ata_meta_path(routing.storage_base_path)
+    previous_text = await asyncio.to_thread(firebase_router.fetch_text, routing, accumulated_path)
+    metadata = build_summary_metadata(routing, room_name, now_iso)
+    metadata.update(
+        {
+            "summary_mode": SUMMARY_MODE,
+            "minute_index": minute_index,
+            "minute_started_at": (
+                minute_payload.get("minute_started_at") if isinstance(minute_payload, dict) else None
+            ),
+            "minute_ended_at": (
+                minute_payload.get("minute_ended_at") if isinstance(minute_payload, dict) else None
+            ),
+        }
+    )
+    logger.info(
+        "Gerando ata progressiva até minuto %04d room=%s session=%s model=%s",
+        minute_index,
+        room_name,
+        call_session_id,
+        summary_engine.accumulated_model,
+    )
+    started_at = time.monotonic()
+    accumulated_text = await asyncio.to_thread(
+        summary_engine.update_progressive_ata,
+        previous_text or "",
+        lines,
+        metadata,
+        None,
+    )
+    logger.info(
+        "Ata progressiva até minuto %04d gerada duration_seconds=%.3f room=%s session=%s",
+        minute_index,
+        time.monotonic() - started_at,
+        room_name,
+        call_session_id,
+    )
+    summary_text_path = export_row["summary_json_path"] or minute_progressive_ata_summary_path(
+        routing.storage_base_path, minute_index
+    )
+    await asyncio.to_thread(
+        firebase_router.upload_text,
+        routing,
+        summary_text_path,
+        accumulated_text,
+        "text/plain; charset=utf-8",
+    )
+    await asyncio.to_thread(
+        firebase_router.upload_text,
+        routing,
+        accumulated_path,
+        accumulated_text,
+        "text/plain; charset=utf-8",
+    )
+    await asyncio.to_thread(
+        firebase_router.upload_json,
+        routing,
+        accumulated_meta_path,
+        {
+            **metadata,
+            "source": "ata_progressiva",
+            "last_minute_index": minute_index,
+            "accumulated_path": accumulated_path,
+            "summary_text_path": summary_text_path,
+        },
+    )
+    await asyncio.to_thread(
+        db_update_minute_export_summary_path,
+        room_name,
+        call_session_id,
+        minute_index,
+        summary_text_path,
+        now_iso,
+    )
+    await asyncio.to_thread(
+        firebase_router.publish_call_index,
+        routing=routing,
+        status="finalized" if session_is_finalized else "processing",
+        last_minute_index=minute_index,
+        finalized=session_is_finalized,
+        summary_accumulated_path=accumulated_path,
+        final_summary_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
+        final_transcript_path=None if not session_is_finalized else CALL_INDEX_UNSET,
+        final_transcript_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
+        final_summary_text_path=None if not session_is_finalized else CALL_INDEX_UNSET,
+        final_summary_text_ready=False if not session_is_finalized else CALL_INDEX_UNSET,
+    )
+    if session_is_finalized and SUMMARY_FINAL_REEMIT_ON_LATE_MINUTES:
+        await asyncio.to_thread(
+            db_schedule_final_summary_task,
+            room_name,
+            call_session_id,
+            utc_now_iso(),
+            True,
+        )
+
+
+async def process_progressive_ata_final_task(
+    firebase_router: FirebaseRouter,
+    summary_engine: SummaryEngine,
+    routing: RoomRoutingContext,
+    session_row: sqlite3.Row,
+    room_name: str,
+    call_session_id: str,
+    minute_index: int,
+    now_iso: str,
+) -> bool:
+    task_rows = await asyncio.to_thread(db_get_summary_task_rows, room_name, call_session_id)
+    exports = await asyncio.to_thread(db_get_session_minute_exports, room_name, call_session_id)
+    expected_minutes = {
+        int(export["minute_index"]) for export in exports if int(export["minute_index"]) >= 0
+    }
+    status_by_minute = {
+        int(row["minute_index"]): str(row["status"] or "")
+        for row in task_rows
+        if int(row["minute_index"]) >= 0
+    }
+    pending_task_minutes = {
+        minute for minute, status in status_by_minute.items() if status != "done"
+    }
+    for minute in expected_minutes:
+        if status_by_minute.get(minute) != "done":
+            pending_task_minutes.add(minute)
+
+    if pending_task_minutes:
+        finalized_at_raw = str(session_row["finalized_at"] or "").strip()
+        if finalized_at_raw and SUMMARY_FINALIZATION_GRACE_SECONDS > 0:
+            try:
+                now_dt = parse_iso_datetime(now_iso)
+                finalized_dt = parse_iso_datetime(finalized_at_raw)
+                elapsed = (now_dt - finalized_dt).total_seconds()
+            except ValueError:
+                elapsed = float(SUMMARY_FINALIZATION_GRACE_SECONDS)
+                now_dt = parse_iso_datetime(now_iso)
+                finalized_dt = now_dt
+            if elapsed < SUMMARY_FINALIZATION_GRACE_SECONDS:
+                deadline_dt = finalized_dt + timedelta(seconds=SUMMARY_FINALIZATION_GRACE_SECONDS)
+                if deadline_dt <= now_dt:
+                    deadline_dt = now_dt + timedelta(seconds=5)
+                await asyncio.to_thread(
+                    db_reschedule_summary_task,
+                    room_name,
+                    call_session_id,
+                    minute_index,
+                    deadline_dt.isoformat(),
+                    (
+                        "aguardando minutos pendentes antes da ata progressiva final: "
+                        f"[{_minutes_label(sorted(pending_task_minutes))}]"
+                    ),
+                    now_iso,
+                )
+                logger.info(
+                    "progressive final delayed by grace room=%s session=%s pending_minutes=%s grace_seconds=%s",
+                    room_name,
+                    call_session_id,
+                    sorted(pending_task_minutes),
+                    SUMMARY_FINALIZATION_GRACE_SECONDS,
+                )
+                return False
+
+    accumulated_path = session_progressive_ata_accumulated_path(routing.storage_base_path)
+    accumulated_meta_path = session_progressive_ata_meta_path(routing.storage_base_path)
+    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+    final_summary_text_path = session_final_summary_text_path(routing.storage_base_path)
+    accumulated_text = await asyncio.to_thread(firebase_router.fetch_text, routing, accumulated_path)
+    accumulated_meta = await asyncio.to_thread(firebase_router.fetch_json, routing, accumulated_meta_path)
+    last_minute_index = -1
+    if isinstance(accumulated_meta, dict):
+        try:
+            last_minute_index = int(accumulated_meta.get("last_minute_index", -1))
+        except (TypeError, ValueError):
+            last_minute_index = -1
+
+    final_transcript_payload = await asyncio.to_thread(
+        firebase_router.fetch_json, routing, final_transcript_path
+    )
+    if not isinstance(final_transcript_payload, dict):
+        final_transcript_payload = await asyncio.to_thread(
+            build_final_transcript_payload,
+            room_name,
+            call_session_id,
+            routing.transcript_session_id,
+            now_iso,
+        )
+    full_transcript_text = transcript_payload_to_text(final_transcript_payload)
+
+    def fetch_minute_payload(export: sqlite3.Row) -> dict | None:
+        return firebase_router.fetch_json(routing, export["transcript_json_path"])
+
+    selected_source = SUMMARY_PROGRESSIVE_FINAL_SOURCE
+    if selected_source == "auto":
+        selected_source = (
+            "full_transcript"
+            if len(full_transcript_text) <= SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS
+            else "delta_only"
+        )
+    elif (
+        selected_source == "full_transcript"
+        and len(full_transcript_text) > SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS
+    ):
+        logger.warning(
+            "progressive final forced full_transcript exceeds max chars room=%s session=%s chars=%s max=%s",
+            room_name,
+            call_session_id,
+            len(full_transcript_text),
+            SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS,
+        )
+
+    included_minutes: list[int] = []
+    if selected_source == "full_transcript":
+        final_source_text = full_transcript_text
+    else:
+        final_source_text, included_minutes = build_progressive_delta_transcript_text(
+            exports,
+            last_minute_index,
+            fetch_minute_payload,
+        )
+
+    metadata = build_summary_metadata(routing, room_name, now_iso)
+    metadata.update(
+        {
+            "summary_mode": SUMMARY_MODE,
+            "final_source_requested": SUMMARY_PROGRESSIVE_FINAL_SOURCE,
+            "final_source_used": selected_source,
+            "full_transcript_chars": len(full_transcript_text),
+            "full_transcript_max_chars": SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS,
+            "last_accumulated_minute_index": last_minute_index,
+            "delta_minute_indexes": included_minutes,
+        }
+    )
+    logger.info(
+        "Gerando ata progressiva final room=%s session=%s source=%s model=%s",
+        room_name,
+        call_session_id,
+        selected_source,
+        summary_engine.final_text_model,
+    )
+    started_at = time.monotonic()
+    final_summary_text = await asyncio.to_thread(
+        summary_engine.finalize_progressive_ata,
+        accumulated_text or "",
+        final_source_text,
+        selected_source,
+        metadata,
+        None,
+    )
+    logger.info(
+        "Ata progressiva final gerada duration_seconds=%.3f room=%s session=%s source=%s",
+        time.monotonic() - started_at,
+        room_name,
+        call_session_id,
+        selected_source,
+    )
+    await asyncio.to_thread(
+        firebase_router.upload_text,
+        routing,
+        final_summary_text_path,
+        final_summary_text,
+        "text/plain; charset=utf-8",
+    )
+    await asyncio.to_thread(
+        firebase_router.publish_call_index,
+        routing=routing,
+        status="finalized",
+        last_minute_index=max(expected_minutes, default=-1),
+        finalized=True,
+        final_summary_path=None,
+        summary_accumulated_path=accumulated_path,
+        final_summary_ready=False,
+        final_transcript_path=final_transcript_path,
+        final_transcript_ready=True,
+        final_summary_text_path=final_summary_text_path,
+        final_summary_text_ready=True,
+    )
+    return True
+
+
 def publish_session_minute_exports(
     firebase_router: FirebaseRouter,
     room_name: str,
@@ -4757,10 +5320,14 @@ def publish_session_minute_exports(
         finalized=finalized,
         final_summary_path=(
             session_final_summary_path(routing.storage_base_path)
-            if finalized and summary_enabled
+            if finalized and summary_enabled and SUMMARY_MODE == "rolling_json"
             else None
         ),
-        summary_accumulated_path=session_summary_accumulated_path(routing.storage_base_path),
+        summary_accumulated_path=(
+            session_progressive_ata_accumulated_path(routing.storage_base_path)
+            if SUMMARY_MODE == "ata_progressiva"
+            else session_summary_accumulated_path(routing.storage_base_path)
+        ),
         final_summary_ready=False,
         final_transcript_path=None,
         final_transcript_ready=False,
@@ -4868,10 +5435,14 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
                 finalized=True,
                 final_summary_path=(
                     session_final_summary_path(routing.storage_base_path)
-                    if summary_engine.enabled
+                    if summary_engine.enabled and SUMMARY_MODE == "rolling_json"
                     else None
                 ),
-                summary_accumulated_path=session_summary_accumulated_path(routing.storage_base_path),
+                summary_accumulated_path=(
+                    session_progressive_ata_accumulated_path(routing.storage_base_path)
+                    if SUMMARY_MODE == "ata_progressiva"
+                    else session_summary_accumulated_path(routing.storage_base_path)
+                ),
                 final_summary_ready=False,
                 final_transcript_path=final_transcript_path,
                 final_transcript_ready=True,
@@ -5065,6 +5636,44 @@ async def summary_worker_loop(
                 continue
             routing = routing_context_from_session_row(session_row)
             session_is_finalized = bool(session_row["finalized_at"])
+            if SUMMARY_MODE == "ata_progressiva":
+                if minute_index >= 0:
+                    export_row = await asyncio.to_thread(
+                        db_get_minute_export, room_name, call_session_id, minute_index
+                    )
+                    if export_row is None:
+                        await asyncio.to_thread(
+                            db_mark_summary_task_done, room_name, call_session_id, minute_index, now_iso
+                        )
+                        continue
+                    await process_progressive_ata_minute_task(
+                        firebase_router,
+                        summary_engine,
+                        routing,
+                        session_is_finalized,
+                        room_name,
+                        call_session_id,
+                        minute_index,
+                        export_row,
+                        now_iso,
+                    )
+                else:
+                    processed = await process_progressive_ata_final_task(
+                        firebase_router,
+                        summary_engine,
+                        routing,
+                        session_row,
+                        room_name,
+                        call_session_id,
+                        minute_index,
+                        now_iso,
+                    )
+                    if not processed:
+                        continue
+                await asyncio.to_thread(
+                    db_mark_summary_task_done, room_name, call_session_id, minute_index, utc_now_iso()
+                )
+                continue
             if minute_index >= 0:
                 export_row = await asyncio.to_thread(
                     db_get_minute_export, room_name, call_session_id, minute_index
@@ -5810,12 +6419,15 @@ async def health() -> dict:
         "firebase_flush_interval_seconds": FIREBASE_FLUSH_INTERVAL_SECONDS,
         "storage_minute_window_seconds": STORAGE_MINUTE_WINDOW_SECONDS,
         "summary_enabled": runtime.summary_engine.enabled,
+        "summary_mode": SUMMARY_MODE,
         "summary_provider": runtime.summary_engine.provider,
         "summary_model_minute": runtime.summary_engine.minute_model,
         "summary_model_accumulated": runtime.summary_engine.accumulated_model,
         "summary_model_final": runtime.summary_engine.final_model,
         "summary_model_final_text": runtime.summary_engine.final_text_model,
         "summary_final_text_format": SUMMARY_FINAL_TEXT_FORMAT,
+        "summary_progressive_final_source": SUMMARY_PROGRESSIVE_FINAL_SOURCE,
+        "summary_progressive_full_transcript_max_chars": SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS,
         "summary_reconcile_interval_seconds": SUMMARY_RECONCILE_INTERVAL_SECONDS,
         "summary_processing_stale_seconds": SUMMARY_PROCESSING_STALE_SECONDS,
         "summary_finalization_grace_seconds": SUMMARY_FINALIZATION_GRACE_SECONDS,
@@ -6055,26 +6667,56 @@ async def admin_summary_reprocess(payload: AdminSummaryReprocessTarget) -> JSONR
         True,
         True,
     )
+    if SUMMARY_MODE == "ata_progressiva":
+        cleanup_exports = await asyncio.to_thread(
+            db_get_session_minute_exports, payload.room_name, payload.call_session_id
+        )
+        for export in cleanup_exports:
+            summary_path = str(export["summary_json_path"] or "").strip()
+            if summary_path:
+                await asyncio.to_thread(runtime.firebase_router.delete_object, routing, summary_path)
+        await asyncio.to_thread(
+            runtime.firebase_router.delete_object,
+            routing,
+            session_final_summary_text_path(routing.storage_base_path),
+        )
     reset_info = await asyncio.to_thread(
         db_reset_summary_reprocess_state,
         payload.room_name,
         payload.call_session_id,
         now_iso,
     )
-    accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
-    await asyncio.to_thread(
-        runtime.firebase_router.upload_json,
-        routing,
-        accumulated_path,
-        {
-            "room_name": routing.room_name,
-            "transcript_session_id": routing.transcript_session_id,
-            "call_session_id": routing.call_session_id,
-            "last_minute_index": -1,
-            "summary": default_accumulated_summary_payload(),
-            "updated_at": now_iso,
-        },
-    )
+    if SUMMARY_MODE == "ata_progressiva":
+        accumulated_path = session_progressive_ata_accumulated_path(routing.storage_base_path)
+        accumulated_meta_path = session_progressive_ata_meta_path(routing.storage_base_path)
+        await asyncio.to_thread(runtime.firebase_router.delete_object, routing, accumulated_path)
+        await asyncio.to_thread(runtime.firebase_router.delete_object, routing, accumulated_meta_path)
+        await asyncio.to_thread(
+            runtime.firebase_router.upload_json,
+            routing,
+            accumulated_meta_path,
+            {
+                **build_summary_metadata(routing, payload.room_name, now_iso),
+                "source": "ata_progressiva",
+                "last_minute_index": -1,
+                "accumulated_path": accumulated_path,
+            },
+        )
+    else:
+        accumulated_path = session_summary_accumulated_path(routing.storage_base_path)
+        await asyncio.to_thread(
+            runtime.firebase_router.upload_json,
+            routing,
+            accumulated_path,
+            {
+                "room_name": routing.room_name,
+                "transcript_session_id": routing.transcript_session_id,
+                "call_session_id": routing.call_session_id,
+                "last_minute_index": -1,
+                "summary": default_accumulated_summary_payload(),
+                "updated_at": now_iso,
+            },
+        )
     final_transcript_path = session_final_transcript_path(routing.storage_base_path)
     final_transcript_payload = await asyncio.to_thread(
         build_final_transcript_payload,
@@ -6106,7 +6748,11 @@ async def admin_summary_reprocess(payload: AdminSummaryReprocessTarget) -> JSONR
         status="finalized",
         last_minute_index=last_minute_index,
         finalized=True,
-        final_summary_path=session_final_summary_path(routing.storage_base_path),
+        final_summary_path=(
+            None
+            if SUMMARY_MODE == "ata_progressiva"
+            else session_final_summary_path(routing.storage_base_path)
+        ),
         summary_accumulated_path=accumulated_path,
         final_summary_ready=False,
         final_transcript_path=final_transcript_path,

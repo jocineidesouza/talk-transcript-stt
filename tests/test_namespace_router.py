@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -1334,7 +1334,7 @@ class SummaryEngineRetryTests(unittest.TestCase):
             side_effect=[TimeoutError("timeout-1"), TimeoutError("timeout-2"), self._response(success_payload)],
         ) as urlopen_mock:
             with patch.object(STT_APP.time, "sleep") as sleep_mock:
-                raw = engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "gpt-4.1-mini", "system", "user")
+                raw = engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "openai/gpt-4.1-mini", "system", "user")
 
         self.assertEqual(raw, "{}")
         self.assertEqual(urlopen_mock.call_count, 3)
@@ -1349,7 +1349,7 @@ class SummaryEngineRetryTests(unittest.TestCase):
         ) as urlopen_mock:
             with patch.object(STT_APP.time, "sleep") as sleep_mock:
                 with self.assertRaises(RuntimeError):
-                    engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "gpt-4.1-mini", "system", "user")
+                    engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "openai/gpt-4.1-mini", "system", "user")
 
         self.assertEqual(urlopen_mock.call_count, 3)
         self.assertEqual(sleep_mock.call_count, 2)
@@ -2536,6 +2536,184 @@ class SummaryWorkerFinalContractErrorTests(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
+class ProgressiveAtaSummaryTests(unittest.IsolatedAsyncioTestCase):
+    def build_routing(self):
+        return STT_APP.RoomRoutingContext(
+            namespace="talk__dev",
+            room_name="talk__dev__roomA",
+            room_id="roomA",
+            call_session_id="RM_session-1",
+            transcript_session_id="session-1",
+            vertical="HEALTH",
+            slug="acme",
+            firestore_doc_path="VERTICALS/HEALTH/COMPANIES/acme/ROOMS/roomA/SESSIONS/RM_session-1",
+            storage_base_path="VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1",
+        )
+
+    async def test_progressive_minute_updates_accumulated_text_and_meta(self):
+        stop_event = asyncio.Event()
+        routing = self.build_routing()
+        transcript_path = f"{routing.storage_base_path}/minutes/0000/transcript.json"
+        summary_text_path = STT_APP.minute_progressive_ata_summary_path(routing.storage_base_path, 0)
+
+        router = MagicMock()
+        router.fetch_json.return_value = {
+            "minute_index": 0,
+            "minute_started_at": "2026-04-24T12:00:00+00:00",
+            "minute_ended_at": "2026-04-24T12:10:00+00:00",
+            "lines": [{"speaker": "Daiane", "text": "Estou testando o fluxo de SLA."}],
+        }
+        router.fetch_text.return_value = ""
+        router.upload_text = MagicMock()
+        router.upload_json = MagicMock()
+        router.publish_call_index = MagicMock()
+
+        summary_engine = MagicMock()
+        summary_engine.enabled = True
+        summary_engine.accumulated_model = "acc-model"
+        summary_engine.update_progressive_ata.return_value = "<h1>ATA - Daily</h1>"
+        summary_engine.summarize_minute = MagicMock()
+        summary_engine.merge_summaries = MagicMock()
+
+        task = {
+            "room_name": "talk__dev__roomA",
+            "call_session_id": "RM_session-1",
+            "minute_index": 0,
+            "retries": 0,
+        }
+        export_row = {
+            "minute_index": 0,
+            "transcript_json_path": transcript_path,
+            "summary_json_path": summary_text_path,
+        }
+        claim_calls = {"count": 0}
+
+        def fake_claim_summary_task(_now_iso: str):
+            if claim_calls["count"] == 0:
+                claim_calls["count"] += 1
+                return task
+            stop_event.set()
+            return None
+
+        done_calls = []
+
+        def fake_mark_done(room_name: str, call_session_id: str, minute_index: int, _now_iso: str):
+            done_calls.append((room_name, call_session_id, minute_index))
+            stop_event.set()
+
+        with patch.object(STT_APP, "SUMMARY_MODE", "ata_progressiva"):
+            with patch.object(STT_APP, "run_summary_reconciliation_once", new=AsyncMock()):
+                with patch.object(STT_APP, "db_claim_summary_task", side_effect=fake_claim_summary_task):
+                    with patch.object(STT_APP, "db_get_session_row", return_value={"finalized_at": None}):
+                        with patch.object(STT_APP, "routing_context_from_session_row", return_value=routing):
+                            with patch.object(STT_APP, "db_get_minute_export", return_value=export_row):
+                                with patch.object(STT_APP, "db_update_minute_export_summary_path") as update_path:
+                                    with patch.object(STT_APP, "db_mark_summary_task_done", side_effect=fake_mark_done):
+                                        with patch.object(STT_APP, "db_mark_summary_task_error") as mark_error:
+                                            await asyncio.wait_for(
+                                                STT_APP.summary_worker_loop(stop_event, router, summary_engine),
+                                                timeout=2,
+                                            )
+
+        self.assertEqual(done_calls, [("talk__dev__roomA", "RM_session-1", 0)])
+        mark_error.assert_not_called()
+        summary_engine.summarize_minute.assert_not_called()
+        summary_engine.merge_summaries.assert_not_called()
+        summary_engine.update_progressive_ata.assert_called_once()
+        update_path.assert_called_once_with(
+            "talk__dev__roomA",
+            "RM_session-1",
+            0,
+            summary_text_path,
+            ANY,
+        )
+        uploaded_text_paths = [call.args[1] for call in router.upload_text.call_args_list]
+        self.assertIn(summary_text_path, uploaded_text_paths)
+        self.assertIn(
+            STT_APP.session_progressive_ata_accumulated_path(routing.storage_base_path),
+            uploaded_text_paths,
+        )
+        meta_upload = router.upload_json.call_args.args
+        self.assertEqual(meta_upload[1], STT_APP.session_progressive_ata_meta_path(routing.storage_base_path))
+        self.assertEqual(meta_upload[2]["last_minute_index"], 0)
+        self.assertEqual(
+            router.publish_call_index.call_args.kwargs["summary_accumulated_path"],
+            STT_APP.session_progressive_ata_accumulated_path(routing.storage_base_path),
+        )
+
+    async def test_progressive_final_source_policy(self):
+        routing = self.build_routing()
+        exports = [
+            {
+                "minute_index": 0,
+                "transcript_json_path": f"{routing.storage_base_path}/minutes/0000/transcript.json",
+            }
+        ]
+        task_rows = [
+            {"minute_index": 0, "status": "done"},
+            {"minute_index": -1, "status": "processing"},
+        ]
+
+        async def run_case(requested_source: str, max_chars: int, expected_mode: str):
+            router = MagicMock()
+
+            def fake_fetch_json(_routing, path):
+                if path == STT_APP.session_progressive_ata_meta_path(routing.storage_base_path):
+                    return {"last_minute_index": -1}
+                if path == STT_APP.session_final_transcript_path(routing.storage_base_path):
+                    return {
+                        "lines": [
+                            {"speaker": "A", "text": "x" * 30},
+                            {"speaker": "B", "text": "y" * 30},
+                        ]
+                    }
+                return {"lines": [{"speaker": "A", "text": "delta"}]}
+
+            router.fetch_json.side_effect = fake_fetch_json
+            router.fetch_text.return_value = "<h1>ATA - Daily</h1>"
+            router.upload_text = MagicMock()
+            router.publish_call_index = MagicMock()
+
+            summary_engine = MagicMock()
+            summary_engine.final_text_model = "final-text-model"
+            summary_engine.finalize_progressive_ata.return_value = "<h1>ATA Final</h1>"
+
+            with patch.object(STT_APP, "SUMMARY_MODE", "ata_progressiva"):
+                with patch.object(STT_APP, "SUMMARY_PROGRESSIVE_FINAL_SOURCE", requested_source):
+                    with patch.object(STT_APP, "SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS", max_chars):
+                        with patch.object(STT_APP, "db_get_summary_task_rows", return_value=task_rows):
+                            with patch.object(STT_APP, "db_get_session_minute_exports", return_value=exports):
+                                processed = await STT_APP.process_progressive_ata_final_task(
+                                    router,
+                                    summary_engine,
+                                    routing,
+                                    {"finalized_at": "2026-04-24T12:00:00+00:00"},
+                                    "talk__dev__roomA",
+                                    "RM_session-1",
+                                    -1,
+                                    "2026-04-24T12:10:00+00:00",
+                                )
+
+            self.assertTrue(processed)
+            call_args = summary_engine.finalize_progressive_ata.call_args.args
+            self.assertEqual(call_args[2], expected_mode)
+            return call_args[1]
+
+        full_text = await run_case("auto", 1000, "full_transcript")
+        self.assertIn("x" * 30, full_text)
+
+        delta_text = await run_case("auto", 10, "delta_only")
+        self.assertIn("delta", delta_text)
+        self.assertNotIn("x" * 30, delta_text)
+
+        forced_delta_text = await run_case("delta_only", 1000, "delta_only")
+        self.assertIn("delta", forced_delta_text)
+
+        forced_full_text = await run_case("full_transcript", 10, "full_transcript")
+        self.assertIn("x" * 30, forced_full_text)
+
+
+@unittest.skipIf(STT_APP_IMPORT_ERROR is not None, f"dependencias ausentes: {STT_APP_IMPORT_ERROR}")
 class FinalTranscriptTests(unittest.TestCase):
     def test_session_final_transcript_path_matches_expected_structure(self):
         base = "VERTICALS/HEALTH/COMPANIES/acme/TRANSCRIPT/roomA/RM_session-1"
@@ -2876,7 +3054,7 @@ class AdminSummaryReprocessTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_reprocess_status_returns_final_error_details_when_exhausted(self):
         temp_payload = {
             "error": "falha de contrato",
-            "model": "gpt-4.1-mini",
+            "model": "openai/gpt-4.1-mini",
             "kind": STT_APP.SUMMARY_KIND_FINAL,
             "updated_at": "2026-04-24T12:00:00+00:00",
         }
