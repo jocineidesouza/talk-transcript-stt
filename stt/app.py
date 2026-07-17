@@ -45,6 +45,16 @@ MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
 APP_VERSION = os.environ.get("APP_VERSION", "0.1.5").strip() or "0.1.5"
+STT_PROVIDER = os.environ.get("STT_PROVIDER", "self_hosted").strip() or "self_hosted"
+STT_MODEL = os.environ.get("STT_MODEL", MODEL_DIR.name).strip() or MODEL_DIR.name
+STT_PRICING_SOURCE = os.environ.get(
+    "STT_PRICING_SOURCE", "azure_speech_standard_reference"
+).strip() or "azure_speech_standard_reference"
+STT_PRICING_VERSION = os.environ.get("STT_PRICING_VERSION", "2026-07-17").strip() or "2026-07-17"
+try:
+    STT_PRICE_USD_PER_HOUR = max(0.0, float(os.environ.get("STT_PRICE_USD_PER_HOUR", "1.0")))
+except ValueError:
+    STT_PRICE_USD_PER_HOUR = 1.0
 
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "/data/queue.db"))
 SPOOL_DIR = Path(os.environ.get("SPOOL_DIR", "/data/spool"))
@@ -159,6 +169,115 @@ logging.basicConfig(
 logger = logging.getLogger("stt")
 
 CALL_INDEX_UNSET = object()
+
+
+def stt_operation_id(chunk_row: sqlite3.Row | dict) -> str:
+    return (
+        f"transcription:{chunk_row['session_id']}:{chunk_row['participant_identity']}"
+        f":{int(chunk_row['seq'])}"
+    )
+
+
+def audio_duration_ms(started_at: str, ended_at: str) -> int:
+    return max(0, round((parse_iso_datetime(ended_at) - parse_iso_datetime(started_at)).total_seconds() * 1000))
+
+
+def stt_cost_micros(duration_ms: int) -> int:
+    return round(max(0, duration_ms) / 3_600_000 * STT_PRICE_USD_PER_HOUR * 1_000_000)
+
+
+def build_stt_transcription_metadata(
+    operation_id: str | None = None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    model_type: str | None = None,
+    request_id: str | None = None,
+) -> dict:
+    return {
+        "provider": provider or STT_PROVIDER,
+        "model": model or STT_MODEL,
+        "modelType": model_type or MODEL_TYPE,
+        "operationId": operation_id,
+        "requestId": request_id,
+    }
+
+
+def build_stt_usage(
+    duration_ms: int,
+    processing_time_ms: int | None = None,
+    operation_id: str | None = None,
+    *,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    audio_tokens: int | None = None,
+    cached_tokens: int | None = None,
+    cost_micros: int | None = None,
+    currency: str = "USD",
+    pricing_source: str | None = None,
+    pricing_version: str | None = None,
+    simulated: bool = False,
+) -> dict:
+    return {
+        "audioDurationMs": max(0, int(duration_ms)),
+        "processingTimeMs": None if processing_time_ms is None else max(0, int(processing_time_ms)),
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "audioTokens": audio_tokens,
+        "cachedTokens": cached_tokens,
+        "costMicros": stt_cost_micros(duration_ms) if cost_micros is None else int(cost_micros),
+        "currency": currency,
+        "billingUnit": "audio_second",
+        "pricingSource": pricing_source or STT_PRICING_SOURCE,
+        "pricingVersion": pricing_version or STT_PRICING_VERSION,
+        "simulated": simulated,
+    }
+
+
+def aggregate_stt_usage(lines: list[dict]) -> dict:
+    usage_items = [line.get("usage", {}) for line in lines]
+    return {
+        "audioDurationMs": sum(int(item.get("audioDurationMs") or 0) for item in usage_items),
+        "processingTimeMs": sum(int(item.get("processingTimeMs") or 0) for item in usage_items),
+        "inputTokens": None,
+        "outputTokens": None,
+        "audioTokens": None,
+        "cachedTokens": None,
+        "costMicros": sum(int(item.get("costMicros") or 0) for item in usage_items),
+        "currency": "USD",
+        "billingUnit": "audio_second",
+        "pricingSource": STT_PRICING_SOURCE,
+        "pricingVersion": STT_PRICING_VERSION,
+        "simulated": any(bool(item.get("simulated")) for item in usage_items),
+    }
+
+
+def build_stt_line_metadata(row: sqlite3.Row | dict) -> tuple[dict, dict]:
+    duration_ms = int(
+        row["audio_duration_ms"]
+        or audio_duration_ms(row["chunk_started_at"], row["chunk_ended_at"])
+    )
+    transcription = build_stt_transcription_metadata(
+        row["operation_id"],
+        provider=row["provider"],
+        model=row["model"],
+        model_type=row["model_type"],
+        request_id=row["request_id"],
+    )
+    usage = build_stt_usage(
+        duration_ms,
+        row["processing_time_ms"],
+        row["operation_id"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        audio_tokens=row["audio_tokens"],
+        cached_tokens=row["cached_tokens"],
+        cost_micros=row["cost_micros"],
+        currency=row["currency"] or "USD",
+        pricing_source=row["pricing_source"],
+        pricing_version=row["pricing_version"],
+    )
+    return transcription, usage
 
 
 class SummaryContractValidationError(RuntimeError):
@@ -2067,6 +2186,21 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 transcript TEXT,
                 error_message TEXT,
+                audio_duration_ms INTEGER,
+                processing_time_ms INTEGER,
+                provider TEXT,
+                model TEXT,
+                model_type TEXT,
+                operation_id TEXT,
+                request_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                audio_tokens INTEGER,
+                cached_tokens INTEGER,
+                cost_micros INTEGER,
+                currency TEXT,
+                pricing_source TEXT,
+                pricing_version TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 processed_at TEXT,
@@ -2074,6 +2208,29 @@ def init_db() -> None:
             )
             """
         )
+        chunk_columns = {
+            "audio_duration_ms": "INTEGER",
+            "processing_time_ms": "INTEGER",
+            "provider": "TEXT",
+            "model": "TEXT",
+            "model_type": "TEXT",
+            "operation_id": "TEXT",
+            "request_id": "TEXT",
+            "input_tokens": "INTEGER",
+            "output_tokens": "INTEGER",
+            "audio_tokens": "INTEGER",
+            "cached_tokens": "INTEGER",
+            "cost_micros": "INTEGER",
+            "currency": "TEXT",
+            "pricing_source": "TEXT",
+            "pricing_version": "TEXT",
+        }
+        existing_chunk_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()
+        }
+        for column, column_type in chunk_columns.items():
+            if column not in existing_chunk_columns:
+                conn.execute(f"ALTER TABLE chunks ADD COLUMN {column} {column_type}")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS transcripts (
@@ -2430,20 +2587,66 @@ class FirebaseSink:
             payload["transcript_session_ids"] = transcript_session_ids
         session_ref.set(payload, merge=True)
 
-    def upload_json(self, object_path: str, body: dict) -> None:
+    def upload_json(self, routing: RoomRoutingContext, object_path: str, body: dict) -> None:
         if not self.enabled or self.storage_bucket is None:
             return
 
         json_blob = self.storage_bucket.blob(object_path)
+        path_segments = [segment for segment in str(object_path or '').split('/') if segment]
+        relative_path = path_segments[6:] if len(path_segments) >= 7 else []
+        artifact_type = path_segments[3] if len(path_segments) >= 4 else ''
+        object_role = None
+        if artifact_type == 'transcriptions' and relative_path[:1] == ['final']:
+            object_role = 'final-transcript'
+        elif artifact_type == 'summaries':
+            if relative_path[:1] == ['final']:
+                object_role = 'final-summary'
+            elif relative_path[:1] == ['accumulated']:
+                object_role = 'accumulated-summary'
+
+        custom_metadata = {
+            'vertical': routing.vertical,
+            'slug': routing.slug,
+            'feature': 'ai',
+            'artifactType': artifact_type,
+            'entityId': routing.call_session_id,
+            'artifactId': routing.transcript_session_id or path_segments[5] if len(path_segments) >= 6 else '',
+            'producer': 'transcription-service' if artifact_type == 'transcriptions' else 'summary-service',
+            'callSessionId': routing.call_session_id,
+            'roomId': routing.room_id,
+        }
+        if object_role:
+            custom_metadata['objectRole'] = object_role
+
+        json_blob.metadata = custom_metadata
         json_blob.upload_from_string(
             json.dumps(body, ensure_ascii=False),
             content_type="application/json",
         )
 
-    def upload_text(self, object_path: str, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
+    def upload_text(
+        self,
+        routing: RoomRoutingContext,
+        object_path: str,
+        body: str,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
         if not self.enabled or self.storage_bucket is None:
             return
         text_blob = self.storage_bucket.blob(object_path)
+        custom_metadata = {
+            'vertical': routing.vertical,
+            'slug': routing.slug,
+            'feature': 'ai',
+            'artifactType': 'summaries',
+            'entityId': routing.call_session_id,
+            'artifactId': routing.transcript_session_id or '',
+            'producer': 'summary-service',
+            'callSessionId': routing.call_session_id,
+            'roomId': routing.room_id,
+            'objectRole': 'final-summary' if '/final/' in f'/{object_path}' else 'summary-text',
+        }
+        text_blob.metadata = custom_metadata
         text_blob.upload_from_string(body, content_type=content_type)
 
     def fetch_text(self, object_path: str) -> str | None:
@@ -2477,6 +2680,7 @@ class FirebaseSink:
         self, routing: RoomRoutingContext, payload: MinuteShardPayload
     ) -> None:
         self.upload_json(
+            routing,
             payload.transcript_json_path,
             {
                 "room_name": payload.room_name,
@@ -2488,6 +2692,8 @@ class FirebaseSink:
                 "minute_index": payload.minute_index,
                 "minute_started_at": payload.minute_started_at,
                 "minute_ended_at": payload.minute_ended_at,
+                "transcription": build_stt_transcription_metadata(),
+                "usage": aggregate_stt_usage(payload.lines),
                 "line_count": payload.line_count,
                 "lines": payload.lines,
             },
@@ -2694,7 +2900,7 @@ class FirebaseRouter:
         self.sink_for_namespace(routing.namespace).upload_minute_transcript(routing, payload)
 
     def upload_json(self, routing: RoomRoutingContext, object_path: str, body: dict) -> None:
-        self.sink_for_namespace(routing.namespace).upload_json(object_path, body)
+        self.sink_for_namespace(routing.namespace).upload_json(routing, object_path, body)
 
     def upload_text(
         self,
@@ -2704,6 +2910,7 @@ class FirebaseRouter:
         content_type: str = "text/plain; charset=utf-8",
     ) -> None:
         self.sink_for_namespace(routing.namespace).upload_text(
+            routing,
             object_path,
             body,
             content_type=content_type,
@@ -3098,21 +3305,45 @@ def db_claim_next_chunk() -> sqlite3.Row | None:
         conn.close()
 
 
-def db_mark_chunk_done(chunk_row: sqlite3.Row, text: str) -> None:
+def db_mark_chunk_done(
+    chunk_row: sqlite3.Row,
+    text: str,
+    processing_time_ms: int,
+) -> None:
     now = utc_now_iso()
+    duration_ms = audio_duration_ms(chunk_row["chunk_started_at"], chunk_row["chunk_ended_at"])
+    operation_id = stt_operation_id(chunk_row)
     conn = read_db_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
             UPDATE chunks
-            SET status='done', transcript=?, processed_at=?, updated_at=?
+            SET status='done', transcript=?, processed_at=?, updated_at=?,
+                audio_duration_ms=?, processing_time_ms=?, provider=?, model=?, model_type=?,
+                operation_id=?, request_id=?, input_tokens=?, output_tokens=?, audio_tokens=?,
+                cached_tokens=?, cost_micros=?, currency=?, pricing_source=?, pricing_version=?
             WHERE room_name = ? AND session_id = ? AND participant_identity = ? AND seq = ?
             """,
             (
                 text,
                 now,
                 now,
+                duration_ms,
+                processing_time_ms,
+                STT_PROVIDER,
+                STT_MODEL,
+                MODEL_TYPE,
+                operation_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                stt_cost_micros(duration_ms),
+                "USD",
+                STT_PRICING_SOURCE,
+                STT_PRICING_VERSION,
                 chunk_row["room_name"],
                 chunk_row["session_id"],
                 chunk_row["participant_identity"],
@@ -3204,7 +3435,22 @@ def db_get_room_aggregate(room_name: str, session_id: str) -> tuple[str, list[di
                 c.seq,
                 c.transcript,
                 c.chunk_started_at,
-                c.chunk_ended_at
+                c.chunk_ended_at,
+                c.audio_duration_ms,
+                c.processing_time_ms,
+                c.provider,
+                c.model,
+                c.model_type,
+                c.operation_id,
+                c.request_id,
+                c.input_tokens,
+                c.output_tokens,
+                c.audio_tokens,
+                c.cached_tokens,
+                c.cost_micros,
+                c.currency,
+                c.pricing_source,
+                c.pricing_version
             FROM chunks c
             LEFT JOIN participants p
               ON p.room_name = c.room_name
@@ -3222,6 +3468,7 @@ def db_get_room_aggregate(room_name: str, session_id: str) -> tuple[str, list[di
                 continue
             participant_name = (row["participant_name"] or "").strip()
             display_name = participant_name or row["participant_identity"]
+            transcription, usage = build_stt_line_metadata(row)
             lines.append(
                 {
                     "participant_identity": row["participant_identity"],
@@ -3231,6 +3478,8 @@ def db_get_room_aggregate(room_name: str, session_id: str) -> tuple[str, list[di
                     "text": text,
                     "chunk_started_at": row["chunk_started_at"],
                     "chunk_ended_at": row["chunk_ended_at"],
+                    "usage": usage,
+                    "transcription": transcription,
                 }
             )
 
@@ -3373,7 +3622,22 @@ def db_get_done_chunks_for_session(room_name: str, call_session_id: str) -> list
                 c.seq,
                 c.transcript,
                 c.chunk_started_at,
-                c.chunk_ended_at
+                c.chunk_ended_at,
+                c.audio_duration_ms,
+                c.processing_time_ms,
+                c.provider,
+                c.model,
+                c.model_type,
+                c.operation_id,
+                c.request_id,
+                c.input_tokens,
+                c.output_tokens,
+                c.audio_tokens,
+                c.cached_tokens,
+                c.cost_micros,
+                c.currency,
+                c.pricing_source,
+                c.pricing_version
             FROM chunks c
             LEFT JOIN participants p
               ON p.room_name = c.room_name
@@ -3408,6 +3672,7 @@ def build_minute_shards(
         )
         participant_name = (row["participant_name"] or "").strip()
         display_name = participant_name or row["participant_identity"]
+        transcription, usage = build_stt_line_metadata(row)
         grouped.setdefault(minute_index, []).append(
             {
                 "speaker": display_name,
@@ -3417,6 +3682,8 @@ def build_minute_shards(
                 "text": text,
                 "chunk_started_at": row["chunk_started_at"],
                 "chunk_ended_at": row["chunk_ended_at"],
+                "usage": usage,
+                "transcription": transcription,
             }
         )
 
@@ -5010,6 +5277,8 @@ def build_final_transcript_payload(
 ) -> dict:
     transcript, lines = db_get_room_aggregate(room_name, call_session_id)
     return {
+        "transcription": build_stt_transcription_metadata(),
+        "usage": aggregate_stt_usage(lines),
         "room_name": room_name,
         "transcript_session_id": transcript_session_id,
         "call_session_id": call_session_id,
@@ -6358,16 +6627,19 @@ async def worker_loop(
 
         spool_path = Path(chunk_row["spool_path"])
         try:
+            processing_started = time.perf_counter()
             text = await asyncio.to_thread(decode_pcm_file, recognizer, spool_path)
-            await asyncio.to_thread(db_mark_chunk_done, chunk_row, text)
+            processing_time_ms = round((time.perf_counter() - processing_started) * 1000)
+            await asyncio.to_thread(db_mark_chunk_done, chunk_row, text, processing_time_ms)
 
             logger.info(
-                "chunk processed room=%s session=%s participant=%s seq=%s text_len=%s",
+                "chunk processed room=%s session=%s participant=%s seq=%s text_len=%s processing_time_ms=%s",
                 chunk_row["room_name"],
                 chunk_row["session_id"],
                 chunk_row["participant_identity"],
                 chunk_row["seq"],
                 len(text),
+                processing_time_ms,
             )
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("chunk processing failed: %s", exc)

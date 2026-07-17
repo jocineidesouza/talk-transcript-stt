@@ -122,6 +122,22 @@ Body JSON:
 }
 ```
 
+## Uso e cobranca da transcricao
+
+Os arquivos `minutes/*/transcript.json` e `final/final_transcript.json` carregam metadados do provedor e uso
+agregado no campo `usage`. Cada item de `lines` tambem possui `transcription` e `usage` proprios.
+
+- `provider` e `model` identificam o motor que gerou a linha.
+- `operationId` e deterministico por sessao, participante e sequencia, permitindo idempotencia.
+- `audioDurationMs` e a duracao do chunk; `processingTimeMs` e o tempo do decode local.
+- `costMicros` e custo em microdolares (`1 USD = 1.000.000 micros`), calculado pela duracao do audio.
+- Tokens ficam `null` quando o provedor STT nao os fornece; nao sao estimados artificialmente.
+- O `usage` do arquivo e a soma dos valores de `lines[].usage`.
+
+No `self_hosted`, `STT_PRICE_USD_PER_HOUR` define o preco de referencia usado para consolidacao. Ao trocar de
+provedor, o contrato permanece o mesmo e apenas `STT_PROVIDER`, modelo, identificadores retornados e regra de
+preco precisam ser adaptados.
+
 Exemplo curl:
 
 ```bash
@@ -184,6 +200,11 @@ Campos principais no retorno:
 - `OPENROUTER_BASE_URL` (padrao `https://openrouter.ai/api/v1`)
 - `OPENROUTER_HTTP_REFERER` (opcional)
 - `OPENROUTER_X_TITLE` (opcional)
+- `STT_PROVIDER` (padrao `self_hosted`)
+- `STT_MODEL` (padrao derivado de `MODEL_DIR`)
+- `STT_PRICE_USD_PER_HOUR` (padrao `1.00`, referencia de cobranca por hora de audio)
+- `STT_PRICING_SOURCE` (padrao `azure_speech_standard_reference`)
+- `STT_PRICING_VERSION` (padrao `2026-07-17`)
 
 Exemplo de `FIREBASE_NAMESPACE_CONFIG_JSON`:
 
