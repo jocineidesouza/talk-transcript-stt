@@ -44,7 +44,7 @@ TAIL_PADDING_SECONDS = float(os.environ.get("TAIL_PADDING_SECONDS", "0.35"))
 MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.1.4").strip() or "0.1.4"
+APP_VERSION = os.environ.get("APP_VERSION", "0.1.5").strip() or "0.1.5"
 
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "/data/queue.db"))
 SPOOL_DIR = Path(os.environ.get("SPOOL_DIR", "/data/spool"))
