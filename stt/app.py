@@ -1878,6 +1878,7 @@ class RoomRoutingContext:
     slug: str
     firestore_doc_path: str
     storage_base_path: str
+    transcript_storage_base_path: str = ""
 
 
 class RoomRoutingError(RuntimeError):
@@ -1901,8 +1902,24 @@ def build_firestore_doc_path(vertical: str, slug: str, room_id: str, call_sessio
     return f"VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/SESSIONS/{call_session_id}"
 
 
-def build_storage_base_path(vertical: str, slug: str, room_id: str, call_session_id: str) -> str:
-    return f"VERTICALS/{vertical}/COMPANIES/{slug}/TRANSCRIPT/{room_id}/{call_session_id}"
+def build_storage_base_path(
+    vertical: str,
+    slug: str,
+    room_id: str,
+    call_session_id: str,
+    transcript_session_id: str,
+) -> str:
+    return f"{vertical}/{slug}/ai/summaries/{call_session_id}/{transcript_session_id}"
+
+
+def build_transcript_storage_base_path(
+    vertical: str,
+    slug: str,
+    room_id: str,
+    call_session_id: str,
+    transcript_session_id: str,
+) -> str:
+    return f"{vertical}/{slug}/ai/transcriptions/{call_session_id}/{transcript_session_id}"
 
 
 def build_room_session_doc_path(vertical: str, slug: str, room_id: str, call_session_id: str) -> str:
@@ -1999,6 +2016,7 @@ def init_db() -> None:
                 slug TEXT,
                 firestore_doc_path TEXT,
                 storage_base_path TEXT,
+                transcript_storage_base_path TEXT,
                 started_at TEXT NOT NULL,
                 metadata_json TEXT,
                 state TEXT NOT NULL DEFAULT 'active',
@@ -2110,6 +2128,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN firestore_doc_path TEXT")
         if "storage_base_path" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN storage_base_path TEXT")
+        if "transcript_storage_base_path" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN transcript_storage_base_path TEXT")
         conn.execute("UPDATE sessions SET call_session_id = room_id WHERE call_session_id IS NULL OR call_session_id = ''")
         conn.execute(
             """
@@ -2370,6 +2390,7 @@ class FirebaseSink:
             "minute_window_seconds": minute_window_seconds,
             "flush_interval_seconds": flush_interval_seconds,
             "storage_base": routing.storage_base_path,
+            "transcript_storage_base": routing.transcript_storage_base_path,
             "updated_at": firestore.SERVER_TIMESTAMP,
         }
         if summary_accumulated_path is not CALL_INDEX_UNSET:
@@ -2571,6 +2592,8 @@ class FirebaseRouter:
         info = extract_room_namespace(room_name)
         if info is None:
             raise RoomRoutingError("invalid_namespace", f"namespace invalido para room {room_name}")
+        if not str(transcript_session_id or '').strip():
+            raise RoomRoutingError("missing_transcript_session_id", "transcript_session_id obrigatorio")
 
         if not self.enabled:
             vertical = "disabled"
@@ -2584,7 +2607,12 @@ class FirebaseRouter:
                 vertical=vertical,
                 slug=slug,
                 firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, call_session_id),
-                storage_base_path=build_storage_base_path(vertical, slug, info.room_id, call_session_id),
+                storage_base_path=build_storage_base_path(
+                    vertical, slug, info.room_id, call_session_id, transcript_session_id
+                ),
+                transcript_storage_base_path=build_transcript_storage_base_path(
+                    vertical, slug, info.room_id, call_session_id, transcript_session_id
+                ),
             )
 
         sink = self._get_or_create_sink(info.namespace)
@@ -2620,7 +2648,12 @@ class FirebaseRouter:
             vertical=vertical,
             slug=slug,
             firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, call_session_id),
-            storage_base_path=build_storage_base_path(vertical, slug, info.room_id, call_session_id),
+            storage_base_path=build_storage_base_path(
+                vertical, slug, info.room_id, call_session_id, transcript_session_id
+            ),
+            transcript_storage_base_path=build_transcript_storage_base_path(
+                vertical, slug, info.room_id, call_session_id, transcript_session_id
+            ),
         )
     def publish_call_index(
         self,
@@ -2770,10 +2803,10 @@ def db_upsert_start(req: StartRequest, routing: RoomRoutingContext) -> None:
             """
             INSERT INTO sessions(
                 room_name, session_id, call_session_id, transcript_session_id, room_id, vertical, slug,
-                firestore_doc_path, storage_base_path,
+                firestore_doc_path, storage_base_path, transcript_storage_base_path,
                 started_at, metadata_json,
                 state, room_end_received, last_chunk_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)
             ON CONFLICT(room_name, session_id) DO UPDATE SET
                 updated_at=excluded.updated_at,
                 call_session_id=excluded.call_session_id,
@@ -2783,6 +2816,7 @@ def db_upsert_start(req: StartRequest, routing: RoomRoutingContext) -> None:
                 slug=excluded.slug,
                 firestore_doc_path=excluded.firestore_doc_path,
                 storage_base_path=excluded.storage_base_path,
+                transcript_storage_base_path=excluded.transcript_storage_base_path,
                 metadata_json=COALESCE(excluded.metadata_json, sessions.metadata_json),
                 last_chunk_at=COALESCE(sessions.last_chunk_at, excluded.last_chunk_at)
             """,
@@ -2796,6 +2830,7 @@ def db_upsert_start(req: StartRequest, routing: RoomRoutingContext) -> None:
                 routing.slug,
                 routing.firestore_doc_path,
                 routing.storage_base_path,
+                routing.transcript_storage_base_path,
                 req.started_at,
                 json.dumps(req.metadata, ensure_ascii=False) if req.metadata is not None else None,
                 req.started_at,
@@ -3255,7 +3290,7 @@ def db_get_session_row(room_name: str, call_session_id: str) -> sqlite3.Row | No
         return conn.execute(
             """
             SELECT room_name, session_id, call_session_id, transcript_session_id, room_id, vertical, slug,
-                   firestore_doc_path, storage_base_path,
+                   firestore_doc_path, storage_base_path, transcript_storage_base_path,
                    started_at, room_end_received, finalized_at
             FROM sessions
             WHERE room_name=? AND (session_id=? OR call_session_id=?)
@@ -3277,13 +3312,16 @@ def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
     slug = str(row["slug"] or "").strip()
     firestore_doc_path = str(row["firestore_doc_path"] or "").strip()
     storage_base_path = str(row["storage_base_path"] or "").strip()
+    transcript_storage_base_path = str(row["transcript_storage_base_path"] or "").strip()
 
     if not room_name or not room_id or not call_session_id:
         raise RuntimeError("session routing context incompleto: room_name/room_id/call_session_id")
     if not vertical or not slug:
         raise RuntimeError("session routing context incompleto: vertical/slug")
-    if not firestore_doc_path or not storage_base_path:
-        raise RuntimeError("session routing context incompleto: firestore_doc_path/storage_base_path")
+    if not firestore_doc_path or not storage_base_path or not transcript_storage_base_path:
+        raise RuntimeError(
+            "session routing context incompleto: firestore_doc_path/storage_base_path/transcript_storage_base_path"
+        )
     if not namespace_value:
         raise RuntimeError("session routing context invalido: namespace ausente")
 
@@ -3297,6 +3335,7 @@ def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
         slug=slug,
         firestore_doc_path=firestore_doc_path,
         storage_base_path=storage_base_path,
+        transcript_storage_base_path=transcript_storage_base_path,
     )
 
 
@@ -5159,7 +5198,7 @@ async def process_progressive_ata_final_task(
 
     accumulated_path = session_progressive_ata_accumulated_path(routing.storage_base_path)
     accumulated_meta_path = session_progressive_ata_meta_path(routing.storage_base_path)
-    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+    final_transcript_path = session_final_transcript_path(routing.transcript_storage_base_path)
     final_summary_text_path = session_final_summary_text_path(routing.storage_base_path)
     accumulated_text = await asyncio.to_thread(firebase_router.fetch_text, routing, accumulated_path)
     accumulated_meta = await asyncio.to_thread(firebase_router.fetch_json, routing, accumulated_meta_path)
@@ -5291,7 +5330,7 @@ def publish_session_minute_exports(
         room_name=room_name,
         call_session_id=routing.call_session_id,
         transcript_session_id=routing.transcript_session_id,
-        storage_base_path=routing.storage_base_path,
+        storage_base_path=routing.transcript_storage_base_path,
         started_at=session_row["started_at"],
         done_chunks=done_chunks,
         minute_window_seconds=STORAGE_MINUTE_WINDOW_SECONDS,
@@ -5405,7 +5444,7 @@ async def finalize_entities(firebase_router: FirebaseRouter, summary_engine: Sum
                 summary_engine.enabled,
             )
             routing = routing_context_from_session_row(room)
-            final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+            final_transcript_path = session_final_transcript_path(routing.transcript_storage_base_path)
             final_summary_text_path = session_final_summary_text_path(routing.storage_base_path)
             final_transcript_payload = await asyncio.to_thread(
                 build_final_transcript_payload,
@@ -6061,7 +6100,7 @@ async def summary_worker_loop(
                         final_temp_path,
                         temp_payload,
                     )
-                    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+                    final_transcript_path = session_final_transcript_path(routing.transcript_storage_base_path)
                     await asyncio.to_thread(
                         firebase_router.publish_call_index,
                         routing=routing,
@@ -6126,7 +6165,7 @@ async def summary_worker_loop(
                         final_path,
                     )
                     final_summary_text_ready = False
-                    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+                    final_transcript_path = session_final_transcript_path(routing.transcript_storage_base_path)
                     try:
                         final_text_system_prompt = await asyncio.to_thread(
                             firebase_router.fetch_agent_prompt,
@@ -6717,7 +6756,7 @@ async def admin_summary_reprocess(payload: AdminSummaryReprocessTarget) -> JSONR
                 "updated_at": now_iso,
             },
         )
-    final_transcript_path = session_final_transcript_path(routing.storage_base_path)
+    final_transcript_path = session_final_transcript_path(routing.transcript_storage_base_path)
     final_transcript_payload = await asyncio.to_thread(
         build_final_transcript_payload,
         payload.room_name,
