@@ -138,6 +138,24 @@ No `self_hosted`, `STT_PRICE_USD_PER_HOUR` define o preco de referencia usado pa
 provedor, o contrato permanece o mesmo e apenas `STT_PROVIDER`, modelo, identificadores retornados e regra de
 preco precisam ser adaptados.
 
+### Custos do resumo via OpenRouter
+
+Enquanto `SUMMARY_PROVIDER=openrouter`, cada chamada ao endpoint `/responses` e registrada no SQLite e o arquivo
+`final/summary_costs.json` e enviado ao Storage quando a ata final textual e concluida. O arquivo inclui chamadas
+de resumo por minuto, acumulado, JSON final, HTML final, ata progressiva, retries, tokens, cache, reasoning,
+generation ID, request ID, modelo e custo retornado pelo OpenRouter.
+
+O custo do OpenRouter e convertido para `costMicros` (`1 USD = 1.000.000 micros`). Cada retry possui uma entrada
+separada e seu `operationId` inclui a tentativa logica e a tentativa de rede. Reprocessamentos reutilizam o
+registro persistido e nao criam custo novo quando nenhuma chamada e feita.
+
+### Integração futura com OpenAI
+
+A integracao OpenAI ainda nao esta implementada. Quando necessaria, ela deve reutilizar a tabela
+`summary_requests` e o mesmo `summary_costs.json`, mapeando `input_tokens`, `output_tokens`,
+`input_tokens_details.cached_tokens` e `output_tokens_details.reasoning_tokens`. O custo devera ser calculado
+por uma tabela de precos versionada da OpenAI, pois o contrato atual de custos e especifico do OpenRouter.
+
 Exemplo curl:
 
 ```bash

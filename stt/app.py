@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -2342,6 +2342,47 @@ def init_db() -> None:
             ON summary_tasks(status, next_attempt_at, updated_at)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summary_requests (
+                room_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                transcript_session_id TEXT,
+                minute_index INTEGER,
+                kind TEXT,
+                stage TEXT NOT NULL,
+                logical_attempt INTEGER NOT NULL DEFAULT 1,
+                network_attempt INTEGER NOT NULL DEFAULT 1,
+                operation_id TEXT NOT NULL UNIQUE,
+                provider TEXT NOT NULL,
+                model_requested TEXT,
+                model_used TEXT,
+                generation_id TEXT,
+                request_id TEXT,
+                status TEXT NOT NULL,
+                http_status INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                total_tokens INTEGER,
+                cached_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                provider_cost_micros INTEGER NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                latency_ms INTEGER,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(room_name, session_id, operation_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_summary_requests_session
+            ON summary_requests(room_name, session_id, created_at)
+            """
+        )
     finally:
         conn.close()
 
@@ -2528,6 +2569,7 @@ class FirebaseSink:
         final_transcript_ready: bool | object = CALL_INDEX_UNSET,
         final_summary_text_path: str | None | object = CALL_INDEX_UNSET,
         final_summary_text_ready: bool | object = CALL_INDEX_UNSET,
+        summary_costs_path: str | None | object = CALL_INDEX_UNSET,
     ) -> None:
         if not self.enabled or self.firestore_client is None:
             return
@@ -2564,6 +2606,8 @@ class FirebaseSink:
             payload["final_summary_text_path"] = final_summary_text_path
         if final_summary_text_ready is not CALL_INDEX_UNSET:
             payload["final_summary_text_ready"] = final_summary_text_ready
+        if summary_costs_path is not CALL_INDEX_UNSET:
+            payload["summary_costs_path"] = summary_costs_path
 
         call_ref.set(payload, merge=True)
 
@@ -2874,6 +2918,7 @@ class FirebaseRouter:
         final_transcript_ready: bool | object = CALL_INDEX_UNSET,
         final_summary_text_path: str | None | object = CALL_INDEX_UNSET,
         final_summary_text_ready: bool | object = CALL_INDEX_UNSET,
+        summary_costs_path: str | None | object = CALL_INDEX_UNSET,
     ) -> None:
         self.sink_for_namespace(routing.namespace).publish_call_index(
             routing,
@@ -2889,6 +2934,7 @@ class FirebaseRouter:
             final_transcript_ready=final_transcript_ready,
             final_summary_text_path=final_summary_text_path,
             final_summary_text_ready=final_summary_text_ready,
+            summary_costs_path=summary_costs_path,
         )
 
     def upsert_room_session_links_on_start(self, routing: RoomRoutingContext) -> None:
@@ -3799,6 +3845,203 @@ def db_upsert_summary_task(room_name: str, call_session_id: str, minute_index: i
         conn.close()
 
 
+def db_record_summary_request(record: dict) -> None:
+    conn = read_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO summary_requests(
+                room_name, session_id, transcript_session_id, minute_index,
+                kind, stage, logical_attempt, network_attempt, operation_id,
+                provider, model_requested, model_used, generation_id, request_id,
+                status, http_status, input_tokens, output_tokens, total_tokens,
+                cached_tokens, reasoning_tokens, provider_cost_micros, currency,
+                started_at, completed_at, latency_ms, error_message, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(operation_id) DO UPDATE SET
+                model_used=excluded.model_used,
+                generation_id=excluded.generation_id,
+                request_id=excluded.request_id,
+                status=excluded.status,
+                http_status=excluded.http_status,
+                input_tokens=excluded.input_tokens,
+                output_tokens=excluded.output_tokens,
+                total_tokens=excluded.total_tokens,
+                cached_tokens=excluded.cached_tokens,
+                reasoning_tokens=excluded.reasoning_tokens,
+                provider_cost_micros=excluded.provider_cost_micros,
+                currency=excluded.currency,
+                completed_at=excluded.completed_at,
+                latency_ms=excluded.latency_ms,
+                error_message=excluded.error_message
+            """,
+            (
+                record["room_name"],
+                record["session_id"],
+                record.get("transcript_session_id"),
+                record.get("minute_index"),
+                record.get("kind"),
+                record["stage"],
+                int(record.get("logical_attempt", 1)),
+                int(record.get("network_attempt", 1)),
+                record["operation_id"],
+                record.get("provider", "openrouter"),
+                record.get("model_requested"),
+                record.get("model_used"),
+                record.get("generation_id"),
+                record.get("request_id"),
+                record["status"],
+                record.get("http_status"),
+                record.get("input_tokens"),
+                record.get("output_tokens"),
+                record.get("total_tokens"),
+                record.get("cached_tokens"),
+                record.get("reasoning_tokens"),
+                int(record.get("provider_cost_micros") or 0),
+                record.get("currency", "USD"),
+                record["started_at"],
+                record.get("completed_at"),
+                record.get("latency_ms"),
+                record.get("error_message"),
+                record.get("created_at") or utc_now_iso(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_get_summary_requests(room_name: str, call_session_id: str) -> list[sqlite3.Row]:
+    conn = read_db_connection()
+    try:
+        return conn.execute(
+            """
+            SELECT * FROM summary_requests
+            WHERE room_name=? AND session_id=?
+            ORDER BY created_at ASC, network_attempt ASC
+            """,
+            (room_name, call_session_id),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def build_summary_costs_payload(
+    room_name: str,
+    call_session_id: str,
+    transcript_session_id: str | None,
+    rows: list[sqlite3.Row],
+    updated_at: str,
+) -> dict:
+    requests = [
+        {
+            "operationId": row["operation_id"],
+            "stage": row["stage"],
+            "kind": row["kind"],
+            "minuteIndex": row["minute_index"],
+            "logicalAttempt": row["logical_attempt"],
+            "networkAttempt": row["network_attempt"],
+            "provider": row["provider"],
+            "modelRequested": row["model_requested"],
+            "modelUsed": row["model_used"],
+            "generationId": row["generation_id"],
+            "requestId": row["request_id"],
+            "status": row["status"],
+            "httpStatus": row["http_status"],
+            "startedAt": row["started_at"],
+            "completedAt": row["completed_at"],
+            "latencyMs": row["latency_ms"],
+            "usage": {
+                "inputTokens": row["input_tokens"],
+                "outputTokens": row["output_tokens"],
+                "totalTokens": row["total_tokens"],
+                "cachedTokens": row["cached_tokens"],
+                "reasoningTokens": row["reasoning_tokens"],
+            },
+            "cost": {
+                "providerCostMicros": row["provider_cost_micros"] or 0,
+                "billableCostMicros": row["provider_cost_micros"] or 0,
+                "currency": row["currency"] or "USD",
+                "source": "openrouter",
+            },
+            "errorMessage": row["error_message"],
+        }
+        for row in rows
+    ]
+    totals = {
+        "requests": len(requests),
+        "completedRequests": sum(row["status"] == "completed" for row in requests),
+        "failedRequests": sum(row["status"] != "completed" for row in requests),
+        "inputTokens": sum(int(row["usage"]["inputTokens"] or 0) for row in requests),
+        "outputTokens": sum(int(row["usage"]["outputTokens"] or 0) for row in requests),
+        "totalTokens": sum(int(row["usage"]["totalTokens"] or 0) for row in requests),
+        "cachedTokens": sum(int(row["usage"]["cachedTokens"] or 0) for row in requests),
+        "reasoningTokens": sum(int(row["usage"]["reasoningTokens"] or 0) for row in requests),
+        "providerCostMicros": sum(int(row["cost"]["providerCostMicros"] or 0) for row in requests),
+        "billableCostMicros": sum(int(row["cost"]["billableCostMicros"] or 0) for row in requests),
+        "currency": "USD",
+    }
+    by_stage: dict[str, dict] = {}
+    for row in requests:
+        stage = str(row.get("stage") or "unknown")
+        bucket = by_stage.setdefault(
+            stage,
+            {
+                "requests": 0,
+                "completedRequests": 0,
+                "failedRequests": 0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0,
+                "cachedTokens": 0,
+                "reasoningTokens": 0,
+                "providerCostMicros": 0,
+                "billableCostMicros": 0,
+                "currency": "USD",
+            },
+        )
+        bucket["requests"] += 1
+        bucket["completedRequests"] += row["status"] == "completed"
+        bucket["failedRequests"] += row["status"] != "completed"
+        for key in ("inputTokens", "outputTokens", "totalTokens", "cachedTokens", "reasoningTokens"):
+            bucket[key] += int(row["usage"][key] or 0)
+        bucket["providerCostMicros"] += int(row["cost"]["providerCostMicros"] or 0)
+        bucket["billableCostMicros"] += int(row["cost"]["billableCostMicros"] or 0)
+
+    return {
+        "schemaVersion": "1.0",
+        "operation": "summary",
+        "provider": "openrouter",
+        "room_name": room_name,
+        "call_session_id": call_session_id,
+        "transcript_session_id": transcript_session_id,
+        "updated_at": updated_at,
+        "requests": requests,
+        "totals": totals,
+        "byStage": by_stage,
+    }
+
+
+async def publish_summary_costs(
+    firebase_router: "FirebaseRouter",
+    routing: "RoomRoutingContext",
+    room_name: str,
+    call_session_id: str,
+    updated_at: str,
+) -> str:
+    rows = await asyncio.to_thread(db_get_summary_requests, room_name, call_session_id)
+    payload = build_summary_costs_payload(
+        room_name,
+        call_session_id,
+        routing.transcript_session_id,
+        rows,
+        updated_at,
+    )
+    path = session_summary_costs_path(routing.storage_base_path)
+    await asyncio.to_thread(firebase_router.upload_json, routing, path, payload)
+    return path
+
+
 def db_claim_summary_task(now_iso: str) -> sqlite3.Row | None:
     conn = read_db_connection()
     try:
@@ -4584,6 +4827,30 @@ class SummaryEngine:
     timeout_seconds: int
     request_retries: int
     retry_base_seconds: float
+    request_context: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def set_request_context(
+        self,
+        *,
+        room_name: str,
+        call_session_id: str,
+        transcript_session_id: str | None,
+        stage: str,
+        kind: str | None,
+        minute_index: int | None,
+    ) -> None:
+        self.request_context.clear()
+        self.request_context.update(
+            {
+                "room_name": room_name,
+                "session_id": call_session_id,
+                "transcript_session_id": transcript_session_id,
+                "stage": stage,
+                "kind": kind,
+                "minute_index": minute_index,
+                "logical_attempt": 1,
+            }
+        )
 
     @staticmethod
     def create() -> "SummaryEngine":
@@ -4624,6 +4891,77 @@ class SummaryEngine:
     def _retry_delay_seconds(self, attempt: int) -> float:
         return min(8.0, self.retry_base_seconds * (2**attempt))
 
+    def _record_request_attempt(
+        self,
+        *,
+        network_attempt: int,
+        started_at: str,
+        started_monotonic: float,
+        status: str,
+        payload: dict | None = None,
+        request_id: str | None = None,
+        http_status: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        context = dict(self.request_context)
+        if not context.get("room_name") or not context.get("session_id"):
+            return
+        payload = payload if isinstance(payload, dict) else {}
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        prompt_details = usage.get("prompt_tokens_details")
+        prompt_details = prompt_details if isinstance(prompt_details, dict) else {}
+        completion_details = usage.get("completion_tokens_details")
+        completion_details = completion_details if isinstance(completion_details, dict) else {}
+        raw_cost = usage.get("cost")
+        try:
+            provider_cost_micros = round(float(raw_cost or 0) * 1_000_000)
+        except (TypeError, ValueError):
+            provider_cost_micros = 0
+        logical_attempt = int(context.get("logical_attempt", 1))
+        minute_label = (
+            f"minute:{int(context['minute_index']):04d}"
+            if context.get("minute_index") is not None
+            else "session"
+        )
+        operation_id = (
+            f"summary:{context['session_id']}:{context.get('stage', 'unknown')}"
+            f":{minute_label}:logical:{logical_attempt}:network:{network_attempt}"
+        )
+        completed_at = utc_now_iso()
+        record = {
+            **context,
+            "logical_attempt": logical_attempt,
+            "network_attempt": network_attempt,
+            "operation_id": operation_id,
+            "provider": self.provider,
+            "model_requested": context.get("model_requested"),
+            "model_used": payload.get("model") or context.get("model_requested"),
+            "generation_id": payload.get("id"),
+            "request_id": request_id,
+            "status": status,
+            "http_status": http_status,
+            "input_tokens": usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "cached_tokens": prompt_details.get("cached_tokens"),
+            "reasoning_tokens": completion_details.get("reasoning_tokens"),
+            "provider_cost_micros": provider_cost_micros,
+            "currency": "USD",
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "latency_ms": round((time.perf_counter() - started_monotonic) * 1000),
+            "error_message": error_message,
+            "created_at": completed_at,
+        }
+        try:
+            db_record_summary_request(record)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "failed to persist summary usage provider=%s operation_id=%s",
+                self.provider,
+                operation_id,
+            )
+
     def _request_text(
         self,
         kind: str | None,
@@ -4663,10 +5001,37 @@ class SummaryEngine:
         )
         max_attempts = self.request_retries + 1
         for attempt in range(max_attempts):
+            request_started_at = utc_now_iso()
+            request_started_monotonic = time.perf_counter()
+            network_attempt = attempt + 1
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
+                    response_body = response.read().decode("utf-8")
+                    payload = json.loads(response_body)
+                    request_id = response.headers.get("x-request-id")
+                self.request_context["model_requested"] = model
+                self._record_request_attempt(
+                    network_attempt=network_attempt,
+                    started_at=request_started_at,
+                    started_monotonic=request_started_monotonic,
+                    status="completed",
+                    payload=payload,
+                    request_id=request_id,
+                    http_status=200,
+                )
                 break
+            except json.JSONDecodeError as exc:
+                self.request_context["model_requested"] = model
+                self._record_request_attempt(
+                    network_attempt=network_attempt,
+                    started_at=request_started_at,
+                    started_monotonic=request_started_monotonic,
+                    status="failed",
+                    error_message=f"invalid_json_response: {exc}",
+                )
+                raise RuntimeError(
+                    f"Summary provider={self.provider} retornou JSON invalido model={model}"
+                ) from exc
             except urllib.error.HTTPError as exc:
                 detail = ""
                 try:
@@ -4674,6 +5039,16 @@ class SummaryEngine:
                     detail = body[:1200]
                 except Exception:  # pylint: disable=broad-except
                     detail = ""
+                self.request_context["model_requested"] = model
+                self._record_request_attempt(
+                    network_attempt=network_attempt,
+                    started_at=request_started_at,
+                    started_monotonic=request_started_monotonic,
+                    status="failed",
+                    request_id=exc.headers.get("x-request-id") if exc.headers else None,
+                    http_status=exc.code,
+                    error_message=detail or str(exc),
+                )
                 should_retry = exc.code in (408, 409, 429, 500, 502, 503, 504)
                 if should_retry and attempt < (max_attempts - 1):
                     delay = self._retry_delay_seconds(attempt)
@@ -4692,6 +5067,14 @@ class SummaryEngine:
                     f"Summary request failed provider={self.provider} status={exc.code} model={model} detail={detail}"
                 ) from exc
             except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+                self.request_context["model_requested"] = model
+                self._record_request_attempt(
+                    network_attempt=network_attempt,
+                    started_at=request_started_at,
+                    started_monotonic=request_started_monotonic,
+                    status="failed",
+                    error_message=str(exc),
+                )
                 if attempt < (max_attempts - 1):
                     delay = self._retry_delay_seconds(attempt)
                     logger.warning(
@@ -4815,6 +5198,7 @@ class SummaryEngine:
         first_error: RuntimeError | None = None
         last_error: RuntimeError | None = None
         for attempt in range(FINAL_SUMMARY_TEXT_MAX_ATTEMPTS):
+            self.request_context["logical_attempt"] = attempt + 1
             raw_output = self._request_text(
                 kind=None,
                 model=self.final_text_model,
@@ -4936,6 +5320,10 @@ def session_final_transcript_path(storage_base_path: str) -> str:
 
 def session_final_summary_text_path(storage_base_path: str) -> str:
     return join_storage_path(storage_base_path, "final/final_summary_text.txt")
+
+
+def session_summary_costs_path(storage_base_path: str) -> str:
+    return join_storage_path(storage_base_path, "final/summary_costs.json")
 
 
 def build_final_summary_temp_payload(
@@ -5327,6 +5715,14 @@ async def process_progressive_ata_minute_task(
         call_session_id,
         summary_engine.accumulated_model,
     )
+    summary_engine.set_request_context(
+        room_name=room_name,
+        call_session_id=call_session_id,
+        transcript_session_id=routing.transcript_session_id,
+        stage="progressive_ata_minute",
+        kind=None,
+        minute_index=minute_index,
+    )
     started_at = time.monotonic()
     accumulated_text = await asyncio.to_thread(
         summary_engine.update_progressive_ata,
@@ -5542,6 +5938,14 @@ async def process_progressive_ata_final_task(
         selected_source,
         summary_engine.final_text_model,
     )
+    summary_engine.set_request_context(
+        room_name=room_name,
+        call_session_id=call_session_id,
+        transcript_session_id=routing.transcript_session_id,
+        stage="progressive_ata_final",
+        kind=None,
+        minute_index=None,
+    )
     started_at = time.monotonic()
     final_summary_text = await asyncio.to_thread(
         summary_engine.finalize_progressive_ata,
@@ -5565,6 +5969,19 @@ async def process_progressive_ata_final_task(
         final_summary_text,
         "text/plain; charset=utf-8",
     )
+    summary_costs_path = await publish_summary_costs(
+        firebase_router,
+        routing,
+        room_name,
+        call_session_id,
+        now_iso,
+    )
+    logger.info(
+        "summary costs uploaded room=%s session=%s path=%s",
+        room_name,
+        call_session_id,
+        summary_costs_path,
+    )
     await asyncio.to_thread(
         firebase_router.publish_call_index,
         routing=routing,
@@ -5578,6 +5995,7 @@ async def process_progressive_ata_final_task(
         final_transcript_ready=True,
         final_summary_text_path=final_summary_text_path,
         final_summary_text_ready=True,
+        summary_costs_path=summary_costs_path,
     )
     return True
 
@@ -6005,6 +6423,14 @@ async def summary_worker_loop(
                     call_session_id,
                     summary_engine.minute_model,
                 )
+                summary_engine.set_request_context(
+                    room_name=room_name,
+                    call_session_id=call_session_id,
+                    transcript_session_id=routing.transcript_session_id,
+                    stage="minute_summary",
+                    kind=SUMMARY_KIND_MINUTE,
+                    minute_index=minute_index,
+                )
                 summary_started_at = time.monotonic()
                 minute_summary = await asyncio.to_thread(
                     summary_engine.summarize_minute, lines, minute_system_prompt
@@ -6078,6 +6504,14 @@ async def summary_worker_loop(
                     room_name,
                     call_session_id,
                     summary_engine.accumulated_model,
+                )
+                summary_engine.set_request_context(
+                    room_name=room_name,
+                    call_session_id=call_session_id,
+                    transcript_session_id=routing.transcript_session_id,
+                    stage="accumulated_summary",
+                    kind=SUMMARY_KIND_ACCUMULATED,
+                    minute_index=minute_index,
                 )
                 accumulated_started_at = time.monotonic()
                 merged_summary = await asyncio.to_thread(
@@ -6321,6 +6755,14 @@ async def summary_worker_loop(
                             routing,
                             "stt_finalize_summary",
                         )
+                        summary_engine.set_request_context(
+                            room_name=room_name,
+                            call_session_id=call_session_id,
+                            transcript_session_id=routing.transcript_session_id,
+                            stage="final_summary_json",
+                            kind=SUMMARY_KIND_FINAL,
+                            minute_index=None,
+                        )
                         final_started_at = time.monotonic()
                         final_summary = await asyncio.to_thread(
                             summary_engine.finalize_summary,
@@ -6448,6 +6890,14 @@ async def summary_worker_loop(
                             summary_engine.final_text_model,
                             SUMMARY_FINAL_TEXT_FORMAT,
                         )
+                        summary_engine.set_request_context(
+                            room_name=room_name,
+                            call_session_id=call_session_id,
+                            transcript_session_id=routing.transcript_session_id,
+                            stage="final_summary_html",
+                            kind=None,
+                            minute_index=None,
+                        )
                         final_text_started_at = time.monotonic()
                         final_summary_text = await asyncio.to_thread(
                             summary_engine.finalize_summary_text,
@@ -6480,6 +6930,19 @@ async def summary_worker_loop(
                             final_summary_text_path,
                             final_summary_text,
                             "text/plain; charset=utf-8",
+                        )
+                        summary_costs_path = await publish_summary_costs(
+                            firebase_router,
+                            routing,
+                            room_name,
+                            call_session_id,
+                            now_iso,
+                        )
+                        logger.info(
+                            "summary costs uploaded room=%s session=%s path=%s",
+                            room_name,
+                            call_session_id,
+                            summary_costs_path,
                         )
                         final_summary_text_ready = True
                         logger.info(
@@ -6544,6 +7007,7 @@ async def summary_worker_loop(
                         final_transcript_ready=True,
                         final_summary_text_path=final_summary_text_path,
                         final_summary_text_ready=final_summary_text_ready,
+                        summary_costs_path=summary_costs_path,
                     )
                     logger.info(
                         "metadata ata final registrada no firestore room=%s session=%s final_summary_ready=%s final_summary_text_ready=%s",
