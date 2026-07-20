@@ -178,6 +178,14 @@ def stt_operation_id(chunk_row: sqlite3.Row | dict) -> str:
     )
 
 
+def stt_session_operation_id(call_session_id: str, transcript_session_id: str | None) -> str:
+    return f"transcription:{call_session_id}:{transcript_session_id or call_session_id}"
+
+
+def summary_session_operation_id(call_session_id: str, transcript_session_id: str | None) -> str:
+    return f"summary:{call_session_id}:{transcript_session_id or call_session_id}"
+
+
 def audio_duration_ms(started_at: str, ended_at: str) -> int:
     return max(0, round((parse_iso_datetime(ended_at) - parse_iso_datetime(started_at)).total_seconds() * 1000))
 
@@ -194,19 +202,20 @@ def build_stt_transcription_metadata(
     model_type: str | None = None,
     request_id: str | None = None,
 ) -> dict:
-    return {
+    metadata = {
         "provider": provider or STT_PROVIDER,
         "model": model or STT_MODEL,
         "modelType": model_type or MODEL_TYPE,
-        "operationId": operation_id,
-        "requestId": request_id,
     }
+    if operation_id is not None:
+        metadata["operationId"] = operation_id
+        metadata["requestId"] = request_id
+    return metadata
 
 
 def build_stt_usage(
     duration_ms: int,
     processing_time_ms: int | None = None,
-    operation_id: str | None = None,
     *,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
@@ -217,8 +226,9 @@ def build_stt_usage(
     pricing_source: str | None = None,
     pricing_version: str | None = None,
     simulated: bool = False,
+    include_billing_metadata: bool = True,
 ) -> dict:
-    return {
+    usage = {
         "audioDurationMs": max(0, int(duration_ms)),
         "processingTimeMs": None if processing_time_ms is None else max(0, int(processing_time_ms)),
         "inputTokens": input_tokens,
@@ -226,12 +236,18 @@ def build_stt_usage(
         "audioTokens": audio_tokens,
         "cachedTokens": cached_tokens,
         "costMicros": stt_cost_micros(duration_ms) if cost_micros is None else int(cost_micros),
-        "currency": currency,
-        "billingUnit": "audio_second",
-        "pricingSource": pricing_source or STT_PRICING_SOURCE,
-        "pricingVersion": pricing_version or STT_PRICING_VERSION,
-        "simulated": simulated,
     }
+    if include_billing_metadata:
+        usage.update(
+            {
+                "currency": currency,
+                "billingUnit": "audio_second",
+                "pricingSource": pricing_source or STT_PRICING_SOURCE,
+                "pricingVersion": pricing_version or STT_PRICING_VERSION,
+                "simulated": simulated,
+            }
+        )
+    return usage
 
 
 def aggregate_stt_usage(lines: list[dict]) -> dict:
@@ -257,17 +273,13 @@ def build_stt_line_metadata(row: sqlite3.Row | dict) -> tuple[dict, dict]:
         row["audio_duration_ms"]
         or audio_duration_ms(row["chunk_started_at"], row["chunk_ended_at"])
     )
-    transcription = build_stt_transcription_metadata(
-        row["operation_id"],
-        provider=row["provider"],
-        model=row["model"],
-        model_type=row["model_type"],
-        request_id=row["request_id"],
-    )
+    transcription = {
+        "operationId": row["operation_id"],
+        "requestId": row["request_id"],
+    }
     usage = build_stt_usage(
         duration_ms,
         row["processing_time_ms"],
-        row["operation_id"],
         input_tokens=row["input_tokens"],
         output_tokens=row["output_tokens"],
         audio_tokens=row["audio_tokens"],
@@ -276,6 +288,7 @@ def build_stt_line_metadata(row: sqlite3.Row | dict) -> tuple[dict, dict]:
         currency=row["currency"] or "USD",
         pricing_source=row["pricing_source"],
         pricing_version=row["pricing_version"],
+        include_billing_metadata=False,
     )
     return transcription, usage
 
@@ -2727,6 +2740,9 @@ class FirebaseSink:
             routing,
             payload.transcript_json_path,
             {
+                "operation_id": stt_session_operation_id(
+                    payload.call_session_id, payload.transcript_session_id
+                ),
                 "room_name": payload.room_name,
                 "transcript_session_id": payload.transcript_session_id,
                 "call_session_id": payload.call_session_id,
@@ -4011,6 +4027,7 @@ def build_summary_costs_payload(
     return {
         "schemaVersion": "1.0",
         "operation": "summary",
+        "operation_id": summary_session_operation_id(call_session_id, transcript_session_id),
         "provider": "openrouter",
         "room_name": room_name,
         "call_session_id": call_session_id,
@@ -5665,6 +5682,7 @@ def build_final_transcript_payload(
 ) -> dict:
     transcript, lines = db_get_room_aggregate(room_name, call_session_id)
     return {
+        "operation_id": stt_session_operation_id(call_session_id, transcript_session_id),
         "transcription": build_stt_transcription_metadata(),
         "usage": aggregate_stt_usage(lines),
         "room_name": room_name,

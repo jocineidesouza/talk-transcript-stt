@@ -127,6 +127,14 @@ Body JSON:
 Os arquivos `minutes/*/transcript.json` e `final/final_transcript.json` carregam metadados do provedor e uso
 agregado no campo `usage`. Cada item de `lines` tambem possui `transcription` e `usage` proprios.
 
+Como a sessao usa um unico modelo do inicio ao fim, `provider`, `model`, `modelType`, moeda e politica de preco
+ficam somente no cabecalho. Em cada linha ficam apenas `operationId`, `requestId`, metricas especificas do chunk,
+tokens e custo individual.
+
+O cabecalho tambem possui `operation_id` no formato
+`transcription:{call_session_id}:{transcript_session_id}`, usado como identificador idempotente da transcricao
+inteira. Os `lines[].operationId` continuam identificando cada chunk individual.
+
 - `provider` e `model` identificam o motor que gerou a linha.
 - `operationId` e deterministico por sessao, participante e sequencia, permitindo idempotencia.
 - `audioDurationMs` e a duracao do chunk; `processingTimeMs` e o tempo do decode local.
@@ -144,6 +152,10 @@ Enquanto `SUMMARY_PROVIDER=openrouter`, cada chamada ao endpoint `/responses` e 
 `final/summary_costs.json` e enviado ao Storage quando a ata final textual e concluida. O arquivo inclui chamadas
 de resumo por minuto, acumulado, JSON final, HTML final, ata progressiva, retries, tokens, cache, reasoning,
 generation ID, request ID, modelo e custo retornado pelo OpenRouter.
+
+O cabecalho de `summary_costs.json` possui `operation_id` no formato
+`summary:{call_session_id}:{transcript_session_id}`, usado como identificador idempotente do consumo de resumo.
+Cada chamada individual continua identificada por `requests[].operationId`.
 
 O custo do OpenRouter e convertido para `costMicros` (`1 USD = 1.000.000 micros`). Cada retry possui uma entrada
 separada e seu `operationId` inclui a tentativa logica e a tentativa de rede. Reprocessamentos reutilizam o
