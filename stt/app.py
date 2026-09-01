@@ -44,7 +44,7 @@ TAIL_PADDING_SECONDS = float(os.environ.get("TAIL_PADDING_SECONDS", "0.35"))
 MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.1.6").strip() or "0.1.6"
+APP_VERSION = os.environ.get("APP_VERSION", "0.1.7").strip() or "0.1.7"
 STT_PROVIDER = os.environ.get("STT_PROVIDER", "self_hosted").strip() or "self_hosted"
 STT_MODEL = os.environ.get("STT_MODEL", MODEL_DIR.name).strip() or MODEL_DIR.name
 STT_PRICING_SOURCE = os.environ.get(
@@ -530,7 +530,7 @@ Entrada:
 
 Tarefa:
 - Gerar uma nova versão completa da ata acumulada, incorporando somente informações sustentadas pelo novo trecho e preservando informações anteriores úteis.
-- A ata deve ser adequada para uma daily operacional sempre que o conteúdo parecer daily/status report.
+- A ata deve ser uma ata formal e profissional de reunião, independentemente do tipo de reunião.
 - Consolidar assuntos equivalentes e evitar duplicar itens quando o novo trecho continuar algo já registrado.
 
 Regras obrigatórias:
@@ -546,7 +546,7 @@ Regras obrigatórias:
 - A primeira linha deve começar com <h1>.
 
 Estrutura preferida:
-<h1>ATA - Resumo - [data/intervalo quando informado]</h1>
+<h1>Ata da Reunião - [data/intervalo quando informado]</h1>
 <h2>Participantes</h2>
 <ul>...</ul>
 <h2>Resumo das Atividades</h2>
@@ -571,7 +571,7 @@ Entrada:
 
 Tarefa:
 - Gerar a ata final em HTML fragment, limpa, consolidada e fiel ao conteúdo recebido.
-- Revisar duplicações, corrigir continuidade entre trechos e manter o formato operacional de daily quando aplicável.
+- Revisar duplicações, corrigir continuidade entre trechos e manter o formato formal de ata de reunião.
 
 Regras obrigatórias:
 - Use apenas a ata acumulada e a fonte de transcrição recebida.
@@ -583,7 +583,7 @@ Regras obrigatórias:
 - A primeira linha deve começar com <h1>.
 
 Estrutura preferida:
-<h1>ATA - Daily - [data/intervalo quando informado]</h1>
+<h1>Ata da Reunião - [data/intervalo quando informado]</h1>
 <h2>Participantes</h2>
 <ul>...</ul>
 <h2>Resumo das Atividades</h2>

@@ -26,7 +26,7 @@ services:
       STT_PRICE_USD_PER_HOUR: "1.00"
       STT_PRICING_SOURCE: azure_speech_standard_reference
       STT_PRICING_VERSION: "2026-07-17"
-      APP_VERSION: "0.1.6"
+      APP_VERSION: "0.1.7"
       AUTO_DOWNLOAD_MODEL: "1"
       SQLITE_PATH: /data/queue.db
       SPOOL_DIR: /data/spool
