@@ -44,7 +44,7 @@ TAIL_PADDING_SECONDS = float(os.environ.get("TAIL_PADDING_SECONDS", "0.35"))
 MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.1.5").strip() or "0.1.5"
+APP_VERSION = os.environ.get("APP_VERSION", "0.1.6").strip() or "0.1.6"
 STT_PROVIDER = os.environ.get("STT_PROVIDER", "self_hosted").strip() or "self_hosted"
 STT_MODEL = os.environ.get("STT_MODEL", MODEL_DIR.name).strip() or MODEL_DIR.name
 STT_PRICING_SOURCE = os.environ.get(
@@ -110,16 +110,16 @@ OPENROUTER_HTTP_REFERER = os.environ.get("OPENROUTER_HTTP_REFERER", "").strip()
 OPENROUTER_X_TITLE = os.environ.get("OPENROUTER_X_TITLE", "").strip()
 
 SUMMARY_MODEL_MINUTE = os.environ.get(
-    "SUMMARY_MODEL_MINUTE", "openai/gpt-4.1-mini"
+    "SUMMARY_MODEL_MINUTE", "openai/gpt-5.6-luna"
 ).strip()
 SUMMARY_MODEL_ACCUMULATED = os.environ.get(
-    "SUMMARY_MODEL_ACCUMULATED", "openai/gpt-4.1-mini"
+    "SUMMARY_MODEL_ACCUMULATED", "openai/gpt-5.6-luna"
 ).strip()
 SUMMARY_MODEL_FINAL = os.environ.get(
-    "SUMMARY_MODEL_FINAL", "openai/gpt-4.1-mini"
+    "SUMMARY_MODEL_FINAL", "openai/gpt-5.6-luna"
 ).strip()
 SUMMARY_MODEL_FINAL_TEXT = os.environ.get(
-    "SUMMARY_MODEL_FINAL_TEXT", "openai/gpt-4.1-mini"
+    "SUMMARY_MODEL_FINAL_TEXT", "openai/gpt-5.6-luna"
 ).strip()
 SUMMARY_FINAL_TEXT_FORMAT = os.environ.get("SUMMARY_FINAL_TEXT_FORMAT", "html").strip().lower()
 if SUMMARY_FINAL_TEXT_FORMAT not in {"markdown", "html", "text"}:
@@ -1974,6 +1974,7 @@ def safe_key(value: str) -> str:
 class RoomNamespaceInfo:
     namespace: str
     room_id: str
+    call_id: str
 
 
 @dataclass(frozen=True)
@@ -2004,6 +2005,7 @@ class RoomRoutingContext:
     namespace: str
     room_name: str
     room_id: str
+    call_id: str
     call_session_id: str
     transcript_session_id: str | None
     vertical: str
@@ -2023,35 +2025,41 @@ def extract_room_namespace(room_name: str) -> RoomNamespaceInfo | None:
     for namespace in sorted(ALLOWED_LIVEKIT_NAMESPACES, key=len, reverse=True):
         prefix = f"{namespace}__"
         if room_name.startswith(prefix):
-            room_id = room_name[len(prefix) :].strip()
-            if room_id:
-                return RoomNamespaceInfo(namespace=namespace, room_id=room_id)
+            resource_id = room_name[len(prefix) :].strip()
+            marker = "__call__"
+            if marker not in resource_id:
+                return None
+            room_id, call_id = resource_id.rsplit(marker, 1)
+            room_id = room_id.strip()
+            call_id = call_id.strip()
+            if room_id and call_id:
+                return RoomNamespaceInfo(namespace=namespace, room_id=room_id, call_id=call_id)
             return None
     return None
 
 
-def build_firestore_doc_path(vertical: str, slug: str, room_id: str, call_session_id: str) -> str:
-    return f"VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/SESSIONS/{call_session_id}"
+def build_firestore_doc_path(vertical: str, slug: str, room_id: str, call_id: str) -> str:
+    return f"VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{room_id}/CALLS/{call_id}"
 
 
 def build_storage_base_path(
     vertical: str,
     slug: str,
     room_id: str,
-    call_session_id: str,
+    call_id: str,
     transcript_session_id: str,
 ) -> str:
-    return f"{vertical}/{slug}/ai/summaries/{call_session_id}/{transcript_session_id}"
+    return f"{vertical}/{slug}/ai/summaries/{call_id}/{transcript_session_id}"
 
 
 def build_transcript_storage_base_path(
     vertical: str,
     slug: str,
     room_id: str,
-    call_session_id: str,
+    call_id: str,
     transcript_session_id: str,
 ) -> str:
-    return f"{vertical}/{slug}/ai/transcriptions/{call_session_id}/{transcript_session_id}"
+    return f"{vertical}/{slug}/ai/transcriptions/{call_id}/{transcript_session_id}"
 
 
 def build_room_session_doc_path(vertical: str, slug: str, room_id: str, call_session_id: str) -> str:
@@ -2591,8 +2599,10 @@ class FirebaseSink:
         payload = {
             "room_name": routing.room_name,
             "room_id": routing.room_id,
+            "call_id": routing.call_id,
             "transcript_session_id": routing.transcript_session_id,
             "call_session_id": routing.call_session_id,
+            "provider_room_sid": routing.call_session_id,
             "namespace": self.namespace,
             "vertical": routing.vertical,
             "slug": routing.slug,
@@ -2633,15 +2643,20 @@ class FirebaseSink:
             firestore.ArrayUnion([routing.transcript_session_id]) if routing.transcript_session_id else None
         )
         payload = {
+            "room_id": routing.room_id,
+            "call_id": routing.call_id,
             "call_session_id": routing.call_session_id,
             "transcript_session_id": routing.transcript_session_id,
-            "agent_stt_id": routing.transcript_session_id,
-            "status": "active",
-            "started_at": firestore.SERVER_TIMESTAMP,
+            "providerRoomSid": routing.call_session_id,
+            "providerRoomName": routing.room_name,
+            "transcription": {
+                "status": "processing",
+                "transcriptSessionId": routing.transcript_session_id,
+                "providerRoomSid": routing.call_session_id,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            },
             "updated_at": firestore.SERVER_TIMESTAMP,
         }
-        if transcript_session_ids is not None:
-            payload["transcript_session_ids"] = transcript_session_ids
         session_ref.set(payload, merge=True)
 
     def upload_json(self, routing: RoomRoutingContext, object_path: str, body: dict) -> None:
@@ -2868,16 +2883,17 @@ class FirebaseRouter:
                 namespace=info.namespace,
                 room_name=room_name,
                 room_id=info.room_id,
+                call_id=info.call_id,
                 call_session_id=call_session_id,
                 transcript_session_id=transcript_session_id,
                 vertical=vertical,
                 slug=slug,
-                firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, call_session_id),
+                firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, info.call_id),
                 storage_base_path=build_storage_base_path(
-                    vertical, slug, info.room_id, call_session_id, transcript_session_id
+                    vertical, slug, info.room_id, info.call_id, transcript_session_id
                 ),
                 transcript_storage_base_path=build_transcript_storage_base_path(
-                    vertical, slug, info.room_id, call_session_id, transcript_session_id
+                    vertical, slug, info.room_id, info.call_id, transcript_session_id
                 ),
             )
 
@@ -2899,26 +2915,44 @@ class FirebaseRouter:
         payload = raw_payload if isinstance(raw_payload, dict) else {}
         vertical = str(payload.get("vertical", "")).strip()
         slug = str(payload.get("slug", "")).strip()
-        if not vertical or not slug:
+        indexed_room_id = str(payload.get("roomId", "")).strip()
+        indexed_call_id = str(payload.get("callId", "")).strip()
+        indexed_provider_name = str(payload.get("providerRoomName", "")).strip()
+        if not vertical or not slug or payload.get("lifecycle") != "canonical":
             raise RoomRoutingError(
                 "room_index_invalid",
-                f"indices vertical/slug invalidos para room {room_name}",
+                f"indice canonico invalido para room {room_name}",
             )
+        if indexed_provider_name != room_name or indexed_room_id != info.room_id or indexed_call_id != info.call_id:
+            raise RoomRoutingError("room_index_mismatch", f"indice nao corresponde a room {room_name}")
+        call_ref = sink.firestore_client.document(
+            f"VERTICALS/{vertical}/COMPANIES/{slug}/ROOMS/{info.room_id}/CALLS/{info.call_id}"
+        )
+        call_snapshot = call_ref.get()
+        if not call_snapshot.exists:
+            raise RoomRoutingError("call_not_found", f"Call canonica nao encontrada para room {room_name}")
+        call_data = call_snapshot.to_dict() or {}
+        if str(call_data.get("providerRoomName", "")).strip() != room_name:
+            raise RoomRoutingError("call_provider_room_mismatch", f"Call nao corresponde a room {room_name}")
+        persisted_sid = str(call_data.get("providerRoomSid", "") or call_data.get("callSessionId", "")).strip()
+        if persisted_sid and persisted_sid != str(call_session_id).strip():
+            raise RoomRoutingError("call_provider_sid_mismatch", f"Call nao corresponde ao sid da room {room_name}")
 
         return RoomRoutingContext(
             namespace=info.namespace,
             room_name=room_name,
             room_id=info.room_id,
+            call_id=info.call_id,
             call_session_id=call_session_id,
             transcript_session_id=transcript_session_id,
             vertical=vertical,
             slug=slug,
-            firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, call_session_id),
+            firestore_doc_path=build_firestore_doc_path(vertical, slug, info.room_id, info.call_id),
             storage_base_path=build_storage_base_path(
-                vertical, slug, info.room_id, call_session_id, transcript_session_id
+                vertical, slug, info.room_id, info.call_id, transcript_session_id
             ),
             transcript_storage_base_path=build_transcript_storage_base_path(
-                vertical, slug, info.room_id, call_session_id, transcript_session_id
+                vertical, slug, info.room_id, info.call_id, transcript_session_id
             ),
         )
     def publish_call_index(
@@ -3617,6 +3651,7 @@ def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
     namespace_info = extract_room_namespace(room_name)
     namespace_value = namespace_info.namespace if namespace_info is not None else ""
     room_id = str(row["room_id"] or "").strip()
+    parsed_call_id = namespace_info.call_id if namespace_info is not None else ""
     call_session_id = str(row["call_session_id"] or row["session_id"] or "").strip()
     transcript_session_id = str(row["transcript_session_id"] or "").strip() or None
     vertical = str(row["vertical"] or "").strip()
@@ -3625,7 +3660,7 @@ def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
     storage_base_path = str(row["storage_base_path"] or "").strip()
     transcript_storage_base_path = str(row["transcript_storage_base_path"] or "").strip()
 
-    if not room_name or not room_id or not call_session_id:
+    if not room_name or not room_id or not parsed_call_id or not call_session_id:
         raise RuntimeError("session routing context incompleto: room_name/room_id/call_session_id")
     if not vertical or not slug:
         raise RuntimeError("session routing context incompleto: vertical/slug")
@@ -3640,6 +3675,7 @@ def routing_context_from_session_row(row: sqlite3.Row) -> RoomRoutingContext:
         namespace=namespace_value,
         room_name=room_name,
         room_id=room_id,
+        call_id=parsed_call_id,
         call_session_id=call_session_id,
         transcript_session_id=transcript_session_id,
         vertical=vertical,

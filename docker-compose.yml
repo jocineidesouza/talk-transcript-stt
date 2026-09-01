@@ -26,7 +26,7 @@ services:
       STT_PRICE_USD_PER_HOUR: "1.00"
       STT_PRICING_SOURCE: azure_speech_standard_reference
       STT_PRICING_VERSION: "2026-07-17"
-      APP_VERSION: "0.1.5"
+      APP_VERSION: "0.1.6"
       AUTO_DOWNLOAD_MODEL: "1"
       SQLITE_PATH: /data/queue.db
       SPOOL_DIR: /data/spool
@@ -46,10 +46,10 @@ services:
       SUMMARY_PROGRESSIVE_FINAL_SOURCE: "auto"
       SUMMARY_PROGRESSIVE_FULL_TRANSCRIPT_MAX_CHARS: "120000"
       SUMMARY_PROVIDER: "openrouter"
-      SUMMARY_MODEL_MINUTE: "openai/gpt-4.1-mini"
-      SUMMARY_MODEL_ACCUMULATED: "openai/gpt-4.1-mini"
-      SUMMARY_MODEL_FINAL: "openai/gpt-4.1-mini"
-      SUMMARY_MODEL_FINAL_TEXT: "openai/gpt-4.1-mini"
+      SUMMARY_MODEL_MINUTE: "openai/gpt-5.6-luna"
+      SUMMARY_MODEL_ACCUMULATED: "openai/gpt-5.6-luna"
+      SUMMARY_MODEL_FINAL: "openai/gpt-5.6-luna"
+      SUMMARY_MODEL_FINAL_TEXT: "openai/gpt-5.6-luna"
       SUMMARY_FINAL_TEXT_FORMAT: "html"
       SUMMARY_REQUEST_TIMEOUT_SECONDS: "300"
       SUMMARY_REQUEST_RETRIES: "2"

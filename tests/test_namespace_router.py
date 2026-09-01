@@ -1334,7 +1334,7 @@ class SummaryEngineRetryTests(unittest.TestCase):
             side_effect=[TimeoutError("timeout-1"), TimeoutError("timeout-2"), self._response(success_payload)],
         ) as urlopen_mock:
             with patch.object(STT_APP.time, "sleep") as sleep_mock:
-                raw = engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "openai/gpt-4.1-mini", "system", "user")
+                raw = engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "openai/gpt-5.6-luna", "system", "user")
 
         self.assertEqual(raw, "{}")
         self.assertEqual(urlopen_mock.call_count, 3)
@@ -1349,7 +1349,7 @@ class SummaryEngineRetryTests(unittest.TestCase):
         ) as urlopen_mock:
             with patch.object(STT_APP.time, "sleep") as sleep_mock:
                 with self.assertRaises(RuntimeError):
-                    engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "openai/gpt-4.1-mini", "system", "user")
+                    engine._request_text(STT_APP.SUMMARY_KIND_MINUTE, "openai/gpt-5.6-luna", "system", "user")
 
         self.assertEqual(urlopen_mock.call_count, 3)
         self.assertEqual(sleep_mock.call_count, 2)
@@ -3054,7 +3054,7 @@ class AdminSummaryReprocessTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_reprocess_status_returns_final_error_details_when_exhausted(self):
         temp_payload = {
             "error": "falha de contrato",
-            "model": "openai/gpt-4.1-mini",
+            "model": "openai/gpt-5.6-luna",
             "kind": STT_APP.SUMMARY_KIND_FINAL,
             "updated_at": "2026-04-24T12:00:00+00:00",
         }
