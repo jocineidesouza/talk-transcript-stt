@@ -1655,8 +1655,10 @@ class CallIndexContractTests(unittest.TestCase):
         )
 
         payload = fake_doc.set.call_args.args[0]
-        self.assertEqual(payload["status"], "finalized")
-        self.assertTrue(payload["finalized"])
+        self.assertNotIn("status", payload)
+        self.assertNotIn("finalized", payload)
+        self.assertEqual(payload["transcription"]["status"], "finalized")
+        self.assertTrue(payload["transcription"]["finalized"])
         self.assertEqual(payload["final_summary_path"], "path/final_summary.json")
         self.assertTrue(payload["final_summary_ready"])
         self.assertEqual(payload["final_transcript_path"], "path/final_transcript.json")
@@ -1685,6 +1687,10 @@ class CallIndexContractTests(unittest.TestCase):
         )
 
         payload = fake_doc.set.call_args.args[0]
+        self.assertNotIn("status", payload)
+        self.assertNotIn("finalized", payload)
+        self.assertEqual(payload["transcription"]["status"], "processing")
+        self.assertFalse(payload["transcription"]["finalized"])
         self.assertNotIn("final_summary_path", payload)
         self.assertNotIn("final_summary_ready", payload)
         self.assertNotIn("final_transcript_path", payload)

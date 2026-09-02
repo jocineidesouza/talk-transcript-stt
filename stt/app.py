@@ -44,7 +44,7 @@ TAIL_PADDING_SECONDS = float(os.environ.get("TAIL_PADDING_SECONDS", "0.35"))
 MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.1.7").strip() or "0.1.7"
+APP_VERSION = os.environ.get("APP_VERSION", "0.1.8").strip() or "0.1.8"
 STT_PROVIDER = os.environ.get("STT_PROVIDER", "self_hosted").strip() or "self_hosted"
 STT_MODEL = os.environ.get("STT_MODEL", MODEL_DIR.name).strip() or MODEL_DIR.name
 STT_PRICING_SOURCE = os.environ.get(
@@ -2606,8 +2606,13 @@ class FirebaseSink:
             "namespace": self.namespace,
             "vertical": routing.vertical,
             "slug": routing.slug,
-            "status": status,
-            "finalized": finalized,
+            "transcription": {
+                "status": status,
+                "finalized": finalized,
+                "transcriptSessionId": routing.transcript_session_id,
+                "providerRoomSid": routing.call_session_id,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            },
             "last_minute_index": last_minute_index,
             "minute_window_seconds": minute_window_seconds,
             "flush_interval_seconds": flush_interval_seconds,
