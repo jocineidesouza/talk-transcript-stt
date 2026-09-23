@@ -44,7 +44,7 @@ TAIL_PADDING_SECONDS = float(os.environ.get("TAIL_PADDING_SECONDS", "0.35"))
 MODEL_LANGUAGE = os.environ.get("MODEL_LANGUAGE", "pt")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "cohere_transcribe_offline_vad_streaming")
 FEATURE_DIM = int(os.environ.get("FEATURE_DIM", "80"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.1.8").strip() or "0.1.8"
+APP_VERSION = os.environ.get("APP_VERSION", "0.1.9").strip() or "0.1.9"
 STT_PROVIDER = os.environ.get("STT_PROVIDER", "self_hosted").strip() or "self_hosted"
 STT_MODEL = os.environ.get("STT_MODEL", MODEL_DIR.name).strip() or MODEL_DIR.name
 STT_PRICING_SOURCE = os.environ.get(
@@ -110,16 +110,16 @@ OPENROUTER_HTTP_REFERER = os.environ.get("OPENROUTER_HTTP_REFERER", "").strip()
 OPENROUTER_X_TITLE = os.environ.get("OPENROUTER_X_TITLE", "").strip()
 
 SUMMARY_MODEL_MINUTE = os.environ.get(
-    "SUMMARY_MODEL_MINUTE", "openai/gpt-5.6-luna"
+    "SUMMARY_MODEL_MINUTE", "openai/gpt-6-luna"
 ).strip()
 SUMMARY_MODEL_ACCUMULATED = os.environ.get(
-    "SUMMARY_MODEL_ACCUMULATED", "openai/gpt-5.6-luna"
+    "SUMMARY_MODEL_ACCUMULATED", "openai/gpt-6-luna"
 ).strip()
 SUMMARY_MODEL_FINAL = os.environ.get(
-    "SUMMARY_MODEL_FINAL", "openai/gpt-5.6-luna"
+    "SUMMARY_MODEL_FINAL", "openai/gpt-6-luna"
 ).strip()
 SUMMARY_MODEL_FINAL_TEXT = os.environ.get(
-    "SUMMARY_MODEL_FINAL_TEXT", "openai/gpt-5.6-luna"
+    "SUMMARY_MODEL_FINAL_TEXT", "openai/gpt-6-luna"
 ).strip()
 SUMMARY_FINAL_TEXT_FORMAT = os.environ.get("SUMMARY_FINAL_TEXT_FORMAT", "html").strip().lower()
 if SUMMARY_FINAL_TEXT_FORMAT not in {"markdown", "html", "text"}:
@@ -936,6 +936,8 @@ def final_summary_text_format_instructions(output_format: str) -> str:
         "- Retorne apenas o documento final da ata.\n"
         "- Nao inclua explicacoes, analise, justificativa, plano, raciocinio ou comentarios.\n"
         "- Nao use blocos de codigo.\n"
+        "- O titulo deve ser 'Ata da Reuniao' seguido somente da data da reuniao.\n"
+        "- Nao inclua no titulo horario de inicio, horario de fim ou intervalo de horarios.\n"
     )
     if normalized == "html":
         return common + (
@@ -949,11 +951,11 @@ def final_summary_text_format_instructions(output_format: str) -> str:
         return common + (
             "- Formato de saida: texto simples.\n"
             "- Nao use Markdown estrutural, HTML ou blocos de codigo.\n"
-            "- Comece diretamente pelo titulo Ata de Reuniao.\n"
+            "- Comece diretamente pelo titulo Ata da Reuniao, seguido somente da data.\n"
         )
     return common + (
         "- Formato de saida: Markdown.\n"
-        f"- A primeira linha da resposta deve ser exatamente: {FINAL_SUMMARY_TEXT_REQUIRED_PREFIX}\n"
+        f"- A primeira linha da resposta deve comecar com {FINAL_SUMMARY_TEXT_REQUIRED_PREFIX}, seguida somente da data.\n"
         "- Use cabecalhos Markdown e listas Markdown quando necessario.\n"
     )
 
